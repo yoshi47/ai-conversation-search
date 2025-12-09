@@ -1,45 +1,56 @@
 ---
 name: conversation-search
 description: Find and resume Claude Code conversations by searching topics or filtering by date. Returns session IDs and project paths for easy resumption via 'claude --resume'. Use when user asks "find that conversation about X", "what did we discuss", "what did we work on yesterday", "summarize today's work", "show this week's conversations", "recent projects we accomplished", or wants to locate past work by topic, date, or time period (yesterday, today, last week, specific dates).
-allowed-tools: Bash
+allowed-tools: Bash, TodoWrite
 ---
 
 # Conversation Search
 
 Find past conversations in your Claude Code history and get the commands to resume them.
 
+## MANDATORY FIRST STEP - CREATE TODO CHECKLIST
+
+**Before doing ANYTHING else, you MUST use the TodoWrite tool to create this exact checklist:**
+
+```
+- Ensure cc-conversation-search tool is installed and upgraded
+- Classify query type (temporal/topic/hybrid)
+- Execute Level 1: focused search with cc-conversation-search
+- Execute Level 2: broader search if Level 1 fails
+- Execute Level 3: manual exploration if Level 1 and 2 fail
+- Present results to user
+```
+
+**CRITICAL CONSTRAINTS:**
+- DO NOT use grep, find, cat, or any manual file operations on .jsonl files
+- DO NOT skip the todo creation step
+- DO NOT jump to Level 3 without attempting Levels 1 and 2
+- ONLY use cc-conversation-search commands for all search operations
+
+Mark each todo as `in_progress` when starting it, `completed` when done.
+
 ## Prerequisites & Auto-Installation
 
 The skill requires the `cc-conversation-search` CLI tool (v0.4.0+ minimum).
 
-**IMPORTANT: Always upgrade to latest when skill activates**
+**First todo: Ensure tool is installed and upgraded**
 
 ```bash
-# Check if installed
+# Check if installed and upgrade
 if command -v cc-conversation-search &> /dev/null; then
-    # Already installed - upgrade to latest to match plugin version
     uv tool upgrade cc-conversation-search 2>/dev/null || pip install --upgrade cc-conversation-search
     echo "Upgraded to: $(cc-conversation-search --version)"
 else
-    echo "Not installed - installing now..."
+    # Install if needed
+    if command -v uv &> /dev/null; then
+        uv tool install cc-conversation-search
+    else
+        pip install --user cc-conversation-search
+        export PATH="$HOME/.local/bin:$PATH"
+    fi
+    # Initialize database
+    cc-conversation-search init --days 7
 fi
-```
-
-**If not installed:**
-
-### Automatic Installation
-
-```bash
-# Try uv first (preferred), fallback to pip
-if command -v uv &> /dev/null; then
-    uv tool install cc-conversation-search
-else
-    pip install --user cc-conversation-search
-    export PATH="$HOME/.local/bin:$PATH"
-fi
-
-# Initialize database
-cc-conversation-search init --days 7
 ```
 
 **If installation fails**, guide the user:
@@ -55,280 +66,215 @@ Then initialize:
   cc-conversation-search init
 ```
 
-**After installation, verify:**
-```bash
-cc-conversation-search --version  # Should show 0.4.0 or higher
-```
-
-**Do not attempt search** until installation is confirmed.
-
-### Version Compatibility Note
-
-Minimum CLI version: 0.4.0 (required for --version, --quiet, proper error messages).
-
-**Best practice**: This skill automatically upgrades the CLI tool on every activation to ensure compatibility with plugin updates.
+**Do not proceed with search** until installation is confirmed.
 
 ## Query Type Classification
 
-**CRITICAL: Before searching, identify the query type:**
+**Second todo: Classify the user's query**
+
+Determine which type before executing search:
 
 ### Type 1: Temporal Queries
-User asks about time ("yesterday", "last week", "today's work"):
-- **Use:** `--date`, `--since`, or `--until` parameters
-- **Examples:**
-  - "What did we work on yesterday?" → `--date yesterday`
-  - "Summarize this week" → `--since` (7 days ago)
-  - "Today's conversations" → `--date today`
+User asks about time periods WITHOUT specific topics:
+- "What did we work on yesterday?"
+- "Summarize this week"
+- "Show today's conversations"
+
+**Action:** Use `list` command with date filters
 
 ### Type 2: Topic Queries
-User asks about content ("auth bug", "Redis"):
-- **Use:** `search "topic"` with optional time scope
-- **Examples:**
-  - "Find Redis conversation" → `search "Redis"`
-  - "Recent auth work" → `search "auth" --days 7`
+User asks about CONTENT/TOPICS:
+- "Find that Redis conversation"
+- "Where did we discuss authentication?"
+- "Show me where we worked on the API"
+
+**Action:** Use `search "topic"` command
 
 ### Type 3: Hybrid Queries
-User asks about topic + time:
-- **Use:** Combine search query with date filters
-- **Examples:**
-  - "Find yesterday's auth discussion" → `search "auth" --date yesterday`
-  - "Redis work from last week" → `search "Redis" --since` (week ago)
+User asks about TOPIC + TIME:
+- "Show me yesterday's authentication work"
+- "Find Redis discussions from last week"
+- "How many times did you say X in the past week?"
 
-## Progressive Search Workflow
+**Action:** Use `search "topic"` with date filters
 
-Use this tiered approach, escalating only if needed:
+## Three-Level Search Workflow
 
-**Copy this checklist:**
-```
-Search Progress:
-- [ ] Level 0: Classify query type (temporal/topic/hybrid)
-- [ ] Level 1: Simple focused search (fast, auto-indexes)
-- [ ] Level 2: Broader search without filters
-- [ ] Level 3: Manual exploration (token-heavy)
-- [ ] Level 4: Present results
-```
+**Execute in order. Do not skip levels.**
 
-### Level 1: Simple Search (Start Here)
+### Level 1: Focused Search (ALWAYS START HERE)
 
-**Note**: Search automatically indexes recent conversations, so you always get fresh data.
+Based on query classification:
 
-Run focused search with time scope:
+**For Topic or Hybrid queries:**
 ```bash
-cc-conversation-search search "query terms" --days 14 --json
+cc-conversation-search search "search terms" --days 14 --json
 ```
 
-Parse JSON. **If clear matches** → skip to Level 4.
+**For Temporal queries:**
+```bash
+cc-conversation-search list --date yesterday --json  # or --days N, --since, --until
+```
+
+**Parse the JSON output.** If you find relevant matches → skip to Level 4 (present results).
+
+**Note:** Search auto-indexes recent conversations for fresh data.
 
 ### Level 2: Broader Search
 
-If Level 1 yields no good matches:
-- Remove time filter: `cc-conversation-search search "query" --json`
-- Try alternative keywords (e.g., "auth" vs "authentication")
-- Try broader terms (e.g., "database" vs "postgres migration")
+**Only if Level 1 found nothing useful.**
+
+For topic/hybrid queries:
+- Remove time constraints: `cc-conversation-search search "terms" --json`
+- Try alternative keywords: "auth" vs "authentication"
+- Try broader terms: "database" vs "postgres"
+
+For temporal queries:
+- Expand time range: `--days 30` instead of `--days 7`
 
 **If matches found** → skip to Level 4.
 
-### Level 3: Manual Exploration (Token-Heavy)
+### Level 3: Manual Exploration
 
-Only escalate here if Levels 1-2 failed:
+**Only if Levels 1 and 2 both failed.**
 
-1. List recent conversations:
-   ```bash
-   cc-conversation-search list --days 30 --json
-   ```
-
-2. Read conversation summaries from JSON to identify promising ones
-
-3. Get conversation tree for promising sessions:
-   ```bash
-   cc-conversation-search tree <SESSION_ID> --json
-   ```
-
-4. Manually read message summaries in tree to find relevant content
-
-**If match found** → proceed to Level 4.
+1. List conversations: `cc-conversation-search list --days 30 --json`
+2. Review conversation summaries in JSON
+3. For promising sessions: `cc-conversation-search tree <SESSION_ID> --json`
+4. Read message summaries to locate content
 
 ### Level 4: Present Results
 
-**If found:**
+**Format results for the user:**
 
-Display session resumption information using this markdown format:
+For found conversations:
 
+```markdown
 **Session Details**
-
 - **Session**: abc-123-session-id
 - **Project**: /home/user/projects/myproject
 - **Time**: 2025-11-13 22:50
-- **Message**: def-456-message-uuid
+- **Message**: def-456-message-uuid (if applicable)
 
 **To Resume This Conversation**
-
 ```bash
 cd /home/user/projects/myproject
 claude --resume abc-123-session-id
 ```
-
-Optionally offer context expansion:
-```bash
-cc-conversation-search context <UUID> --json
 ```
+
+For counting/analysis queries:
+- Parse JSON results
+- Filter by message_type if needed (user vs assistant)
+- Count matches
+- Present clear answer with evidence
 
 **If not found after all 3 levels:**
-- State clearly: "No matching conversations found after exhaustive search"
+- "No matching conversations found after exhaustive search"
 - Suggest: `cc-conversation-search index --days 90` to reindex older history
-- Acknowledge: "The conversation may not exist or may be older than indexed range"
-
-## Error Handling
-
-**Tool not installed:**
-```bash
-which cc-conversation-search
-```
-If not found:
-1. Install: `uv tool install cc-conversation-search` or `pip install cc-conversation-search`
-2. Initialize: `cc-conversation-search init`
-3. **Do not proceed** until confirmed installed
-
-Note: The package name and command are both `cc-conversation-search`
-
-**Database not found:**
-User must run: `cc-conversation-search init`
-Creates `~/.conversation-search/index.db` and indexes last 7 days.
-
-**No results at Level 1 or 2:**
-Escalate to Level 3. **Do not give up early.**
-
-**No results after Level 3:**
-Only then report "no match" with reindexing suggestion.
+- "The conversation may not exist or may be older than indexed range"
 
 ## Command Reference
 
-### Search Command
+### Search (for topic and hybrid queries)
 ```bash
-# Topic search with time scope
+# With time scope
 cc-conversation-search search "query" --days N --json
 
-# Search by calendar date
+# Specific date
 cc-conversation-search search "query" --date yesterday --json
-cc-conversation-search search "query" --date today --json
 cc-conversation-search search "query" --date 2025-11-13 --json
 
-# Search by date range
-cc-conversation-search search "query" --since yesterday --until today --json
+# Date range
 cc-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 --json
 
-# All time (no date filter)
+# All time
 cc-conversation-search search "query" --json
 ```
 
-**Date Filter Options:**
-- `--days N`: Last N days from NOW (e.g., --days 7 = last 7 days)
-- `--date DATE`: Specific calendar day (midnight to midnight)
-- `--since DATE`: From date onwards (inclusive)
-- `--until DATE`: Up to and including date
+**Date filter options:**
+- `--days N`: Last N days from now
+- `--date DATE`: Specific calendar day
+- `--since DATE`: From date onwards
+- `--until DATE`: Up to date (inclusive)
 - DATE formats: `yyyy-mm-dd`, `yesterday`, `today`
+- Cannot mix `--days` with `--date/--since/--until`
 
-**Important:** Cannot mix `--days` with `--date/--since/--until`
-
-### List Conversations
+### List (for temporal queries)
 ```bash
-# List by calendar date
 cc-conversation-search list --date yesterday --json
-cc-conversation-search list --date today --json
-
-# List by range
-cc-conversation-search list --since yesterday --until today --json
-
-# List last N days (relative to NOW)
 cc-conversation-search list --days 7 --json
+cc-conversation-search list --since 2025-11-10 --until today --json
 ```
 
-### Context Expansion
+### Context & Tree
 ```bash
 cc-conversation-search context <UUID> --json
-cc-conversation-search context <UUID> --no-index --json  # Skip indexing
-```
-
-**Conversation tree:**
-```bash
 cc-conversation-search tree <SESSION_ID> --json
 ```
 
-**Resume helper** (returns copy-pasteable commands):
-```bash
-cc-conversation-search resume <UUID>
-```
-
-**Always use `--json`** for structured output in search/context/list/tree.
-
-See [REFERENCE.md](REFERENCE.md) for complete command documentation.
+**Always use `--json` for structured output.**
 
 ## Examples
 
-**Example 1: User wants to find specific discussion**
+**Example 1: Topic query**
 ```
 User: "Find that conversation where we fixed the authentication bug"
 ```
 
-You should:
-1. Run Level 1: `cc-conversation-search search "authentication bug" --days 14 --json`
-2. If no matches, Level 2: `cc-conversation-search search "auth" --json`
-3. If still no matches, Level 3 (list + tree exploration)
-4. When found, display session ID, project path, timestamp, and resume commands
+Todo workflow:
+1. ✓ Tool installed/upgraded
+2. ✓ Classify: TOPIC query
+3. ✓ Level 1: `cc-conversation-search search "authentication bug" --days 14 --json`
+4. If no results → Level 2: `cc-conversation-search search "auth bug" --json`
+5. Present results with resume commands
 
-**Example 2: User exploring past work**
-```
-User: "Did we ever discuss React hooks?"
-```
-
-You should:
-1. Run Level 1: `cc-conversation-search search "react hooks" --days 30 --json`
-2. Display all matches with session IDs and project paths
-3. Show resume commands for each match
-
-**Example 3: User wants to return to specific work**
-```
-User: "I want to go back to where we started implementing the API"
-```
-
-You should:
-1. Search: `cc-conversation-search search "implementing API" --json`
-2. Display session ID and project path prominently
-3. Show exact resume commands
-4. Offer context if needed: `cc-conversation-search context <UUID> --json`
-
-**Example 4: User asks about yesterday (temporal query)**
+**Example 2: Temporal query**
 ```
 User: "What did we work on yesterday?"
 ```
 
-You should:
-1. Classify: TEMPORAL query (not topic search)
-2. Run: `cc-conversation-search list --date yesterday --json`
-3. Parse JSON results
-4. Group by project_path
-5. Analyze conversation_summary fields
-6. Present organized summary by project with highlights
+Todo workflow:
+1. ✓ Tool installed/upgraded
+2. ✓ Classify: TEMPORAL query
+3. ✓ Level 1: `cc-conversation-search list --date yesterday --json`
+4. Parse conversations, group by project
+5. Present organized summary
 
-**Example 5: User wants this week's summary (temporal query)**
-```
-User: "Summarize what we accomplished this week"
-```
-
-You should:
-1. Classify: TEMPORAL query
-2. Calculate date range (7 days ago to today)
-3. Run: `cc-conversation-search list --since <7-days-ago> --until today --json`
-4. Parse all conversations from last 7 days
-5. Group by project_path and date
-6. Present weekly summary organized by project
-
-**Example 6: User wants recent work on specific topic (hybrid)**
+**Example 3: Hybrid query**
 ```
 User: "Show me yesterday's authentication work"
 ```
 
-You should:
-1. Classify: HYBRID (topic + time)
-2. Run: `cc-conversation-search search "authentication" --date yesterday --json`
-3. Display matching sessions with resume commands
+Todo workflow:
+1. ✓ Tool installed/upgraded
+2. ✓ Classify: HYBRID query (topic + time)
+3. ✓ Level 1: `cc-conversation-search search "authentication" --date yesterday --json`
+4. Present matching sessions
+
+**Example 4: Counting/analysis query**
+```
+User: "How many times did you say 'absolutely right' in the past week?"
+```
+
+Todo workflow:
+1. ✓ Tool installed/upgraded
+2. ✓ Classify: HYBRID query (phrase + time)
+3. ✓ Level 1: `cc-conversation-search search "absolutely right" --days 7 --json`
+4. Parse JSON, filter `message_type == "assistant"`, count results
+5. Present count with context snippets
+
+## Error Handling
+
+**Tool not installed:**
+- Guide user through installation (see Prerequisites section)
+- Do not proceed until confirmed
+
+**Database not found:**
+- User must run: `cc-conversation-search init`
+- Creates `~/.conversation-search/index.db`
+
+**Empty results:**
+- Follow Level 1 → 2 → 3 progression
+- Do not give up after Level 1
+- Only report "not found" after Level 3 fails
