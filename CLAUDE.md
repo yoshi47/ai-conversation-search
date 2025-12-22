@@ -7,13 +7,16 @@
 - `cli.py` reads version dynamically via `importlib.metadata`
 - Plugin JSON files (`.claude-plugin/*.json`) must be updated manually when bumping
 
-## Version Locations
+## Bumping Version
 
-When bumping the version, update these files:
+```bash
+./scripts/bump-version.sh 0.5.3
+```
 
-1. **pyproject.toml** - `version = "x.y.z"` (PRIMARY - PyPI package version)
-2. **.claude-plugin/plugin.json** - `"version": "x.y.z"` (plugin metadata)
-3. **.claude-plugin/marketplace.json** - `"version": "x.y.z"` (marketplace metadata)
+This updates all version locations:
+- `pyproject.toml` (PyPI package)
+- `.claude-plugin/plugin.json` (plugin metadata)
+- `.claude-plugin/marketplace.json` (marketplace metadata)
 
 ## Pre-push Hook
 
