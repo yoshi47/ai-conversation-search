@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,10 @@ from conversation_search.core.indexer import ConversationIndexer
 from conversation_search.core.search import ConversationSearch, format_timestamp
 
 __version__ = "0.5.0"
+
+# Configurable Claude command (default: 'claude')
+# Set CC_CONVERSATION_SEARCH_CMD env var to override (e.g., 'clauded' for alias)
+CLAUDE_CMD = os.environ.get('CC_CONVERSATION_SEARCH_CMD', 'claude')
 
 
 def localize_timestamps(data: Any) -> Any:
@@ -186,7 +191,7 @@ def cmd_search(args):
 
         print(f"\n   Resume:")
         print(f"     cd {project_dir}")
-        print(f"     clauded --resume {result['session_id']}")
+        print(f"     {CLAUDE_CMD} --resume {result['session_id']}")
         print()
 
 
@@ -348,7 +353,7 @@ def cmd_resume(args):
         project_dir = f"/{project_dir}"
 
     print(f"cd {project_dir}")
-    print(f"clauded --resume {session_id}")
+    print(f"{CLAUDE_CMD} --resume {session_id}")
 
 
 def main():
