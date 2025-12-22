@@ -6,13 +6,17 @@ import json
 import os
 import sys
 from datetime import datetime
+from importlib.metadata import version, PackageNotFoundError
 from pathlib import Path
 from typing import Any, Dict, List, Union
 
 from conversation_search.core.indexer import ConversationIndexer
 from conversation_search.core.search import ConversationSearch, format_timestamp
 
-__version__ = "0.5.1"
+try:
+    __version__ = version("cc-conversation-search")
+except PackageNotFoundError:
+    __version__ = "dev"
 
 # Configurable Claude command (default: 'claude')
 # Set CC_CONVERSATION_SEARCH_CMD env var to override (e.g., 'clauded' for alias)

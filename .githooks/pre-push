@@ -1,0 +1,28 @@
+#!/bin/bash
+# Pre-push hook: Check if version already exists on PyPI
+# Prevents CI failures from duplicate version uploads
+
+set -e
+
+# Extract version from pyproject.toml
+VERSION=$(grep -m1 '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+
+if [ -z "$VERSION" ]; then
+    echo "Error: Could not extract version from pyproject.toml"
+    exit 1
+fi
+
+# Check if version exists on PyPI
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/cc-conversation-search/${VERSION}/json")
+
+if [ "$HTTP_STATUS" = "200" ]; then
+    echo "Error: Version ${VERSION} already exists on PyPI!"
+    echo "Bump the version in pyproject.toml before pushing."
+    echo ""
+    echo "Also update plugin versions in:"
+    echo "  - .claude-plugin/plugin.json"
+    echo "  - .claude-plugin/marketplace.json"
+    exit 1
+fi
+
+echo "Version check passed: ${VERSION} not on PyPI yet"

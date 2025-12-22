@@ -1,37 +1,24 @@
 # Version Management
 
-## Current Version: 0.5.1
+## Single Source of Truth
 
-## Version Locations (Keep in Sync)
+**pyproject.toml** is the single source of truth for the package version.
 
-When bumping the version, update ALL of these files:
+- `cli.py` reads version dynamically via `importlib.metadata`
+- Plugin JSON files (`.claude-plugin/*.json`) must be updated manually when bumping
 
-1. **pyproject.toml** - Line 3: `version = "0.5.1"`
-2. **src/conversation_search/cli.py** - Line 15: `__version__ = "0.5.1"`
-3. **.claude-plugin/plugin.json** - Line 3: `"version": "0.5.1"`
-4. **.claude-plugin/marketplace.json** - Line 12: `"version": "0.5.1"`
+## Version Locations
 
-## Quick Sync Command
+When bumping the version, update these files:
 
-```bash
-# Find all version strings (should all show same version)
-grep -n "version.*0\." pyproject.toml .claude-plugin/*.json src/conversation_search/cli.py
-```
+1. **pyproject.toml** - `version = "x.y.z"` (PRIMARY - PyPI package version)
+2. **.claude-plugin/plugin.json** - `"version": "x.y.z"` (plugin metadata)
+3. **.claude-plugin/marketplace.json** - `"version": "x.y.z"` (marketplace metadata)
 
-## Version Strategy (MVP)
+## Pre-push Hook
 
-- **Minimum supported version**: 0.4.0 (documented in SKILL.md)
-- **Auto-upgrade on skill activation**: SKILL.md instructs Claude to run `uv tool upgrade cc-conversation-search`
-- **Manual sync**: Update all 4 files when bumping version (no automation yet)
-- **Future**: Consider build script to auto-sync from pyproject.toml
-
-## How It Works
-
-When users update the plugin via `/plugin update conversation-search`:
-1. Plugin files get updated (including new SKILL.md)
-2. SKILL.md tells Claude to run `uv tool upgrade cc-conversation-search` on activation
-3. User gets latest CLI automatically
-4. No version mismatch issues
+A git pre-push hook validates that the version in pyproject.toml doesn't already exist on PyPI.
+This prevents CI failures from trying to upload duplicate versions.
 
 ## Breaking Changes
 
