@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Union
 from conversation_search.core.indexer import ConversationIndexer
 from conversation_search.core.search import ConversationSearch, format_timestamp
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # Configurable Claude command (default: 'claude')
 # Set CC_CONVERSATION_SEARCH_CMD env var to override (e.g., 'clauded' for alias)

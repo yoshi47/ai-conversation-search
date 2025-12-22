@@ -1,15 +1,15 @@
 # Version Management
 
-## Current Version: 0.4.6
+## Current Version: 0.5.1
 
 ## Version Locations (Keep in Sync)
 
 When bumping the version, update ALL of these files:
 
-1. **pyproject.toml** - Line 3: `version = "0.4.6"`
-2. **src/conversation_search/cli.py** - Line 12: `__version__ = "0.4.6"`
-3. **.claude-plugin/plugin.json** - Line 3: `"version": "0.4.6"`
-4. **.claude-plugin/marketplace.json** - Line 12: `"version": "0.4.6"`
+1. **pyproject.toml** - Line 3: `version = "0.5.1"`
+2. **src/conversation_search/cli.py** - Line 15: `__version__ = "0.5.1"`
+3. **.claude-plugin/plugin.json** - Line 3: `"version": "0.5.1"`
+4. **.claude-plugin/marketplace.json** - Line 12: `"version": "0.5.1"`
 
 ## Quick Sync Command
 
