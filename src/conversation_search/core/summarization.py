@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 
+from conversation_search.core.db import connect as connect_db
+
 
 class MessageSummarizer:
     """Handles smart hybrid extraction without AI summarization"""
@@ -157,9 +159,7 @@ class MessageSummarizer:
 
     def update_database(self, summaries: List[Dict], method: str = 'smart_extraction'):
         """Update database with extracted searchable text"""
-        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn = connect_db(str(self.db_path))
         cursor = conn.cursor()
 
         updated = 0
@@ -195,9 +195,7 @@ class MessageSummarizer:
         if not message_uuids:
             return
 
-        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn = connect_db(str(self.db_path))
         cursor = conn.cursor()
 
         try:
@@ -220,9 +218,7 @@ class MessageSummarizer:
         if not message_uuids:
             return
 
-        conn = sqlite3.connect(str(self.db_path), timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn = connect_db(str(self.db_path))
         cursor = conn.cursor()
 
         try:

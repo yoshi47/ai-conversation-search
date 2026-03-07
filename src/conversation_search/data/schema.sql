@@ -113,14 +113,3 @@ CREATE TABLE IF NOT EXISTS repo_root_cache (
     resolved_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
--- Processing queue for new/updated files
-CREATE TABLE IF NOT EXISTS index_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_path TEXT UNIQUE NOT NULL,
-    discovered_at TEXT DEFAULT CURRENT_TIMESTAMP,
-    processed_at TEXT,
-    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'completed', 'failed')),
-    error_message TEXT
-);
-
-CREATE INDEX IF NOT EXISTS idx_queue_status ON index_queue(status);

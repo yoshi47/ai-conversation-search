@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
+from conversation_search.core.db import connect as connect_db
 from conversation_search.core.git_utils import resolve_repo_root
 
 
@@ -54,12 +55,7 @@ class OpenCodeIndexer:
 
     def _connect_search_db(self) -> sqlite3.Connection:
         """Connect to the search database."""
-        conn = sqlite3.connect(str(self.search_db_path), timeout=30.0)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.row_factory = sqlite3.Row
-        return conn
+        return connect_db(str(self.search_db_path))
 
     def _ensure_sync_table(self, conn: sqlite3.Connection):
         """Create the sync state table if needed."""

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
 from importlib.resources import files
+from conversation_search.core.db import connect as connect_db
 from conversation_search.core.summarization import (
     MessageSummarizer,
     is_summarizer_conversation,
@@ -24,15 +25,8 @@ class ConversationIndexer:
     def __init__(self, db_path: str = "~/.conversation-search/index.db", quiet: bool = False):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(self.db_path), timeout=30.0)
+        self.conn = connect_db(db_path)
         self.quiet = quiet
-
-        # Enable WAL mode for concurrent access
-        self.conn.execute("PRAGMA journal_mode=WAL")
-        self.conn.execute("PRAGMA synchronous=NORMAL")
-        self.conn.execute("PRAGMA busy_timeout=30000")  # 30 second busy timeout
-
-        self.conn.row_factory = sqlite3.Row
         self._init_db()
         self.summarizer = MessageSummarizer(db_path=str(self.db_path))
         self._summarizer_project_hash = None

@@ -136,6 +136,27 @@ def _index_codex(quiet: bool = False, days_back: int = 1):
     cx_indexer.scan_and_index(days_back=days_back)
 
 
+def _auto_index(days_back: int = 30, quiet: bool = True):
+    """Auto-index all sources before search/list/context commands."""
+    indexer = ConversationIndexer(quiet=quiet)
+    files = indexer.scan_conversations(days_back=days_back)
+    if files:
+        for conv_file in files:
+            try:
+                indexer.index_conversation(conv_file, summarize=True)
+            except Exception:
+                pass
+    indexer.close()
+    try:
+        _index_opencode(quiet=quiet, days_back=days_back)
+    except Exception:
+        pass
+    try:
+        _index_codex(quiet=quiet, days_back=days_back)
+    except Exception:
+        pass
+
+
 def cmd_index(args):
     """Index conversations (JIT - fast without AI calls)"""
     quiet = args.quiet
@@ -171,26 +192,8 @@ def cmd_index(args):
 
 def cmd_search(args):
     """Search conversations"""
-    # Auto-index before searching to ensure fresh data
     if not getattr(args, 'no_index', False):
-        days_to_index = args.days if args.days else 30
-        indexer = ConversationIndexer(quiet=True)
-        files = indexer.scan_conversations(days_back=days_to_index)
-        if files:
-            for conv_file in files:
-                try:
-                    indexer.index_conversation(conv_file, summarize=True)
-                except Exception:
-                    pass  # Silent failures for auto-indexing
-        indexer.close()
-        try:
-            _index_opencode(quiet=True, days_back=days_to_index)
-        except Exception:
-            pass
-        try:
-            _index_codex(quiet=True, days_back=days_to_index)
-        except Exception:
-            pass
+        _auto_index(days_back=args.days if args.days else 30)
 
     search = ConversationSearch()
 
@@ -261,17 +264,8 @@ def cmd_search(args):
 
 def cmd_context(args):
     """Get context around a message"""
-    # Auto-index recent conversations to ensure fresh data
     if not getattr(args, 'no_index', False):
-        indexer = ConversationIndexer(quiet=True)
-        files = indexer.scan_conversations(days_back=30)
-        if files:
-            for conv_file in files:
-                try:
-                    indexer.index_conversation(conv_file, summarize=True)
-                except Exception:
-                    pass  # Silent failures for auto-indexing
-        indexer.close()
+        _auto_index(days_back=30)
 
     search = ConversationSearch()
 
@@ -319,26 +313,8 @@ def cmd_context(args):
 
 def cmd_list(args):
     """List recent conversations"""
-    # Auto-index before listing to ensure fresh data
     if not getattr(args, 'no_index', False):
-        days_to_index = args.days if args.days else 30
-        indexer = ConversationIndexer(quiet=True)
-        files = indexer.scan_conversations(days_back=days_to_index)
-        if files:
-            for conv_file in files:
-                try:
-                    indexer.index_conversation(conv_file, summarize=True)
-                except Exception:
-                    pass  # Silent failures for auto-indexing
-        indexer.close()
-        try:
-            _index_opencode(quiet=True, days_back=days_to_index)
-        except Exception:
-            pass
-        try:
-            _index_codex(quiet=True, days_back=days_to_index)
-        except Exception:
-            pass
+        _auto_index(days_back=args.days if args.days else 30)
 
     search = ConversationSearch()
 
