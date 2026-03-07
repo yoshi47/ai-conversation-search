@@ -22,6 +22,11 @@ except PackageNotFoundError:
 # Set CC_CONVERSATION_SEARCH_CMD env var to override (e.g., 'clauded' for alias)
 CLAUDE_CMD = os.environ.get('CC_CONVERSATION_SEARCH_CMD', 'claude')
 
+# Source display labels
+SOURCE_LABELS = {'opencode': '[OC]', 'codex': '[CX]'}
+# Sources that store real paths (not Claude Code's hyphenated format)
+EXTERNAL_SOURCES = {'opencode', 'codex'}
+
 
 def localize_timestamps(data: Any) -> Any:
     """Recursively convert UTC ISO timestamps to local timezone"""
@@ -89,8 +94,9 @@ def cmd_init(args):
 
     indexer.close()
 
-    # Also index OpenCode
+    # Also index OpenCode and Codex
     _index_opencode(quiet=quiet, days_back=days)
+    _index_codex(quiet=quiet, days_back=days)
 
     if not quiet:
         print(f"\n✓ Initialization complete!")
@@ -114,6 +120,20 @@ def _index_opencode(quiet: bool = False, days_back: int = 1):
         print("\nIndexing OpenCode conversations...")
     oc_indexer = OpenCodeIndexer(quiet=quiet)
     oc_indexer.scan_and_index(days_back=days_back)
+
+
+def _index_codex(quiet: bool = False, days_back: int = 1):
+    """Index Codex CLI conversations if the sessions directory exists."""
+    from conversation_search.core.codex_indexer import CodexIndexer, DEFAULT_CODEX_SESSIONS
+
+    sessions_dir = Path(DEFAULT_CODEX_SESSIONS).expanduser()
+    if not sessions_dir.exists():
+        return
+
+    if not quiet:
+        print("\nIndexing Codex CLI conversations...")
+    cx_indexer = CodexIndexer(quiet=quiet)
+    cx_indexer.scan_and_index(days_back=days_back)
 
 
 def cmd_index(args):
@@ -144,8 +164,9 @@ def cmd_index(args):
 
     indexer.close()
 
-    # Also index OpenCode
+    # Also index OpenCode and Codex
     _index_opencode(quiet=quiet, days_back=args.days if not args.all else 9999)
+    _index_codex(quiet=quiet, days_back=args.days if not args.all else 9999)
 
 
 def cmd_search(args):
@@ -162,7 +183,14 @@ def cmd_search(args):
                 except Exception:
                     pass  # Silent failures for auto-indexing
         indexer.close()
-        _index_opencode(quiet=True, days_back=days_to_index)
+        try:
+            _index_opencode(quiet=True, days_back=days_to_index)
+        except Exception:
+            pass
+        try:
+            _index_codex(quiet=True, days_back=days_to_index)
+        except Exception:
+            pass
 
     search = ConversationSearch()
 
@@ -195,11 +223,12 @@ def cmd_search(args):
     for result in results:
         icon = "👤" if result['message_type'] == 'user' else "🤖"
         timestamp = format_timestamp(result['timestamp'])
-        source_label = "[OC]" if result.get('source') == 'opencode' else "[CC]"
+        source = result.get('source', 'claude_code')
+        source_label = SOURCE_LABELS.get(source, '[CC]')
 
-        # For OpenCode, project_path is already a real path
-        is_opencode = result.get('source') == 'opencode'
-        if is_opencode:
+        # For external sources, project_path is already a real path
+        is_external = source in EXTERNAL_SOURCES
+        if is_external:
             project_dir = result['project_path'] or ''
         else:
             project_dir = result['project_path'].replace('-', '/')
@@ -219,8 +248,10 @@ def cmd_search(args):
         else:
             print(f"\n   {result['context_snippet']}")
 
-        if is_opencode:
+        if source == 'opencode':
             print(f"\n   OpenCode session: {result['session_id'].removeprefix('oc:')}")
+        elif source == 'codex':
+            print(f"\n   Codex session: {result['session_id'].removeprefix('codex:')}")
         else:
             print(f"\n   Resume:")
             print(f"     cd {project_dir}")
@@ -300,7 +331,14 @@ def cmd_list(args):
                 except Exception:
                     pass  # Silent failures for auto-indexing
         indexer.close()
-        _index_opencode(quiet=True, days_back=days_to_index)
+        try:
+            _index_opencode(quiet=True, days_back=days_to_index)
+        except Exception:
+            pass
+        try:
+            _index_codex(quiet=True, days_back=days_to_index)
+        except Exception:
+            pass
 
     search = ConversationSearch()
 
@@ -326,7 +364,8 @@ def cmd_list(args):
 
     for conv in convs:
         timestamp = format_timestamp(conv['last_message_at'])
-        source_label = "[OC]" if conv.get('source') == 'opencode' else "[CC]"
+        source = conv.get('source', 'claude_code')
+        source_label = SOURCE_LABELS.get(source, '[CC]')
         print(f"{source_label} [{timestamp}] {conv['conversation_summary']}")
         print(f"  {conv['message_count']} messages")
         print(f"  {conv['project_path']}")
@@ -427,7 +466,7 @@ def main():
     search_parser.add_argument('--date', help='Specific date (YYYY-MM-DD, yesterday, today)')
     search_parser.add_argument('--project', help='Filter by project path')
     search_parser.add_argument('--repo', help='Filter by repository root (partial match)')
-    search_parser.add_argument('--source', choices=['claude_code', 'opencode'], help='Filter by source (default: all)')
+    search_parser.add_argument('--source', choices=['claude_code', 'opencode', 'codex'], help='Filter by source (default: all)')
     search_parser.add_argument('--limit', type=int, default=20, help='Max results (default: 20)')
     search_parser.add_argument('--content', action='store_true', help='Show full content')
     search_parser.add_argument('--json', action='store_true', help='Output as JSON')
@@ -451,7 +490,7 @@ def main():
     list_parser.add_argument('--date', help='Specific date (YYYY-MM-DD, yesterday, today)')
     list_parser.add_argument('--limit', type=int, default=20, help='Max results (default: 20)')
     list_parser.add_argument('--repo', help='Filter by repository root (partial match)')
-    list_parser.add_argument('--source', choices=['claude_code', 'opencode'], help='Filter by source (default: all)')
+    list_parser.add_argument('--source', choices=['claude_code', 'opencode', 'codex'], help='Filter by source (default: all)')
     list_parser.add_argument('--json', action='store_true', help='Output as JSON')
     list_parser.add_argument('--no-index', action='store_true', help='Skip auto-indexing (faster but may be stale)')
     list_parser.set_defaults(func=cmd_list)
