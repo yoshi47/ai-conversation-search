@@ -1,35 +1,7 @@
-skills/conversation-search/SKILL.md
-  275a0adae76419b3 193-195,206-208,214-216
-src/conversation_search/core/git_utils.py
-  275a0adae76419b3 1-48
-src/conversation_search/cli.py
-  275a0adae76419b3 158-159,283-284,398,421
-src/conversation_search/data/schema.sql
-  275a0adae76419b3 77,92-99
-src/conversation_search/core/indexer.py
-  275a0adae76419b3 20,52-54,56-80,83-195,197-224,227-228,620,624,627,631,707-709
-src/conversation_search/core/search.py
-  275a0adae76419b3 18-22,76,167-170,320-321,368-371,425,455-458,576,853-854,882-883,947-948
-tests/test_repo_root.py
-  275a0adae76419b3 1-278
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.1.8",
   "base_commit_sha": "771a1acd811fd1b96b294337ce25cf4587f62189",
-  "prompts": {
-    "275a0adae76419b3": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "341da119-bfbf-439b-acc9-0a1a730ff546",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47 <yoshix47@gmail.com>",
-      "messages": [],
-      "total_additions": 728,
-      "total_deletions": 177,
-      "accepted_lines": 560,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
