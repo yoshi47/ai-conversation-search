@@ -1,35 +1,7 @@
-.claude-plugin/plugin.json
-  71752f3abd1472e2 6-7,9
-README.md
-  71752f3abd1472e2 27,306
-.claude-plugin/README.md
-  71752f3abd1472e2 13
-.claude-plugin/INSTALL.md
-  71752f3abd1472e2 63-64
-.claude-plugin/marketplace.json
-  71752f3abd1472e2 4-5,7,15-16,18
-pyproject.toml
-  71752f3abd1472e2 9-10,27-28
-LICENSE.txt
-  71752f3abd1472e2 2
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.1.8",
   "base_commit_sha": "a2247a15af1e06df5c016745cc9d3dadabd2a3dc",
-  "prompts": {
-    "71752f3abd1472e2": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "5d1a3fee-12f0-483d-8bf7-b80da8de1048",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47 <yoshix47@gmail.com>",
-      "messages": [],
-      "total_additions": 33,
-      "total_deletions": 31,
-      "accepted_lines": 19,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
