@@ -1,0 +1,37 @@
+tests/test_opencode_indexer.py
+  328b9afd10b73a80 1-326
+src/conversation_search/core/search.py
+  328b9afd10b73a80 77-78,116-117,145-146,174-177,328-329,380-383
+src/conversation_search/cli.py
+  328b9afd10b73a80 90-96,104-116,128-131,143,147-148,155,165,178-179,198,200-204,209,222-224,293,303,313-314,329-330,430,454
+tests/test_repo_root.py
+  328b9afd10b73a80 116
+src/conversation_search/core/indexer.py
+  328b9afd10b73a80 81-96
+src/conversation_search/data/schema.sql
+  328b9afd10b73a80 85,94-100
+tests/test_date_filtering.py
+  328b9afd10b73a80 55,286
+src/conversation_search/core/opencode_indexer.py
+  328b9afd10b73a80 1-343
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.8",
+  "base_commit_sha": "2c7732249b2d25b6bf3fc88e58f3e244fce4a42b",
+  "prompts": {
+    "328b9afd10b73a80": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "aa367afb-01e2-4828-8bf5-cdaf4d295c24",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 813,
+      "total_deletions": 72,
+      "accepted_lines": 768,
+      "overriden_lines": 0
+    }
+  }
+}
