@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     first_message_at TEXT,
     last_message_at TEXT,
     message_count INTEGER DEFAULT 0,
+    source TEXT DEFAULT 'claude_code',
     indexed_at TEXT DEFAULT CURRENT_TIMESTAMP,
 
     FOREIGN KEY (root_message_uuid) REFERENCES messages(message_uuid)
@@ -90,6 +91,13 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_path);
 CREATE INDEX IF NOT EXISTS idx_conv_last_message ON conversations(last_message_at DESC);
 CREATE INDEX IF NOT EXISTS idx_conv_repo_root ON conversations(repo_root);
+CREATE INDEX IF NOT EXISTS idx_conv_source ON conversations(source);
+
+-- OpenCode sync state
+CREATE TABLE IF NOT EXISTS opencode_sync_state (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 
 -- Cache for resolved repo roots (avoids repeated git commands)
 CREATE TABLE IF NOT EXISTS repo_root_cache (

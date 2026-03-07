@@ -78,6 +78,22 @@ class ConversationIndexer:
             CREATE INDEX IF NOT EXISTS idx_conv_repo_root ON conversations(repo_root)
         """)
 
+        # Migration: Add source column to conversations
+        try:
+            self.conn.execute("""
+                ALTER TABLE conversations ADD COLUMN source TEXT DEFAULT 'claude_code'
+            """)
+            if not self.quiet:
+                print("  Migrated database: added source column")
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise
+
+        # Migration: Create index on source
+        self.conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_conv_source ON conversations(source)
+        """)
+
         self.conn.commit()
 
     def _decode_project_dir_name(self, dir_name: str) -> Optional[str]:

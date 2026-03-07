@@ -74,7 +74,8 @@ class ConversationSearch:
         limit: int = 20,
         project_path: Optional[str] = None,
         repo: Optional[str] = None,
-        snippet_tokens: int = 128
+        snippet_tokens: int = 128,
+        source: Optional[str] = None
     ) -> List[Dict]:
         """
         Search conversations using full-text search on complete content
@@ -112,7 +113,8 @@ class ConversationSearch:
                     m.is_sidechain,
                     SUBSTR(m.full_content, 1, 500) as context_snippet,
                     c.conversation_summary,
-                    c.conversation_file
+                    c.conversation_file,
+                    c.source
                 FROM messages m
                 JOIN conversations c ON m.session_id = c.session_id
                 WHERE m.is_meta_conversation = FALSE
@@ -140,7 +142,8 @@ class ConversationSearch:
                     m.is_sidechain,
                     snippet(message_content_fts, 1, '**', '**', '...', ?) as context_snippet,
                     c.conversation_summary,
-                    c.conversation_file
+                    c.conversation_file,
+                    c.source
                 FROM messages m
                 JOIN message_content_fts ON m.rowid = message_content_fts.rowid
                 JOIN conversations c ON m.session_id = c.session_id
@@ -167,6 +170,10 @@ class ConversationSearch:
         if repo:
             sql += " AND c.repo_root LIKE ? ESCAPE '\\'"
             params.append(f"%{_escape_like(repo)}%")
+
+        if source:
+            sql += " AND c.source = ?"
+            params.append(source)
 
         sql += " ORDER BY m.timestamp DESC LIMIT ?"
         params.append(limit)
@@ -318,7 +325,8 @@ class ConversationSearch:
         date: Optional[str] = None,
         limit: int = 20,
         project_path: Optional[str] = None,
-        repo: Optional[str] = None
+        repo: Optional[str] = None,
+        source: Optional[str] = None
     ) -> List[Dict]:
         """
         List recent conversations
@@ -368,6 +376,10 @@ class ConversationSearch:
         if repo:
             sql += " AND repo_root LIKE ? ESCAPE '\\'"
             params.append(f"%{_escape_like(repo)}%")
+
+        if source:
+            sql += " AND source = ?"
+            params.append(source)
 
         sql += " ORDER BY last_message_at DESC LIMIT ?"
         params.append(limit)

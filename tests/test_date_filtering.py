@@ -52,6 +52,7 @@ class TestSearchWithDateFilters:
                 first_message_at TEXT,
                 last_message_at TEXT,
                 message_count INTEGER DEFAULT 0,
+                source TEXT DEFAULT 'claude_code',
                 indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
 
@@ -282,6 +283,7 @@ class TestListWithDateFilters:
                 first_message_at TEXT,
                 last_message_at TEXT,
                 message_count INTEGER DEFAULT 0,
+                source TEXT DEFAULT 'claude_code',
                 indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
             );
         """)

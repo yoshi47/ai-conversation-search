@@ -87,17 +87,33 @@ def cmd_init(args):
         except Exception as e:
             print(f"\n  Error indexing {conv_file.name}: {e}")
 
-    if quiet:
-        print(f"✓ Indexed {len(files)} conversations")
-    else:
-        print(f"\n\n✓ Initialization complete!")
+    indexer.close()
+
+    # Also index OpenCode
+    _index_opencode(quiet=quiet, days_back=days)
+
+    if not quiet:
+        print(f"\n✓ Initialization complete!")
         print(f"  Database: {db_path}")
         print(f"\nNext steps:")
         print(f"  • Search conversations: cc-conversation-search search '<query>'")
         print(f"  • List recent: cc-conversation-search list")
         print(f"  • Re-index: cc-conversation-search index")
 
-    indexer.close()
+
+def _index_opencode(quiet: bool = False, days_back: int = 1):
+    """Index OpenCode conversations if the database exists."""
+    from conversation_search.core.opencode_indexer import OpenCodeIndexer, DEFAULT_OPENCODE_DB
+    from pathlib import Path
+
+    oc_db = Path(DEFAULT_OPENCODE_DB).expanduser()
+    if not oc_db.exists():
+        return
+
+    if not quiet:
+        print("\nIndexing OpenCode conversations...")
+    oc_indexer = OpenCodeIndexer(quiet=quiet)
+    oc_indexer.scan_and_index(days_back=days_back)
 
 
 def cmd_index(args):
@@ -109,33 +125,35 @@ def cmd_index(args):
 
     if not files:
         if not quiet:
-            print("No conversations to index")
-        return
+            print("No Claude Code conversations to index")
+    else:
+        if not quiet:
+            print(f"Indexing {len(files)} Claude Code conversations...")
 
-    if not quiet:
-        print(f"Indexing {len(files)} conversations...")
+        for i, conv_file in enumerate(files, 1):
+            try:
+                if not quiet:
+                    print(f"[{i}/{len(files)}] {conv_file.name}", end="\r")
+                indexer.index_conversation(conv_file, summarize=not args.no_extract)
+            except Exception as e:
+                if not quiet:
+                    print(f"\nError indexing {conv_file.name}: {e}")
 
-    for i, conv_file in enumerate(files, 1):
-        try:
-            if not quiet:
-                print(f"[{i}/{len(files)}] {conv_file.name}", end="\r")
-            indexer.index_conversation(conv_file, summarize=not args.no_extract)
-        except Exception as e:
-            if not quiet:
-                print(f"\nError indexing {conv_file.name}: {e}")
+        if not quiet:
+            print(f"✓ Indexed {len(files)} Claude Code conversations")
 
-    if not quiet:
-        print(f"✓ Indexed {len(files)} conversations")
     indexer.close()
+
+    # Also index OpenCode
+    _index_opencode(quiet=quiet, days_back=args.days if not args.all else 9999)
 
 
 def cmd_search(args):
     """Search conversations"""
     # Auto-index before searching to ensure fresh data
     if not getattr(args, 'no_index', False):
+        days_to_index = args.days if args.days else 30
         indexer = ConversationIndexer(quiet=True)
-        # Index at least as far back as search range, minimum 30 days
-        days_to_index = max(args.days if args.days else 30, 30)
         files = indexer.scan_conversations(days_back=days_to_index)
         if files:
             for conv_file in files:
@@ -144,6 +162,7 @@ def cmd_search(args):
                 except Exception:
                     pass  # Silent failures for auto-indexing
         indexer.close()
+        _index_opencode(quiet=True, days_back=days_to_index)
 
     search = ConversationSearch()
 
@@ -156,7 +175,8 @@ def cmd_search(args):
             date=getattr(args, 'date', None),
             limit=args.limit,
             project_path=args.project,
-            repo=getattr(args, 'repo', None)
+            repo=getattr(args, 'repo', None),
+            source=getattr(args, 'source', None)
         )
     except Exception as e:
         print(f"Error: {e}")
@@ -175,13 +195,18 @@ def cmd_search(args):
     for result in results:
         icon = "👤" if result['message_type'] == 'user' else "🤖"
         timestamp = format_timestamp(result['timestamp'])
+        source_label = "[OC]" if result.get('source') == 'opencode' else "[CC]"
 
-        # Convert project_path hash to actual path
-        project_dir = result['project_path'].replace('-', '/')
-        if not project_dir.startswith('/'):
-            project_dir = f"/{project_dir}"
+        # For OpenCode, project_path is already a real path
+        is_opencode = result.get('source') == 'opencode'
+        if is_opencode:
+            project_dir = result['project_path'] or ''
+        else:
+            project_dir = result['project_path'].replace('-', '/')
+            if not project_dir.startswith('/'):
+                project_dir = f"/{project_dir}"
 
-        print(f"{icon}  {result['conversation_summary']}")
+        print(f"{icon} {source_label} {result['conversation_summary']}")
         print(f"   Session: {result['session_id']}")
         print(f"   Project: {project_dir}")
         print(f"   Time: {timestamp}")
@@ -194,9 +219,12 @@ def cmd_search(args):
         else:
             print(f"\n   {result['context_snippet']}")
 
-        print(f"\n   Resume:")
-        print(f"     cd {project_dir}")
-        print(f"     {CLAUDE_CMD} --resume {result['session_id']}")
+        if is_opencode:
+            print(f"\n   OpenCode session: {result['session_id'].removeprefix('oc:')}")
+        else:
+            print(f"\n   Resume:")
+            print(f"     cd {project_dir}")
+            print(f"     {CLAUDE_CMD} --resume {result['session_id']}")
         print()
 
 
@@ -262,8 +290,8 @@ def cmd_list(args):
     """List recent conversations"""
     # Auto-index before listing to ensure fresh data
     if not getattr(args, 'no_index', False):
+        days_to_index = args.days if args.days else 30
         indexer = ConversationIndexer(quiet=True)
-        days_to_index = max(args.days if args.days else 30, 30)
         files = indexer.scan_conversations(days_back=days_to_index)
         if files:
             for conv_file in files:
@@ -272,6 +300,7 @@ def cmd_list(args):
                 except Exception:
                     pass  # Silent failures for auto-indexing
         indexer.close()
+        _index_opencode(quiet=True, days_back=days_to_index)
 
     search = ConversationSearch()
 
@@ -281,7 +310,8 @@ def cmd_list(args):
         until=getattr(args, 'until', None),
         date=getattr(args, 'date', None),
         limit=args.limit,
-        repo=getattr(args, 'repo', None)
+        repo=getattr(args, 'repo', None),
+        source=getattr(args, 'source', None)
     )
 
     if args.json:
@@ -296,7 +326,8 @@ def cmd_list(args):
 
     for conv in convs:
         timestamp = format_timestamp(conv['last_message_at'])
-        print(f"[{timestamp}] {conv['conversation_summary']}")
+        source_label = "[OC]" if conv.get('source') == 'opencode' else "[CC]"
+        print(f"{source_label} [{timestamp}] {conv['conversation_summary']}")
         print(f"  {conv['message_count']} messages")
         print(f"  {conv['project_path']}")
         print(f"  Session: {conv['session_id']}")
@@ -396,6 +427,7 @@ def main():
     search_parser.add_argument('--date', help='Specific date (YYYY-MM-DD, yesterday, today)')
     search_parser.add_argument('--project', help='Filter by project path')
     search_parser.add_argument('--repo', help='Filter by repository root (partial match)')
+    search_parser.add_argument('--source', choices=['claude_code', 'opencode'], help='Filter by source (default: all)')
     search_parser.add_argument('--limit', type=int, default=20, help='Max results (default: 20)')
     search_parser.add_argument('--content', action='store_true', help='Show full content')
     search_parser.add_argument('--json', action='store_true', help='Output as JSON')
@@ -419,6 +451,7 @@ def main():
     list_parser.add_argument('--date', help='Specific date (YYYY-MM-DD, yesterday, today)')
     list_parser.add_argument('--limit', type=int, default=20, help='Max results (default: 20)')
     list_parser.add_argument('--repo', help='Filter by repository root (partial match)')
+    list_parser.add_argument('--source', choices=['claude_code', 'opencode'], help='Filter by source (default: all)')
     list_parser.add_argument('--json', action='store_true', help='Output as JSON')
     list_parser.add_argument('--no-index', action='store_true', help='Skip auto-indexing (faster but may be stale)')
     list_parser.set_defaults(func=cmd_list)
