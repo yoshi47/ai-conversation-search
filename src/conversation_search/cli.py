@@ -103,10 +103,10 @@ def cmd_init(args):
 
 def _index_opencode(quiet: bool = False, days_back: int = 1):
     """Index OpenCode conversations if the database exists."""
-    from conversation_search.core.opencode_indexer import OpenCodeIndexer, DEFAULT_OPENCODE_DB
+    from conversation_search.core.opencode_indexer import OpenCodeIndexer, get_opencode_db_path
     from pathlib import Path
 
-    oc_db = Path(DEFAULT_OPENCODE_DB).expanduser()
+    oc_db = Path(get_opencode_db_path()).expanduser()
     if not oc_db.exists():
         return
 

@@ -6,6 +6,7 @@ into the same search database used by Claude Code conversations.
 """
 
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,14 @@ from conversation_search.core.git_utils import resolve_repo_root
 # Default OpenCode database path
 DEFAULT_OPENCODE_DB = "~/.local/share/opencode/opencode.db"
 
+
+def get_opencode_db_path() -> str:
+    """Resolve OpenCode DB path, respecting OPENCODE_HOME env var."""
+    opencode_home = os.environ.get("OPENCODE_HOME")
+    if opencode_home:
+        return os.path.join(opencode_home, "opencode.db")
+    return DEFAULT_OPENCODE_DB
+
 # Session ID prefix to avoid collisions with Claude Code sessions
 OC_PREFIX = "oc:"
 
@@ -25,7 +34,7 @@ class OpenCodeIndexer:
     def __init__(self, search_db_path: str = "~/.conversation-search/index.db",
                  opencode_db_path: Optional[str] = None, quiet: bool = False):
         self.search_db_path = Path(search_db_path).expanduser()
-        self.opencode_db_path = Path(opencode_db_path or DEFAULT_OPENCODE_DB).expanduser()
+        self.opencode_db_path = Path(opencode_db_path or get_opencode_db_path()).expanduser()
         self.quiet = quiet
         self._repo_root_cache = {}
 
