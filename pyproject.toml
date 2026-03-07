@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
 authors = [
-    {name = "akatz-ai", email = "katzfeyalex+akatzgh@gmail.com"}
+    {name = "akatz-ai", email = "katzfeyalex+akatzgh@gmail.com"},
+    {name = "yoshi47", email = "yoshix47@gmail.com"}
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -23,8 +24,8 @@ classifiers = [
 cc-conversation-search = "conversation_search.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/akatz-ai/cc-conversation-search"
-Issues = "https://github.com/akatz-ai/cc-conversation-search/issues"
+Homepage = "https://github.com/yoshi47/ai-conversation-search"
+Issues = "https://github.com/yoshi47/ai-conversation-search/issues"
 
 [build-system]
 requires = ["hatchling"]

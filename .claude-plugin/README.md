@@ -10,7 +10,7 @@ Users can install directly from your GitHub repository:
 
 ```bash
 # Add plugin to marketplace
-/plugin marketplace add akatz-ai/cc-conversation-search
+/plugin marketplace add yoshi47/ai-conversation-search
 
 # Install the plugin
 /plugin install conversation-search

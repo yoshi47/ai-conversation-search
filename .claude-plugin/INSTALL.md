@@ -60,5 +60,5 @@ Claude will use a progressive search strategy to find specific message UUIDs you
 - Try: `conversation-search list --days 30`
 
 **For help:**
-- Documentation: https://github.com/akatz-ai/cc-conversation-search
-- Issues: https://github.com/akatz-ai/cc-conversation-search/issues
+- Documentation: https://github.com/yoshi47/ai-conversation-search
+- Issues: https://github.com/yoshi47/ai-conversation-search/issues

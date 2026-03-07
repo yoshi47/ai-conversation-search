@@ -24,7 +24,7 @@ Install the complete plugin (skill + CLI tool instructions) directly in Claude C
 
 ```bash
 # Add this repo's marketplace
-/plugin marketplace add akatz-ai/cc-conversation-search
+/plugin marketplace add yoshi47/ai-conversation-search
 
 # Install the plugin
 /plugin install conversation-search
@@ -303,7 +303,7 @@ indexer.close()
 ### Setup
 
 ```bash
-git clone https://github.com/akatz-ai/cc-conversation-search
+git clone https://github.com/yoshi47/ai-conversation-search
 cd cc-conversation-search
 uv tool install -e .
 ```
