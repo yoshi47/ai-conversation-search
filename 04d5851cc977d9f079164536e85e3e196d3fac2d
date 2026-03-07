@@ -1,23 +1,7 @@
-tests/test_full_content_search.py
-  b81d912d73f94c6f 8,383-384,399-400
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.1.8",
   "base_commit_sha": "04d5851cc977d9f079164536e85e3e196d3fac2d",
-  "prompts": {
-    "b81d912d73f94c6f": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "faefa3be-b518-4bbf-ae88-4bfaf73250b3",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47 <yoshix47@gmail.com>",
-      "messages": [],
-      "total_additions": 5,
-      "total_deletions": 5,
-      "accepted_lines": 5,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
