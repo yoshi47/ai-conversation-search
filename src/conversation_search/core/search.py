@@ -15,6 +15,11 @@ from conversation_search.core.summarization import MessageSummarizer
 from conversation_search.core.date_utils import build_date_filter
 
 
+def _escape_like(value: str) -> str:
+    """Escape special LIKE characters (%, _, \\) for safe use in LIKE clauses."""
+    return value.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+
+
 def format_timestamp(iso_timestamp: str, include_date: bool = True, include_seconds: bool = False) -> str:
     """
     Convert UTC ISO timestamp to local time for display.
@@ -68,6 +73,7 @@ class ConversationSearch:
         date: Optional[str] = None,
         limit: int = 20,
         project_path: Optional[str] = None,
+        repo: Optional[str] = None,
         snippet_tokens: int = 128
     ) -> List[Dict]:
         """
@@ -157,6 +163,10 @@ class ConversationSearch:
         if project_path:
             sql += " AND m.project_path = ?"
             params.append(project_path)
+
+        if repo:
+            sql += " AND c.repo_root LIKE ? ESCAPE '\\'"
+            params.append(f"%{_escape_like(repo)}%")
 
         sql += " ORDER BY m.timestamp DESC LIMIT ?"
         params.append(limit)
@@ -307,7 +317,8 @@ class ConversationSearch:
         until: Optional[str] = None,
         date: Optional[str] = None,
         limit: int = 20,
-        project_path: Optional[str] = None
+        project_path: Optional[str] = None,
+        repo: Optional[str] = None
     ) -> List[Dict]:
         """
         List recent conversations
@@ -353,6 +364,10 @@ class ConversationSearch:
         if project_path:
             sql += " AND project_path = ?"
             params.append(project_path)
+
+        if repo:
+            sql += " AND repo_root LIKE ? ESCAPE '\\'"
+            params.append(f"%{_escape_like(repo)}%")
 
         sql += " ORDER BY last_message_at DESC LIMIT ?"
         params.append(limit)
@@ -407,6 +422,7 @@ class ConversationSearch:
         self,
         days_back: int = 1,
         project_path: Optional[str] = None,
+        repo: Optional[str] = None,
         max_conversations: int = 10,
         max_messages_per_conv: int = 50
     ) -> str:
@@ -435,6 +451,10 @@ class ConversationSearch:
         if project_path:
             sql += " AND project_path = ?"
             params.append(project_path)
+
+        if repo:
+            sql += " AND repo_root LIKE ? ESCAPE '\\'"
+            params.append(f"%{_escape_like(repo)}%")
 
         sql += " ORDER BY last_message_at DESC LIMIT ?"
         params.append(max_conversations)
@@ -553,6 +573,7 @@ def main():
     parser.add_argument('--limit', type=int, default=20,
                        help='Maximum results (default: 20)')
     parser.add_argument('--project', help='Filter by project path')
+    parser.add_argument('--repo', help='Filter by repository root (partial match)')
     parser.add_argument('--context', metavar='UUID',
                        help='Get context for a specific message UUID')
     parser.add_argument('--depth', type=int, default=3,
@@ -829,7 +850,8 @@ def main():
             # NEW: Context-first mode
             context = search.load_context(
                 days_back=args.days,
-                project_path=args.project
+                project_path=args.project,
+                repo=args.repo
             )
             print(context)
 
@@ -857,7 +879,8 @@ def main():
             results = search.list_recent_conversations(
                 days_back=args.days,
                 limit=args.limit,
-                project_path=args.project
+                project_path=args.project,
+                repo=args.repo
             )
             if args.json:
                 print(json.dumps(results, indent=2))
@@ -921,7 +944,8 @@ def main():
                 query=args.query,
                 days_back=args.days,
                 limit=args.limit,
-                project_path=args.project
+                project_path=args.project,
+                repo=args.repo
             )
 
             if args.json:

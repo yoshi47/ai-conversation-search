@@ -190,6 +190,9 @@ cc-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 --js
 
 # All time
 cc-conversation-search search "query" --json
+
+# Filter by repository (partial match on repo root path)
+cc-conversation-search search "query" --repo myproject --json
 ```
 
 **Date filter options:**
@@ -200,11 +203,17 @@ cc-conversation-search search "query" --json
 - DATE formats: `yyyy-mm-dd`, `yesterday`, `today`
 - Cannot mix `--days` with `--date/--since/--until`
 
+**Other filter options:**
+- `--repo REPO`: Filter by git repository root (partial match). Matches conversations from the same repo including worktrees and subdirectories.
+
 ### List (for temporal queries)
 ```bash
 cc-conversation-search list --date yesterday --json
 cc-conversation-search list --days 7 --json
 cc-conversation-search list --since 2025-11-10 --until today --json
+
+# Filter by repository
+cc-conversation-search list --days 7 --repo myproject --json
 ```
 
 ### Context & Tree

@@ -74,6 +74,7 @@ END;
 CREATE TABLE IF NOT EXISTS conversations (
     session_id TEXT PRIMARY KEY,
     project_path TEXT,
+    repo_root TEXT,
     conversation_file TEXT,
     root_message_uuid TEXT,
     leaf_message_uuid TEXT,  -- From the summary line
@@ -88,6 +89,14 @@ CREATE TABLE IF NOT EXISTS conversations (
 
 CREATE INDEX IF NOT EXISTS idx_conv_project ON conversations(project_path);
 CREATE INDEX IF NOT EXISTS idx_conv_last_message ON conversations(last_message_at DESC);
+CREATE INDEX IF NOT EXISTS idx_conv_repo_root ON conversations(repo_root);
+
+-- Cache for resolved repo roots (avoids repeated git commands)
+CREATE TABLE IF NOT EXISTS repo_root_cache (
+    project_path TEXT PRIMARY KEY,
+    repo_root TEXT,
+    resolved_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 
 -- Processing queue for new/updated files
 CREATE TABLE IF NOT EXISTS index_queue (

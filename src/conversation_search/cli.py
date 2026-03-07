@@ -155,7 +155,8 @@ def cmd_search(args):
             until=getattr(args, 'until', None),
             date=getattr(args, 'date', None),
             limit=args.limit,
-            project_path=args.project
+            project_path=args.project,
+            repo=getattr(args, 'repo', None)
         )
     except Exception as e:
         print(f"Error: {e}")
@@ -279,7 +280,8 @@ def cmd_list(args):
         since=getattr(args, 'since', None),
         until=getattr(args, 'until', None),
         date=getattr(args, 'date', None),
-        limit=args.limit
+        limit=args.limit,
+        repo=getattr(args, 'repo', None)
     )
 
     if args.json:
@@ -393,6 +395,7 @@ def main():
     search_parser.add_argument('--until', help='End date (YYYY-MM-DD, yesterday, today)')
     search_parser.add_argument('--date', help='Specific date (YYYY-MM-DD, yesterday, today)')
     search_parser.add_argument('--project', help='Filter by project path')
+    search_parser.add_argument('--repo', help='Filter by repository root (partial match)')
     search_parser.add_argument('--limit', type=int, default=20, help='Max results (default: 20)')
     search_parser.add_argument('--content', action='store_true', help='Show full content')
     search_parser.add_argument('--json', action='store_true', help='Output as JSON')
@@ -415,6 +418,7 @@ def main():
     list_parser.add_argument('--until', help='End date (YYYY-MM-DD, yesterday, today)')
     list_parser.add_argument('--date', help='Specific date (YYYY-MM-DD, yesterday, today)')
     list_parser.add_argument('--limit', type=int, default=20, help='Max results (default: 20)')
+    list_parser.add_argument('--repo', help='Filter by repository root (partial match)')
     list_parser.add_argument('--json', action='store_true', help='Output as JSON')
     list_parser.add_argument('--no-index', action='store_true', help='Skip auto-indexing (faster but may be stale)')
     list_parser.set_defaults(func=cmd_list)
