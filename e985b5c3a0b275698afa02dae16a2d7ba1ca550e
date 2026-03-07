@@ -1,29 +1,7 @@
-tests/test_codex_indexer.py
-  f35c62c147dbf367 1-429
-src/conversation_search/data/schema.sql
-  f35c62c147dbf367 102-108
-src/conversation_search/core/codex_indexer.py
-  f35c62c147dbf367 1-345
-src/conversation_search/cli.py
-  f35c62c147dbf367 25-29,97,99,125-138,167,169,186,188-193,226-227,229-231,251,253-254,334,336-341,367-368,469,493
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.1.8",
   "base_commit_sha": "e985b5c3a0b275698afa02dae16a2d7ba1ca550e",
-  "prompts": {
-    "f35c62c147dbf367": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "182b163c-aa12-4bf2-8f47-d40e40265383",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47 <yoshix47@gmail.com>",
-      "messages": [],
-      "total_additions": 854,
-      "total_deletions": 34,
-      "accepted_lines": 830,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
