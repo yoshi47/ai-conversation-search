@@ -1,0 +1,25 @@
+src/conversation_search/core/opencode_indexer.py
+  c44a9bc6ae17ce0a 9,21-27,37
+src/conversation_search/cli.py
+  c44a9bc6ae17ce0a 106,109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.8",
+  "base_commit_sha": "dd297d214f60b987c8e44e4e722ca2d8dfa5b522",
+  "prompts": {
+    "c44a9bc6ae17ce0a": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "60c21b5a-ce70-4368-8e03-15bd7a800e3b",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 12,
+      "total_deletions": 3,
+      "accepted_lines": 12,
+      "overriden_lines": 0
+    }
+  }
+}
