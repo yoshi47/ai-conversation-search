@@ -1,10 +1,22 @@
 # Conversation Search - Technical Reference
 
+## Supported Sources
+
+The tool indexes conversations from multiple AI coding assistants:
+
+| Source | Value | Data Location | Session Prefix |
+|--------|-------|--------------|---------------|
+| Claude Code | `claude_code` | `~/.claude/projects/` (JSONL) | *(none)* |
+| OpenCode | `opencode` | `~/.local/share/opencode/opencode.db` (SQLite) | `oc:` |
+| Codex CLI | `codex` | `~/.codex/sessions/` (JSONL) | `codex:` |
+
+All sources are automatically detected and indexed together.
+
 ## Complete Command Reference
 
 ### conversation-search init
 
-Initialize the database and perform initial indexing.
+Initialize the database and perform initial indexing of all detected sources.
 
 ```bash
 conversation-search init [--days DAYS] [--no-extract] [--force]
@@ -17,8 +29,8 @@ conversation-search init [--days DAYS] [--no-extract] [--force]
 
 **What it does:**
 1. Creates `~/.conversation-search/index.db` SQLite database
-2. Scans `~/.claude/projects/` for conversation files
-3. Parses JSONL conversation format
+2. Scans all supported sources (Claude Code, OpenCode, Codex CLI)
+3. Parses conversation formats (JSONL and SQLite)
 4. Extracts searchable content using smart hybrid extraction (instant, no AI)
 5. Builds FTS5 search index
 
@@ -38,7 +50,7 @@ conversation-search init --no-extract
 Search conversations using full-text search on smart-extracted content.
 
 ```bash
-conversation-search search QUERY [--days DAYS] [--project PROJECT] [--limit LIMIT] [--content] [--json]
+conversation-search search QUERY [--days DAYS] [--project PROJECT] [--source SOURCE] [--limit LIMIT] [--content] [--json]
 ```
 
 **Arguments:**
@@ -47,6 +59,7 @@ conversation-search search QUERY [--days DAYS] [--project PROJECT] [--limit LIMI
 **Options:**
 - `--days DAYS`: Limit to last N days
 - `--project PROJECT`: Filter by project path
+- `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
 - `--limit LIMIT`: Max results (default: 20)
 - `--content`: Show full message content instead of summaries
 - `--json`: Output as JSON
@@ -111,12 +124,13 @@ conversation-search context abc-123-def --content --json
 List recent conversations.
 
 ```bash
-conversation-search list [--days DAYS] [--limit LIMIT] [--json]
+conversation-search list [--days DAYS] [--limit LIMIT] [--source SOURCE] [--json]
 ```
 
 **Options:**
 - `--days DAYS`: Show conversations from last N days (default: 7)
 - `--limit LIMIT`: Max conversations to show (default: 20)
+- `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
 - `--json`: Output as JSON
 
 **Example:**
@@ -234,6 +248,7 @@ All commands support `--json` for structured output.
     "project_path": "/home/user/projects/myapp",
     "conversation_summary": "Auth Bug Fix",
     "session_id": "session-xyz",
+    "source": "claude_code",
     "depth": 3,
     "is_sidechain": false
   }
@@ -261,19 +276,24 @@ All commands support `--json` for structured output.
 
 ---
 
-## Integration with Claude Code
+## Supported Conversation Formats
 
-This Skill is designed to work with Claude Code's conversation format:
-
-**Conversation File Format (JSONL):**
+### Claude Code (JSONL)
 ```jsonl
 {"type": "summary", "leafUuid": "...", "conversationSummary": "..."}
 {"uuid": "msg-1", "type": "user", "message": {...}, "timestamp": "..."}
 {"uuid": "msg-2", "type": "assistant", "message": {...}, "parentUuid": "msg-1"}
 ```
 
+### OpenCode (SQLite)
+Reads directly from OpenCode's `opencode.db` database. Path can be overridden with `OPENCODE_HOME` env var.
+
+### Codex CLI (JSONL)
+Reads session files from `~/.codex/sessions/{year}/{month}/{day}/*.jsonl`.
+
 **Key Features:**
-- Preserves tree structure (branches, checkpoints)
+- Multi-source unified search across all AI coding tools
+- Preserves tree structure (branches, checkpoints) for Claude Code
 - Filters tool noise automatically
 - Handles multi-project setups
 - Concurrent-safe with SQLite WAL mode
@@ -289,7 +309,10 @@ This Skill is designed to work with Claude Code's conversation format:
 **Search returns no results:**
 - Check if database exists: `ls ~/.conversation-search/index.db`
 - Run JIT index: `conversation-search index --days 30`
-- Verify conversations exist: `ls ~/.claude/projects/`
+- Verify conversations exist in at least one source:
+  - Claude Code: `ls ~/.claude/projects/`
+  - OpenCode: `ls ~/.local/share/opencode/opencode.db`
+  - Codex CLI: `ls ~/.codex/sessions/`
 
 **Database locked errors:**
 - Close other instances of conversation-search

@@ -1,9 +1,10 @@
 # Conversation Search
 
-Find and resume past Claude Code conversations using smart hybrid extraction and JIT indexing. Get session IDs and project paths to easily jump back into previous work.
+Find and resume past AI coding conversations using smart hybrid extraction and JIT indexing. Supports **Claude Code**, **OpenCode**, and **Codex CLI** — search across all your AI conversations from a single tool.
 
 ## Features
 
+- **Multi-Source Support**: Search across Claude Code, OpenCode, and Codex CLI conversations
 - **Session Resumption**: Get exact commands to resume past conversations
 - **Unified CLI**: Single `ai-conversation-search` command with intuitive subcommands
 - **Calendar Date Filtering**: Intuitive `--date yesterday`, `--since`, `--until` parameters
@@ -14,7 +15,7 @@ Find and resume past Claude Code conversations using smart hybrid extraction and
 - **Progressive Exploration**: Simple search → broader search → manual exploration
 - **Conversation Context**: Expand context incrementally around any message
 - **Claude Code Skill**: Integrated Skill that outputs session resumption commands
-- **Multi-Project Support**: Works across all your Claude Code projects
+- **Multi-Project Support**: Works across all your AI coding projects
 
 ## Quick Start
 
@@ -52,7 +53,7 @@ pip install ai-conversation-search
 ai-conversation-search init
 ```
 
-This creates the database and indexes your last 7 days of conversations.
+This creates the database and indexes your last 7 days of conversations from all supported sources (Claude Code, OpenCode, Codex CLI).
 
 #### 3. Install Skill (Optional)
 
@@ -77,6 +78,10 @@ ai-conversation-search list --since "2025-11-01"
 
 # Traditional relative time filters still work
 ai-conversation-search search "query" --days 30
+
+# Filter by source
+ai-conversation-search search "query" --source opencode
+ai-conversation-search list --source codex --days 7
 
 # Get resume commands for a specific message
 ai-conversation-search resume <MESSAGE_UUID>
@@ -127,7 +132,7 @@ ai-conversation-search index [--days N] [--all] [--no-extract]
 Search conversations with flexible date filtering
 ```bash
 # Traditional relative time
-ai-conversation-search search "query" [--days N] [--project PATH] [--content] [--json]
+ai-conversation-search search "query" [--days N] [--project PATH] [--source SOURCE] [--content] [--json]
 
 # Calendar date filtering (v0.4.8+)
 ai-conversation-search search "query" --date yesterday [--json]
@@ -136,6 +141,9 @@ ai-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 [--j
 
 # Date formats: YYYY-MM-DD, "yesterday", "today"
 # Note: --days cannot be combined with --date/--since/--until
+
+# Filter by source (claude_code, opencode, codex)
+ai-conversation-search search "query" --source opencode --json
 ```
 
 ### `ai-conversation-search context`
@@ -148,7 +156,7 @@ ai-conversation-search context MESSAGE_UUID [--depth 5] [--content] [--json]
 List recent conversations with calendar date support
 ```bash
 # Traditional relative time
-ai-conversation-search list [--days 7] [--limit 20] [--json]
+ai-conversation-search list [--days 7] [--limit 20] [--source SOURCE] [--json]
 
 # Calendar date filtering (v0.4.8+)
 ai-conversation-search list --date yesterday [--json]
@@ -161,6 +169,18 @@ View conversation tree structure
 ai-conversation-search tree SESSION_ID [--json]
 ```
 
+## Supported Sources
+
+| Source | Data Location | Session Prefix |
+|--------|--------------|---------------|
+| **Claude Code** | `~/.claude/projects/{project}/{session}.jsonl` | *(none)* |
+| **OpenCode** | `~/.local/share/opencode/opencode.db` (SQLite) | `oc:` |
+| **Codex CLI** | `~/.codex/sessions/{year}/{month}/{day}/*.jsonl` | `codex:` |
+
+- OpenCode DB path can be overridden with `OPENCODE_HOME` environment variable
+- All sources are automatically detected and indexed together
+- Results are tagged with source labels: `[CC]` (Claude Code), `[OC]` (OpenCode), `[CX]` (Codex CLI)
+
 ## Architecture
 
 ```
@@ -171,11 +191,18 @@ ai-conversation-search tree SESSION_ID [--json]
 └── skills/
     └── conversation-search/  # Optional Skill
 
+~/.local/share/opencode/
+└── opencode.db         # OpenCode conversations (SQLite)
+
+~/.codex/sessions/
+└── {year}/{month}/{day}/
+    └── *.jsonl          # Codex CLI session files
+
 ~/.conversation-search/
-└── index.db           # SQLite database with indexed conversations
+└── index.db           # Unified search database (all sources)
 ```
 
-**Key Purpose**: Find session IDs and project paths to resume past conversations.
+**Key Purpose**: Find session IDs and project paths to resume past conversations across all AI coding tools.
 
 ### Database Schema
 
@@ -186,7 +213,7 @@ ai-conversation-search tree SESSION_ID [--json]
 
 ## How It Works
 
-1. **Indexer**: Scans `~/.claude/projects/` for JSONL conversation files, parses tree structure
+1. **Multi-Source Indexer**: Scans Claude Code (JSONL), OpenCode (SQLite), and Codex CLI (JSONL) conversations
 2. **Smart Extraction**: Hybrid approach - full user content + first 500/last 200 chars for assistant
 3. **Meta-Conversation Filtering**: Automatically detects and excludes conversations where Claude used the search tool (prevents search results pollution)
 4. **Search**: FTS5 full-text search over extracted content with conversation tree traversal
@@ -323,10 +350,12 @@ conversation-search/
 │       ├── __init__.py
 │       ├── cli.py              # Unified CLI
 │       ├── core/
-│       │   ├── indexer.py      # Conversation indexing + meta-filtering
-│       │   ├── search.py       # Search functionality + date filtering
-│       │   ├── date_utils.py   # Calendar date parsing (v0.4.8+)
-│       │   └── summarization.py # Smart hybrid extraction
+│       │   ├── indexer.py            # Claude Code indexing + meta-filtering
+│       │   ├── opencode_indexer.py   # OpenCode conversation indexing
+│       │   ├── codex_indexer.py      # Codex CLI conversation indexing
+│       │   ├── search.py             # Search functionality + date filtering
+│       │   ├── date_utils.py         # Calendar date parsing (v0.4.8+)
+│       │   └── summarization.py      # Smart hybrid extraction
 │       └── data/
 │           └── schema.sql      # Database schema
 ├── skills/
@@ -349,8 +378,11 @@ ai-conversation-search init
 ```
 
 **"No conversations found":**
-- Verify `~/.claude/projects/` exists and contains JSONL files
-- Use Claude Code to create some conversations first
+- Verify conversation data exists in at least one source:
+  - Claude Code: `~/.claude/projects/` contains JSONL files
+  - OpenCode: `~/.local/share/opencode/opencode.db` exists
+  - Codex CLI: `~/.codex/sessions/` contains JSONL files
+- Use one of the supported AI coding tools to create some conversations first
 
 **Want to skip extraction and use raw content only:**
 ```bash

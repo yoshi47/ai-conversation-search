@@ -1,12 +1,12 @@
 ---
 name: conversation-search
-description: Find and resume Claude Code conversations by searching topics or filtering by date. Returns session IDs and project paths for easy resumption via 'claude --resume'. Use when user asks "find that conversation about X", "what did we discuss", "what did we work on yesterday", "summarize today's work", "show this week's conversations", "recent projects we accomplished", or wants to locate past work by topic, date, or time period (yesterday, today, last week, specific dates).
+description: Find and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by searching topics or filtering by date. Returns session IDs and project paths for easy resumption. Use when user asks "find that conversation about X", "what did we discuss", "what did we work on yesterday", "summarize today's work", "show this week's conversations", "recent projects we accomplished", or wants to locate past work by topic, date, or time period (yesterday, today, last week, specific dates).
 allowed-tools: Bash, TodoWrite
 ---
 
 # Conversation Search
 
-Find past conversations in your Claude Code history and get the commands to resume them.
+Find past conversations across Claude Code, OpenCode, and Codex CLI and get the commands to resume them.
 
 ## MANDATORY FIRST STEP - CREATE TODO CHECKLIST
 
@@ -147,10 +147,11 @@ For temporal queries:
 
 **Format results for the user:**
 
-For found conversations:
+For found conversations (results include a `source` field: `claude_code`, `opencode`, or `codex`):
 
 ```markdown
 **Session Details**
+- **Source**: Claude Code / OpenCode / Codex CLI
 - **Session**: abc-123-session-id
 - **Project**: /home/user/projects/myproject
 - **Time**: 2025-11-13 22:50
@@ -162,6 +163,8 @@ cd /home/user/projects/myproject
 claude --resume abc-123-session-id
 ```
 ```
+
+Note: OpenCode sessions have `oc:` prefix, Codex sessions have `codex:` prefix in session IDs. For these sources, resume commands are tool-specific (not `claude --resume`).
 
 For counting/analysis queries:
 - Parse JSON results
@@ -193,6 +196,9 @@ ai-conversation-search search "query" --json
 
 # Filter by repository (partial match on repo root path)
 ai-conversation-search search "query" --repo myproject --json
+
+# Filter by source (claude_code, opencode, codex)
+ai-conversation-search search "query" --source opencode --json
 ```
 
 **Date filter options:**
@@ -214,6 +220,9 @@ ai-conversation-search list --since 2025-11-10 --until today --json
 
 # Filter by repository
 ai-conversation-search list --days 7 --repo myproject --json
+
+# Filter by source
+ai-conversation-search list --source codex --json
 ```
 
 ### Context & Tree
