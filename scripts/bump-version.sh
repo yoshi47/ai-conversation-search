@@ -15,13 +15,13 @@ fi
 NEW_VERSION="$1"
 
 # Update pyproject.toml
-sed -i "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
+sed -i '' "s/^version = \".*\"/version = \"$NEW_VERSION\"/" pyproject.toml
 
 # Update plugin.json
-sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/plugin.json
+sed -i '' "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/plugin.json
 
 # Update marketplace.json
-sed -i "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/marketplace.json
+sed -i '' "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/marketplace.json
 
 echo "Updated version to $NEW_VERSION in:"
 echo "  - pyproject.toml"
