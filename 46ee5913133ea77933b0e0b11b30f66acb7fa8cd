@@ -1,0 +1,27 @@
+skills/conversation-search/SKILL.md
+  fb5c8770a8fdf284 3,9,150,154,167,199-201,223-225
+skills/conversation-search/REFERENCE.md
+  fb5c8770a8fdf284 3-14,19,32-33,53,62,127,133,251,279,281,288-292,295-296,312-315
+README.md
+  fb5c8770a8fdf284 3,7,18,56,82-85,135,144-146,159,172-183,194-199,202,205,216,353-355,381-385
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.8",
+  "base_commit_sha": "46ee5913133ea77933b0e0b11b30f66acb7fa8cd",
+  "prompts": {
+    "fb5c8770a8fdf284": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "21383d6d-2260-4325-8363-c28879cc3d2e",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 92,
+      "total_deletions": 28,
+      "accepted_lines": 89,
+      "overriden_lines": 0
+    }
+  }
+}
