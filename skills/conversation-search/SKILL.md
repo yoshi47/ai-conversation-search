@@ -13,9 +13,9 @@ Find past conversations in your Claude Code history and get the commands to resu
 **Before doing ANYTHING else, you MUST use the TodoWrite tool to create this exact checklist:**
 
 ```
-- Ensure cc-conversation-search tool is installed and upgraded
+- Ensure ai-conversation-search tool is installed and upgraded
 - Classify query type (temporal/topic/hybrid)
-- Execute Level 1: focused search with cc-conversation-search
+- Execute Level 1: focused search with ai-conversation-search
 - Execute Level 2: broader search if Level 1 fails
 - Execute Level 3: manual exploration if Level 1 and 2 fail
 - Present results to user
@@ -25,45 +25,45 @@ Find past conversations in your Claude Code history and get the commands to resu
 - DO NOT use grep, find, cat, or any manual file operations on .jsonl files
 - DO NOT skip the todo creation step
 - DO NOT jump to Level 3 without attempting Levels 1 and 2
-- ONLY use cc-conversation-search commands for all search operations
+- ONLY use ai-conversation-search commands for all search operations
 
 Mark each todo as `in_progress` when starting it, `completed` when done.
 
 ## Prerequisites & Auto-Installation
 
-The skill requires the `cc-conversation-search` CLI tool (v0.4.0+ minimum).
+The skill requires the `ai-conversation-search` CLI tool (v0.4.0+ minimum).
 
 **First todo: Ensure tool is installed and upgraded**
 
 ```bash
 # Check if installed and upgrade
-if command -v cc-conversation-search &> /dev/null; then
-    uv tool upgrade cc-conversation-search 2>/dev/null || pip install --upgrade cc-conversation-search
-    echo "Upgraded to: $(cc-conversation-search --version)"
+if command -v ai-conversation-search &> /dev/null; then
+    uv tool upgrade ai-conversation-search 2>/dev/null || pip install --upgrade ai-conversation-search
+    echo "Upgraded to: $(ai-conversation-search --version)"
 else
     # Install if needed
     if command -v uv &> /dev/null; then
-        uv tool install cc-conversation-search
+        uv tool install ai-conversation-search
     else
-        pip install --user cc-conversation-search
+        pip install --user ai-conversation-search
         export PATH="$HOME/.local/bin:$PATH"
     fi
     # Initialize database
-    cc-conversation-search init --days 7
+    ai-conversation-search init --days 7
 fi
 ```
 
 **If installation fails**, guide the user:
 ```
-The conversation-search plugin requires the cc-conversation-search CLI tool.
+The conversation-search plugin requires the ai-conversation-search CLI tool.
 
 Install it manually:
-  uv tool install cc-conversation-search  (recommended)
+  uv tool install ai-conversation-search  (recommended)
   OR
-  pip install --user cc-conversation-search
+  pip install --user ai-conversation-search
 
 Then initialize:
-  cc-conversation-search init
+  ai-conversation-search init
 ```
 
 **Do not proceed with search** until installation is confirmed.
@@ -108,12 +108,12 @@ Based on query classification:
 
 **For Topic or Hybrid queries:**
 ```bash
-cc-conversation-search search "search terms" --days 14 --json
+ai-conversation-search search "search terms" --days 14 --json
 ```
 
 **For Temporal queries:**
 ```bash
-cc-conversation-search list --date yesterday --json  # or --days N, --since, --until
+ai-conversation-search list --date yesterday --json  # or --days N, --since, --until
 ```
 
 **Parse the JSON output.** If you find relevant matches → skip to Level 4 (present results).
@@ -125,7 +125,7 @@ cc-conversation-search list --date yesterday --json  # or --days N, --since, --u
 **Only if Level 1 found nothing useful.**
 
 For topic/hybrid queries:
-- Remove time constraints: `cc-conversation-search search "terms" --json`
+- Remove time constraints: `ai-conversation-search search "terms" --json`
 - Try alternative keywords: "auth" vs "authentication"
 - Try broader terms: "database" vs "postgres"
 
@@ -138,9 +138,9 @@ For temporal queries:
 
 **Only if Levels 1 and 2 both failed.**
 
-1. List conversations: `cc-conversation-search list --days 30 --json`
+1. List conversations: `ai-conversation-search list --days 30 --json`
 2. Review conversation summaries in JSON
-3. For promising sessions: `cc-conversation-search tree <SESSION_ID> --json`
+3. For promising sessions: `ai-conversation-search tree <SESSION_ID> --json`
 4. Read message summaries to locate content
 
 ### Level 4: Present Results
@@ -171,7 +171,7 @@ For counting/analysis queries:
 
 **If not found after all 3 levels:**
 - "No matching conversations found after exhaustive search"
-- Suggest: `cc-conversation-search index --days 90` to reindex older history
+- Suggest: `ai-conversation-search index --days 90` to reindex older history
 - "The conversation may not exist or may be older than indexed range"
 
 ## Command Reference
@@ -179,20 +179,20 @@ For counting/analysis queries:
 ### Search (for topic and hybrid queries)
 ```bash
 # With time scope
-cc-conversation-search search "query" --days N --json
+ai-conversation-search search "query" --days N --json
 
 # Specific date
-cc-conversation-search search "query" --date yesterday --json
-cc-conversation-search search "query" --date 2025-11-13 --json
+ai-conversation-search search "query" --date yesterday --json
+ai-conversation-search search "query" --date 2025-11-13 --json
 
 # Date range
-cc-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 --json
+ai-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 --json
 
 # All time
-cc-conversation-search search "query" --json
+ai-conversation-search search "query" --json
 
 # Filter by repository (partial match on repo root path)
-cc-conversation-search search "query" --repo myproject --json
+ai-conversation-search search "query" --repo myproject --json
 ```
 
 **Date filter options:**
@@ -208,18 +208,18 @@ cc-conversation-search search "query" --repo myproject --json
 
 ### List (for temporal queries)
 ```bash
-cc-conversation-search list --date yesterday --json
-cc-conversation-search list --days 7 --json
-cc-conversation-search list --since 2025-11-10 --until today --json
+ai-conversation-search list --date yesterday --json
+ai-conversation-search list --days 7 --json
+ai-conversation-search list --since 2025-11-10 --until today --json
 
 # Filter by repository
-cc-conversation-search list --days 7 --repo myproject --json
+ai-conversation-search list --days 7 --repo myproject --json
 ```
 
 ### Context & Tree
 ```bash
-cc-conversation-search context <UUID> --json
-cc-conversation-search tree <SESSION_ID> --json
+ai-conversation-search context <UUID> --json
+ai-conversation-search tree <SESSION_ID> --json
 ```
 
 **Always use `--json` for structured output.**
@@ -234,8 +234,8 @@ User: "Find that conversation where we fixed the authentication bug"
 Todo workflow:
 1. ✓ Tool installed/upgraded
 2. ✓ Classify: TOPIC query
-3. ✓ Level 1: `cc-conversation-search search "authentication bug" --days 14 --json`
-4. If no results → Level 2: `cc-conversation-search search "auth bug" --json`
+3. ✓ Level 1: `ai-conversation-search search "authentication bug" --days 14 --json`
+4. If no results → Level 2: `ai-conversation-search search "auth bug" --json`
 5. Present results with resume commands
 
 **Example 2: Temporal query**
@@ -246,7 +246,7 @@ User: "What did we work on yesterday?"
 Todo workflow:
 1. ✓ Tool installed/upgraded
 2. ✓ Classify: TEMPORAL query
-3. ✓ Level 1: `cc-conversation-search list --date yesterday --json`
+3. ✓ Level 1: `ai-conversation-search list --date yesterday --json`
 4. Parse conversations, group by project
 5. Present organized summary
 
@@ -258,7 +258,7 @@ User: "Show me yesterday's authentication work"
 Todo workflow:
 1. ✓ Tool installed/upgraded
 2. ✓ Classify: HYBRID query (topic + time)
-3. ✓ Level 1: `cc-conversation-search search "authentication" --date yesterday --json`
+3. ✓ Level 1: `ai-conversation-search search "authentication" --date yesterday --json`
 4. Present matching sessions
 
 **Example 4: Counting/analysis query**
@@ -269,7 +269,7 @@ User: "How many times did you say 'absolutely right' in the past week?"
 Todo workflow:
 1. ✓ Tool installed/upgraded
 2. ✓ Classify: HYBRID query (phrase + time)
-3. ✓ Level 1: `cc-conversation-search search "absolutely right" --days 7 --json`
+3. ✓ Level 1: `ai-conversation-search search "absolutely right" --days 7 --json`
 4. Parse JSON, filter `message_type == "assistant"`, count results
 5. Present count with context snippets
 
@@ -280,7 +280,7 @@ Todo workflow:
 - Do not proceed until confirmed
 
 **Database not found:**
-- User must run: `cc-conversation-search init`
+- User must run: `ai-conversation-search init`
 - Creates `~/.conversation-search/index.db`
 
 **Empty results:**

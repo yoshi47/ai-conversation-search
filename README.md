@@ -5,7 +5,7 @@ Find and resume past Claude Code conversations using smart hybrid extraction and
 ## Features
 
 - **Session Resumption**: Get exact commands to resume past conversations
-- **Unified CLI**: Single `cc-conversation-search` command with intuitive subcommands
+- **Unified CLI**: Single `ai-conversation-search` command with intuitive subcommands
 - **Calendar Date Filtering**: Intuitive `--date yesterday`, `--since`, `--until` parameters
 - **Smart Extraction**: Hybrid indexing (full user content + smart assistant extraction)
 - **JIT Indexing**: Instant indexing before search (no AI calls, no delays)
@@ -31,8 +31,8 @@ Install the complete plugin (skill + CLI tool instructions) directly in Claude C
 ```
 
 Then follow the installation instructions shown by Claude to:
-1. Install the CLI tool: `uv tool install cc-conversation-search`
-2. Initialize the database: `cc-conversation-search init`
+1. Install the CLI tool: `uv tool install ai-conversation-search`
+2. Initialize the database: `ai-conversation-search init`
 
 ### Manual Installation
 
@@ -40,16 +40,16 @@ Then follow the installation instructions shown by Claude to:
 
 ```bash
 # Using uv (recommended)
-uv tool install cc-conversation-search
+uv tool install ai-conversation-search
 
 # Or using pip
-pip install cc-conversation-search
+pip install ai-conversation-search
 ```
 
 #### 2. Initialize Database
 
 ```bash
-cc-conversation-search init
+ai-conversation-search init
 ```
 
 This creates the database and indexes your last 7 days of conversations.
@@ -65,24 +65,24 @@ cp skills/conversation-search/* ~/.claude/skills/conversation-search/
 
 ```bash
 # Search for conversations (shows session ID and resume commands)
-cc-conversation-search search "authentication bug"
+ai-conversation-search search "authentication bug"
 
 # Search with calendar date filters
-cc-conversation-search search "react hooks" --date yesterday
-cc-conversation-search search "auth" --since 2025-11-10 --until 2025-11-13
+ai-conversation-search search "react hooks" --date yesterday
+ai-conversation-search search "auth" --since 2025-11-10 --until 2025-11-13
 
 # List conversations by date
-cc-conversation-search list --date yesterday
-cc-conversation-search list --since "2025-11-01"
+ai-conversation-search list --date yesterday
+ai-conversation-search list --since "2025-11-01"
 
 # Traditional relative time filters still work
-cc-conversation-search search "query" --days 30
+ai-conversation-search search "query" --days 30
 
 # Get resume commands for a specific message
-cc-conversation-search resume <MESSAGE_UUID>
+ai-conversation-search resume <MESSAGE_UUID>
 
 # Use with uvx (no install needed)
-uvx cc-conversation-search search "query"
+uvx ai-conversation-search search "query"
 ```
 
 ### Using with Claude Code Skill
@@ -109,56 +109,56 @@ Claude will show you the session ID, project path, and exact commands to resume 
 
 ## Command Reference
 
-### `cc-conversation-search init`
+### `ai-conversation-search init`
 Initialize database and perform initial indexing
 ```bash
-cc-conversation-search init [--days 7] [--no-extract] [--force]
+ai-conversation-search init [--days 7] [--no-extract] [--force]
 ```
 
-### `cc-conversation-search index`
+### `ai-conversation-search index`
 JIT index conversations (instant, no AI calls)
 ```bash
-cc-conversation-search index [--days N] [--all] [--no-extract]
+ai-conversation-search index [--days N] [--all] [--no-extract]
 ```
 
 **IMPORTANT**: The skill always runs `index` before `search` for fresh data.
 
-### `cc-conversation-search search`
+### `ai-conversation-search search`
 Search conversations with flexible date filtering
 ```bash
 # Traditional relative time
-cc-conversation-search search "query" [--days N] [--project PATH] [--content] [--json]
+ai-conversation-search search "query" [--days N] [--project PATH] [--content] [--json]
 
 # Calendar date filtering (v0.4.8+)
-cc-conversation-search search "query" --date yesterday [--json]
-cc-conversation-search search "query" --date 2025-11-13 [--json]
-cc-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 [--json]
+ai-conversation-search search "query" --date yesterday [--json]
+ai-conversation-search search "query" --date 2025-11-13 [--json]
+ai-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 [--json]
 
 # Date formats: YYYY-MM-DD, "yesterday", "today"
 # Note: --days cannot be combined with --date/--since/--until
 ```
 
-### `cc-conversation-search context`
+### `ai-conversation-search context`
 Get context around a specific message
 ```bash
-cc-conversation-search context MESSAGE_UUID [--depth 5] [--content] [--json]
+ai-conversation-search context MESSAGE_UUID [--depth 5] [--content] [--json]
 ```
 
-### `cc-conversation-search list`
+### `ai-conversation-search list`
 List recent conversations with calendar date support
 ```bash
 # Traditional relative time
-cc-conversation-search list [--days 7] [--limit 20] [--json]
+ai-conversation-search list [--days 7] [--limit 20] [--json]
 
 # Calendar date filtering (v0.4.8+)
-cc-conversation-search list --date yesterday [--json]
-cc-conversation-search list --since 2025-11-10 --until today [--json]
+ai-conversation-search list --date yesterday [--json]
+ai-conversation-search list --since 2025-11-10 --until today [--json]
 ```
 
-### `cc-conversation-search tree`
+### `ai-conversation-search tree`
 View conversation tree structure
 ```bash
-cc-conversation-search tree SESSION_ID [--json]
+ai-conversation-search tree SESSION_ID [--json]
 ```
 
 ## Architecture
@@ -205,7 +205,7 @@ The included Skill allows Claude to search your conversation history automatical
 User: "Find that conversation where we started implementing the API"
 Claude: [Activates conversation-search Skill]
         [Classifies as Topic query]
-        [Runs: cc-conversation-search search "implementing API" --days 14 --json]
+        [Runs: ai-conversation-search search "implementing API" --days 14 --json]
         [Finds match]
         [Displays session ID, project path, and resume commands]
 
@@ -224,7 +224,7 @@ Claude: [Activates conversation-search Skill]
 User: "What did we work on yesterday?"
 Claude: [Activates conversation-search Skill]
         [Classifies as Temporal query]
-        [Runs: cc-conversation-search list --date yesterday --json]
+        [Runs: ai-conversation-search list --date yesterday --json]
         [Analyzes conversations by project]
 
         Output:
@@ -249,10 +249,10 @@ See `skills/conversation-search/SKILL.md` for progressive search workflow and co
 All commands support `--json` flag:
 ```bash
 # Export search results
-cc-conversation-search search "authentication" --json > auth_convs.json
+ai-conversation-search search "authentication" --json > auth_convs.json
 
 # Programmatic processing
-cc-conversation-search list --days 30 --json | jq '.[] | .conversation_summary'
+ai-conversation-search list --days 30 --json | jq '.[] | .conversation_summary'
 ```
 
 ### Programmatic Use
@@ -304,7 +304,7 @@ indexer.close()
 
 ```bash
 git clone https://github.com/yoshi47/ai-conversation-search
-cd cc-conversation-search
+cd ai-conversation-search
 uv tool install -e .
 ```
 
@@ -345,7 +345,7 @@ conversation-search/
 
 **"Database not found" error:**
 ```bash
-cc-conversation-search init
+ai-conversation-search init
 ```
 
 **"No conversations found":**
@@ -355,7 +355,7 @@ cc-conversation-search init
 **Want to skip extraction and use raw content only:**
 ```bash
 # Store only raw content (even faster, but less optimized for search)
-cc-conversation-search init --no-extract
+ai-conversation-search init --no-extract
 ```
 
 **Skill not activating:**
@@ -366,8 +366,8 @@ cc-conversation-search init --no-extract
 
 **Import errors:**
 ```bash
-uv tool uninstall cc-conversation-search
-uv tool install cc-conversation-search
+uv tool uninstall ai-conversation-search
+uv tool install ai-conversation-search
 ```
 
 ## Contributing

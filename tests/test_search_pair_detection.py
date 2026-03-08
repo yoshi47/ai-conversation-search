@@ -17,12 +17,12 @@ from conversation_search.core.indexer import ConversationIndexer
 class TestMessageUsesConversationSearch:
     """Test detection of messages that use the conversation-search tool."""
 
-    def test_detects_bash_tool_with_cc_conversation_search(self):
-        """Should detect when Claude runs cc-conversation-search via Bash."""
+    def test_detects_bash_tool_with_ai_conversation_search(self):
+        """Should detect when Claude runs ai-conversation-search via Bash."""
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': '[Tool: Bash]\ncc-conversation-search search "redis" --days 7 --json\n...'
+            'content': '[Tool: Bash]\nai-conversation-search search "redis" --days 7 --json\n...'
         }
         assert message_uses_conversation_search(message) is True
 
@@ -49,7 +49,7 @@ class TestMessageUsesConversationSearch:
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': 'You can use the cc-conversation-search tool to find past conversations. Here is how it works...'
+            'content': 'You can use the ai-conversation-search tool to find past conversations. Here is how it works...'
         }
         assert message_uses_conversation_search(message) is False
 
@@ -58,7 +58,7 @@ class TestMessageUsesConversationSearch:
         message = {
             'uuid': 'test-uuid',
             'message_type': 'user',
-            'content': 'Run cc-conversation-search for me'
+            'content': 'Run ai-conversation-search for me'
         }
         assert message_uses_conversation_search(message) is False
 
@@ -81,65 +81,65 @@ class TestMessageUsesConversationSearch:
         assert message_uses_conversation_search(message) is True
 
     def test_detects_flags_before_subcommand(self):
-        """Should detect cc-conversation-search with flags before subcommand."""
+        """Should detect ai-conversation-search with flags before subcommand."""
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': '[Tool: Bash]\ncc-conversation-search --json search "foo"\n...'
+            'content': '[Tool: Bash]\nai-conversation-search --json search "foo"\n...'
         }
         assert message_uses_conversation_search(message) is True
 
     def test_detects_help_flag(self):
-        """Should detect cc-conversation-search --help."""
+        """Should detect ai-conversation-search --help."""
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': '[Tool: Bash]\ncc-conversation-search --help\n...'
+            'content': '[Tool: Bash]\nai-conversation-search --help\n...'
         }
         assert message_uses_conversation_search(message) is True
 
     def test_detects_version_flag(self):
-        """Should detect cc-conversation-search --version."""
+        """Should detect ai-conversation-search --version."""
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': 'cc-conversation-search -v'
+            'content': 'ai-conversation-search -v'
         }
         assert message_uses_conversation_search(message) is True
 
     def test_detects_uv_tool_upgrade(self):
-        """Should detect uv tool upgrade cc-conversation-search."""
+        """Should detect uv tool upgrade ai-conversation-search."""
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': '[Tool: Bash]\nuv tool upgrade cc-conversation-search\n...'
+            'content': '[Tool: Bash]\nuv tool upgrade ai-conversation-search\n...'
         }
         assert message_uses_conversation_search(message) is True
 
     def test_detects_pip_upgrade(self):
-        """Should detect pip install --upgrade cc-conversation-search."""
+        """Should detect pip install --upgrade ai-conversation-search."""
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': 'pip install --upgrade cc-conversation-search'
+            'content': 'pip install --upgrade ai-conversation-search'
         }
         assert message_uses_conversation_search(message) is True
 
     def test_detects_command_existence_check(self):
-        """Should detect command -v cc-conversation-search."""
+        """Should detect command -v ai-conversation-search."""
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': 'if command -v cc-conversation-search &> /dev/null; then\n    echo "found"\nfi'
+            'content': 'if command -v ai-conversation-search &> /dev/null; then\n    echo "found"\nfi'
         }
         assert message_uses_conversation_search(message) is True
 
     def test_detects_which_command(self):
-        """Should detect which cc-conversation-search."""
+        """Should detect which ai-conversation-search."""
         message = {
             'uuid': 'test-uuid',
             'message_type': 'assistant',
-            'content': 'which cc-conversation-search'
+            'content': 'which ai-conversation-search'
         }
         assert message_uses_conversation_search(message) is True
 
@@ -196,7 +196,7 @@ class TestMarkMetaConversations:
                 'uuid': 'msg-b',
                 'parent_uuid': 'msg-a',
                 'message_type': 'assistant',
-                'content': '[Tool: Bash]\ncc-conversation-search search "redis"\nFound it in session xyz'
+                'content': '[Tool: Bash]\nai-conversation-search search "redis"\nFound it in session xyz'
             },
         ]
 
@@ -220,7 +220,7 @@ class TestMarkMetaConversations:
                 'uuid': 'msg-b',
                 'parent_uuid': 'msg-a',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search search "redis"\nFound it!'
+                'content': 'ai-conversation-search search "redis"\nFound it!'
             },
             {
                 'uuid': 'msg-c',
@@ -262,7 +262,7 @@ class TestMarkMetaConversations:
                 'uuid': 'msg-b',
                 'parent_uuid': 'msg-a',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search search "redis"\nFound 3 results'
+                'content': 'ai-conversation-search search "redis"\nFound 3 results'
             },
             {
                 'uuid': 'msg-c',
@@ -274,7 +274,7 @@ class TestMarkMetaConversations:
                 'uuid': 'msg-d',
                 'parent_uuid': 'msg-c',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search search "redis last week"\nHere it is!'
+                'content': 'ai-conversation-search search "redis last week"\nHere it is!'
             },
             {
                 'uuid': 'msg-e',
@@ -327,7 +327,7 @@ class TestMarkMetaConversations:
                 'uuid': 'msg-d',
                 'parent_uuid': 'msg-c',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search search "auth"\nFound it',
+                'content': 'ai-conversation-search search "auth"\nFound it',
                 'is_sidechain': True
             },
             {
@@ -395,7 +395,7 @@ class TestMarkMetaConversations:
                 'uuid': 'msg-a',
                 'parent_uuid': None,  # Root message
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search search "redis"\nFound it!'
+                'content': 'ai-conversation-search search "redis"\nFound it!'
             },
         ]
 
@@ -418,7 +418,7 @@ class TestMarkMetaConversations:
                 'uuid': 'msg-b',
                 'parent_uuid': 'msg-a',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search search "redis"\nFound it!'
+                'content': 'ai-conversation-search search "redis"\nFound it!'
             },
         ]
 
@@ -489,7 +489,7 @@ class TestMarkMetaConversations:
                 'uuid': 'search-msg',
                 'parent_uuid': 'asst-3',
                 'message_type': 'assistant',
-                'content': '[Tool: Bash]\ncc-conversation-search list --date yesterday --json'
+                'content': '[Tool: Bash]\nai-conversation-search list --date yesterday --json'
             },
         ]
 
@@ -523,7 +523,7 @@ class TestMarkMetaConversations:
                 'uuid': 'search-1',
                 'parent_uuid': 'asst-1',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search search "redis"'
+                'content': 'ai-conversation-search search "redis"'
             },
             {
                 'uuid': 'result-1',
@@ -535,7 +535,7 @@ class TestMarkMetaConversations:
                 'uuid': 'search-2',
                 'parent_uuid': 'result-1',
                 'message_type': 'assistant',
-                'content': 'uv tool upgrade cc-conversation-search'
+                'content': 'uv tool upgrade ai-conversation-search'
             },
         ]
 
@@ -559,7 +559,7 @@ class TestMarkMetaConversations:
                 'uuid': 'search-cmd',
                 'parent_uuid': 'user-question',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search list --date yesterday'
+                'content': 'ai-conversation-search list --date yesterday'
             },
             {
                 'uuid': 'tool-result',
@@ -618,7 +618,7 @@ class TestMarkMetaConversations:
                 'uuid': 'search',
                 'parent_uuid': 'user-q',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search list --date last-week'
+                'content': 'ai-conversation-search list --date last-week'
             },
             {
                 'uuid': 'result',
@@ -658,7 +658,7 @@ class TestMarkMetaConversations:
                 'uuid': 'search',
                 'parent_uuid': 'user-q',
                 'message_type': 'assistant',
-                'content': 'cc-conversation-search search "redis"'
+                'content': 'ai-conversation-search search "redis"'
             },
             {
                 'uuid': 'result',

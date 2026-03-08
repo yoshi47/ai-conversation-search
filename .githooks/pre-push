@@ -13,7 +13,7 @@ if [ -z "$VERSION" ]; then
 fi
 
 # Check if version exists on PyPI
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/cc-conversation-search/${VERSION}/json")
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/ai-conversation-search/${VERSION}/json")
 
 if [ "$HTTP_STATUS" = "200" ]; then
     echo "Error: Version ${VERSION} already exists on PyPI!"

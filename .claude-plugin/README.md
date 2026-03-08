@@ -25,9 +25,9 @@ This will:
 1. Clone the repository
 2. Install the CLI tool:
    ```bash
-   uv tool install cc-conversation-search
+   uv tool install ai-conversation-search
    # OR
-   pip install cc-conversation-search
+   pip install ai-conversation-search
    ```
 3. Initialize the database:
    ```bash

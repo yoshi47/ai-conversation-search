@@ -257,36 +257,36 @@ def message_uses_conversation_search(message: Dict) -> bool:
     content = message.get('content', '')
     content_lower = content.lower()
 
-    # Pattern 1: Bash tool + cc-conversation-search command
+    # Pattern 1: Bash tool + ai-conversation-search command
     # This means Claude RAN the command via Bash
-    if '[Tool: Bash]' in content and 'cc-conversation-search' in content:
+    if '[Tool: Bash]' in content and 'ai-conversation-search' in content:
         return True
 
-    # Pattern 2: Direct cc-conversation-search command usage
+    # Pattern 2: Direct ai-conversation-search command usage
     # Multiple patterns to catch various invocation styles
-    if 'cc-conversation-search' in content:
+    if 'ai-conversation-search' in content:
         cmd_patterns = [
-            # Direct subcommand: cc-conversation-search search
-            r'cc-conversation-search\s+(search|list|index|tree|context|resume)',
-            # Flags before subcommand: cc-conversation-search --json search
-            r'cc-conversation-search\s+--\w+\s+(search|list|index|tree|context|resume)',
-            # Version/help flags: cc-conversation-search --help
-            r'cc-conversation-search\s+(--help|--version|-h|-v)',
+            # Direct subcommand: ai-conversation-search search
+            r'ai-conversation-search\s+(search|list|index|tree|context|resume)',
+            # Flags before subcommand: ai-conversation-search --json search
+            r'ai-conversation-search\s+--\w+\s+(search|list|index|tree|context|resume)',
+            # Version/help flags: ai-conversation-search --help
+            r'ai-conversation-search\s+(--help|--version|-h|-v)',
         ]
         for pattern in cmd_patterns:
             if re.search(pattern, content):
                 return True
 
     # Pattern 3: Tool upgrade commands
-    if re.search(r'uv\s+tool\s+upgrade\s+cc-conversation-search', content):
+    if re.search(r'uv\s+tool\s+upgrade\s+ai-conversation-search', content):
         return True
-    if re.search(r'pip\s+install\s+--upgrade\s+cc-conversation-search', content):
+    if re.search(r'pip\s+install\s+--upgrade\s+ai-conversation-search', content):
         return True
 
     # Pattern 4: Command existence checks
-    if re.search(r'command\s+-v\s+cc-conversation-search', content):
+    if re.search(r'command\s+-v\s+ai-conversation-search', content):
         return True
-    if re.search(r'which\s+cc-conversation-search', content):
+    if re.search(r'which\s+ai-conversation-search', content):
         return True
 
     # Pattern 5: Skill activation markers (actual usage, not discussion)

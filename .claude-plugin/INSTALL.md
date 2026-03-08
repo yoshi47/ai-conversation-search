@@ -6,16 +6,16 @@ Thank you for installing the **conversation-search** plugin!
 
 The skill requires the `conversation-search` CLI tool.
 
-**Note**: The package name is `cc-conversation-search` but the command is `conversation-search`.
+**Note**: The package name is `ai-conversation-search` but the command is `conversation-search`.
 
 ### Recommended: Using uv
 ```bash
-uv tool install cc-conversation-search
+uv tool install ai-conversation-search
 ```
 
 ### Alternative: Using pip
 ```bash
-pip install cc-conversation-search
+pip install ai-conversation-search
 ```
 
 ## Step 2: Initialize the Database

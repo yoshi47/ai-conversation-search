@@ -14,7 +14,7 @@ from conversation_search.core.indexer import ConversationIndexer
 from conversation_search.core.search import ConversationSearch, format_timestamp
 
 try:
-    __version__ = version("cc-conversation-search")
+    __version__ = version("ai-conversation-search")
 except PackageNotFoundError:
     __version__ = "dev"
 
@@ -102,9 +102,9 @@ def cmd_init(args):
         print(f"\n✓ Initialization complete!")
         print(f"  Database: {db_path}")
         print(f"\nNext steps:")
-        print(f"  • Search conversations: cc-conversation-search search '<query>'")
-        print(f"  • List recent: cc-conversation-search list")
-        print(f"  • Re-index: cc-conversation-search index")
+        print(f"  • Search conversations: ai-conversation-search search '<query>'")
+        print(f"  • List recent: ai-conversation-search list")
+        print(f"  • Re-index: ai-conversation-search index")
 
 
 def _index_opencode(quiet: bool = False, days_back: int = 1):
@@ -410,7 +410,7 @@ def cmd_resume(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog='cc-conversation-search',
+        prog='ai-conversation-search',
         description='Find and resume Claude Code conversations using semantic search'
     )
     parser.add_argument('--version', action='version', version=f'%(prog)s {__version__}')
@@ -492,9 +492,9 @@ def main():
         args.func(args)
     except FileNotFoundError as e:
         print(f"Error: {e}")
-        print("\nThe cc-conversation-search tool requires initialization.")
-        print("Install: uv tool install cc-conversation-search")
-        print("Initialize: cc-conversation-search init")
+        print("\nThe ai-conversation-search tool requires initialization.")
+        print("Install: uv tool install ai-conversation-search")
+        print("Initialize: ai-conversation-search init")
         sys.exit(1)
     except KeyboardInterrupt:
         print("\n\nInterrupted")
