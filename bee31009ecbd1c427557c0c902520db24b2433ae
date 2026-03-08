@@ -1,0 +1,25 @@
+scripts/bump-version.sh
+  d2d46bdb2d231330 18,21,24
+pyproject.toml
+  d2d46bdb2d231330 9-10
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.8",
+  "base_commit_sha": "bee31009ecbd1c427557c0c902520db24b2433ae",
+  "prompts": {
+    "d2d46bdb2d231330": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "12174883-6b3a-46b9-ae5b-8336590ba521",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 5,
+      "total_deletions": 5,
+      "accepted_lines": 5,
+      "overriden_lines": 0
+    }
+  }
+}
