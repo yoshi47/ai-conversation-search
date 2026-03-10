@@ -1,0 +1,23 @@
+.claude-plugin/marketplace.json
+  c0d2a630b8bcbd42 2
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.10",
+  "base_commit_sha": "ff317cfba74f8d7d5498fc6e58062359b62ae1f5",
+  "prompts": {
+    "c0d2a630b8bcbd42": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e23b8cf9-6588-4224-9542-6c7e99ebbfd4",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "Yoshiki Kadono <yoshiki.kadono@meetsmore.com>",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
