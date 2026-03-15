@@ -88,6 +88,10 @@ impl ConversationSearch {
         let trimmed = query.trim();
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
+        // Check if any search term has < 3 characters (trigram minimum)
+        let terms: Vec<&str> = trimmed.split_whitespace().collect();
+        let has_short_term = terms.iter().any(|t| t.chars().count() < 3);
+
         let sql = if trimmed.is_empty() {
             let mut sql = String::from(
                 "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
@@ -98,8 +102,24 @@ impl ConversationSearch {
             sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
             params.push(Box::new(limit));
             sql
+        } else if has_short_term {
+            // Trigram requires >= 3 characters per term; fall back to LIKE for short terms
+            let mut sql = String::from(
+                "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
+            );
+
+            for term in &terms {
+                sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
+                params.push(Box::new(format!("%{}%", escape_like(term))));
+            }
+
+            Self::append_filters(&mut sql, &mut params, days_back, since, until, date, project_path, repo, source)?;
+
+            sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
+            params.push(Box::new(limit));
+            sql
         } else {
-            // Sanitize query for FTS5
+            // Sanitize query for FTS5 trigram tokenizer
             let fts_query = if !query.contains(" AND ")
                 && !query.contains(" OR ")
                 && !query.contains(" NOT ")
@@ -107,9 +127,9 @@ impl ConversationSearch {
             {
                 let terms: Vec<&str> = query.split_whitespace().collect();
                 if terms.len() == 1 {
-                    format!("{}*", terms[0])
+                    format!("\"{}\"", terms[0])
                 } else {
-                    terms.iter().map(|t| format!("{}*", t)).collect::<Vec<_>>().join(" ")
+                    terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" AND ")
                 }
             } else {
                 query.to_string()
@@ -1035,16 +1055,160 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
 
-        // Single term should get * appended (prefix search)
+        // Single term — trigram substring match
         let results = searcher
             .search_conversations("rustac", None, None, None, None, 10, None, None, 32, None)
             .unwrap();
-        assert_eq!(results.len(), 1); // "rustac*" matches "rustacean"
+        assert_eq!(results.len(), 1); // "rustac" is a substring of "rustacean"
 
-        // Multi terms should each get *
+        // Multi terms — AND join, each as substring match
         let results = searcher
             .search_conversations("rustac programm", None, None, None, None, 10, None, None, 32, None)
             .unwrap();
-        assert_eq!(results.len(), 1); // "rustac* programm*" matches
+        assert_eq!(results.len(), 1); // both substrings found
+    }
+
+    // ---- Japanese / CJK search tests ----
+
+    #[test]
+    fn test_search_japanese_single_term() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "msg1", "sess1", "認証機能の実装を行いました", "assistant", "2025-01-15T10:00:00", "/proj");
+        insert_test_message(&conn, "msg2", "sess1", "hello world in english", "user", "2025-01-15T10:01:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_conversations("認証", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(uuid, "msg1");
+    }
+
+    #[test]
+    fn test_search_japanese_multi_term() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "msg1", "sess1", "認証機能の実装を行いました", "assistant", "2025-01-15T10:00:00", "/proj");
+        insert_test_message(&conn, "msg2", "sess1", "認証だけのメッセージ", "user", "2025-01-15T10:01:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        // Both terms must match (AND join)
+        let results = searcher
+            .search_conversations("認証 実装", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(uuid, "msg1"); // Only msg1 contains both 認証 and 実装
+    }
+
+    #[test]
+    fn test_search_mixed_cjk_english() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "msg1", "sess1", "OAuth認証の実装をRustで行いました", "assistant", "2025-01-15T10:00:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        // English term in mixed content
+        let results = searcher
+            .search_conversations("OAuth", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+
+        // Japanese term in mixed content
+        let results = searcher
+            .search_conversations("認証", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_short_query_like_fallback() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "msg1", "sess1", "型の定義を変更しました", "assistant", "2025-01-15T10:00:00", "/proj");
+        insert_test_message(&conn, "msg2", "sess1", "英語のメッセージ", "user", "2025-01-15T10:01:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        // 1-byte short query (e.g. "ab") should use LIKE fallback
+        let results = searcher
+            .search_conversations("ab", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+        assert!(results.is_empty()); // no match, but should not error
+
+        // CJK 2-char query "型の" (6 bytes) should use LIKE fallback
+        let results = searcher
+            .search_conversations("型の", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(uuid, "msg1");
+    }
+
+    #[test]
+    fn test_search_cjk_2char_needs_like_fallback() {
+        // SQLite trigram operates on codepoints, not bytes.
+        // CJK 2-char terms (e.g. "認証") = 2 codepoints < 3, so FTS won't match.
+        // LIKE fallback is required.
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "msg1", "sess1", "認証機能の実装を行いました", "assistant", "2025-01-15T10:00:00", "/proj");
+
+        // Direct FTS MATCH with CJK 2-char term should NOT match
+        let result: Option<String> = conn
+            .query_row(
+                "SELECT message_uuid FROM message_content_fts WHERE full_content MATCH '\"認証\"'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        assert_eq!(result, None, "CJK 2-char term should NOT match via FTS trigram (2 codepoints < 3)");
+
+        // But search_conversations should still find it via LIKE fallback
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_conversations("認証", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+    }
+
+    #[test]
+    fn test_search_multi_term_and_join() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "msg1", "sess1", "rustacean programming language", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_message(&conn, "msg2", "sess1", "rustacean is a term for rust users", "user", "2025-01-15T10:01:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        // "rustac programm" should match msg1 (contains both substrings) but not msg2
+        let results = searcher
+            .search_conversations("rustac programm", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(uuid, "msg1");
+    }
+
+    #[test]
+    fn test_search_snippet_trigram() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "msg1", "sess1", "the quick brown fox jumps over the lazy dog", "user", "2025-01-15T10:00:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_conversations("brown fox", None, None, None, None, 10, None, None, 32, None)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        let snippet = results[0].get("context_snippet").and_then(|v| v.as_str()).unwrap();
+        // snippet() with trigram should contain highlight markers
+        assert!(snippet.contains("**"), "snippet should contain highlight markers: {}", snippet);
     }
 }

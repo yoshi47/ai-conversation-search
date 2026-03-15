@@ -46,12 +46,13 @@ CREATE INDEX IF NOT EXISTS idx_is_summarized ON messages(is_summarized);
 CREATE INDEX IF NOT EXISTS idx_is_tool_noise ON messages(is_tool_noise);
 CREATE INDEX IF NOT EXISTS idx_is_meta_conversation ON messages(is_meta_conversation);
 
--- Full-text search on complete content
+-- Full-text search on complete content (trigram tokenizer for CJK/substring matching)
 CREATE VIRTUAL TABLE IF NOT EXISTS message_content_fts USING fts5(
     message_uuid UNINDEXED,
     full_content,
     content='messages',
-    content_rowid='rowid'
+    content_rowid='rowid',
+    tokenize='trigram case_sensitive 0'
 );
 
 -- Triggers to keep FTS in sync
