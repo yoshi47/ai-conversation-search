@@ -1,6 +1,6 @@
 [package]
 name = "ai-conversation-search"
-version = "0.7.1"
+version = "0.7.1-rc.1"
 edition = "2021"
 
 [dependencies]
