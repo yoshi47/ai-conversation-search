@@ -25,13 +25,19 @@ This will:
 1. Clone the repository
 2. Install the CLI tool:
    ```bash
-   uv tool install ai-conversation-search
-   # OR
-   pip install ai-conversation-search
+   # Download pre-built binary (see README.md for full platform detection)
+   mkdir -p ~/.local/bin
+   # For macOS Apple Silicon:
+   curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-aarch64-apple-darwin" \
+       -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
+   export PATH="$HOME/.local/bin:$PATH"
+
+   # Or build from source
+   cargo install --git https://github.com/yoshi47/ai-conversation-search
    ```
 3. Initialize the database:
    ```bash
-   conversation-search init
+   ai-conversation-search init
    ```
 4. Copy the skill to Claude Code:
    ```bash
@@ -52,11 +58,10 @@ This will pull the latest skill files automatically.
 ## What's Included
 
 - **Skill**: conversation-search (with progressive search workflow)
-- **CLI Tool**: conversation-search command-line interface
+- **CLI Tool**: ai-conversation-search command-line interface
 - **Database**: Local SQLite index of conversations
 
 ## Requirements
 
 - Claude Code
-- Python 3.9+
-- Either `uv` or `pip` for installation
+- macOS (arm64 / x86_64) or Linux (x86_64)

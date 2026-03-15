@@ -1,28 +1,30 @@
 #!/bin/bash
-# Pre-push hook: Check if version already exists on PyPI
-# Prevents CI failures from duplicate version uploads
+# Pre-push hook: Check if version tag already exists on remote
+# Prevents CI failures from duplicate version releases
 
-set -e
+set -eo pipefail
 
-# Extract version from pyproject.toml
-VERSION=$(grep -m1 '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+# Extract version from Cargo.toml
+VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 
 if [ -z "$VERSION" ]; then
-    echo "Error: Could not extract version from pyproject.toml"
+    echo "Error: Could not extract version from Cargo.toml"
     exit 1
 fi
 
-# Check if version exists on PyPI
-HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "https://pypi.org/pypi/ai-conversation-search/${VERSION}/json")
+# Check if tag already exists on remote
+REMOTE_TAGS=$(git ls-remote --tags origin "v${VERSION}" 2>&1) || {
+    echo "Warning: Could not check remote tags (network issue?). Skipping version check."
+    exit 0
+}
 
-if [ "$HTTP_STATUS" = "200" ]; then
-    echo "Error: Version ${VERSION} already exists on PyPI!"
-    echo "Bump the version in pyproject.toml before pushing."
+if echo "$REMOTE_TAGS" | grep -q "v${VERSION}"; then
+    echo "Error: Tag v${VERSION} already exists on remote!"
+    echo "Bump the version in Cargo.toml before pushing."
     echo ""
-    echo "Also update plugin versions in:"
-    echo "  - .claude-plugin/plugin.json"
-    echo "  - .claude-plugin/marketplace.json"
+    echo "Also update plugin versions:"
+    echo "  ./scripts/bump-version.sh <new-version>"
     exit 1
 fi
 
-echo "Version check passed: ${VERSION} not on PyPI yet"
+echo "Version check passed: v${VERSION} not yet released"

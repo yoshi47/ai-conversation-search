@@ -31,25 +31,28 @@ Mark each todo as `in_progress` when starting it, `completed` when done.
 
 ## Prerequisites & Auto-Installation
 
-The skill requires the `ai-conversation-search` CLI tool (v0.4.0+ minimum).
+The skill requires the `ai-conversation-search` CLI tool (v0.7.0+ minimum).
 
 **First todo: Ensure tool is installed and upgraded**
 
 ```bash
-# Check if installed and upgrade
-if command -v ai-conversation-search &> /dev/null; then
-    uv tool upgrade ai-conversation-search 2>/dev/null || pip install --upgrade ai-conversation-search
-    echo "Upgraded to: $(ai-conversation-search --version)"
-else
-    # Install if needed
-    if command -v uv &> /dev/null; then
-        uv tool install ai-conversation-search
-    else
-        pip install --user ai-conversation-search
-        export PATH="$HOME/.local/bin:$PATH"
-    fi
-    # Initialize database
+if ! command -v ai-conversation-search &> /dev/null; then
+    echo "Installing ai-conversation-search..."
+    ARCH=$(uname -m)
+    OS=$(uname -s)
+    case "${OS}-${ARCH}" in
+        Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
+        Darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
+        Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+        *) echo "Unsupported platform: ${OS}-${ARCH}"; exit 1 ;;
+    esac
+    mkdir -p ~/.local/bin
+    curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-${TARGET}" \
+        -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
+    export PATH="$HOME/.local/bin:$PATH"
     ai-conversation-search init --days 7
+else
+    echo "ai-conversation-search $(ai-conversation-search --version)"
 fi
 ```
 
@@ -57,10 +60,11 @@ fi
 ```
 The conversation-search plugin requires the ai-conversation-search CLI tool.
 
-Install it manually:
-  uv tool install ai-conversation-search  (recommended)
-  OR
-  pip install --user ai-conversation-search
+Install manually:
+  ARCH=$(uname -m); OS=$(uname -s)
+  # Determine TARGET: aarch64-apple-darwin, x86_64-apple-darwin, or x86_64-unknown-linux-gnu
+  curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-${TARGET}" \
+      -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
 
 Then initialize:
   ai-conversation-search init

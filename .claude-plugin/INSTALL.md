@@ -4,18 +4,33 @@ Thank you for installing the **conversation-search** plugin!
 
 ## Step 1: Install the CLI Tool
 
-The skill requires the `conversation-search` CLI tool.
+The skill requires the `ai-conversation-search` CLI tool.
 
-**Note**: The package name is `ai-conversation-search` but the command is `conversation-search`.
+### Download pre-built binary
 
-### Recommended: Using uv
 ```bash
-uv tool install ai-conversation-search
+# Detect platform and download
+ARCH=$(uname -m)
+OS=$(uname -s)
+case "${OS}-${ARCH}" in
+    Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
+    Darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
+    Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+    *) echo "Unsupported platform: ${OS}-${ARCH}"; exit 1 ;;
+esac
+
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-${TARGET}" \
+    -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
+
+# Ensure ~/.local/bin is in your PATH
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-### Alternative: Using pip
+### Alternative: Build from source
+
 ```bash
-pip install ai-conversation-search
+cargo install --git https://github.com/yoshi47/ai-conversation-search
 ```
 
 ## Step 2: Initialize the Database
@@ -23,7 +38,7 @@ pip install ai-conversation-search
 Create the search index for your conversation history:
 
 ```bash
-conversation-search init
+ai-conversation-search init
 ```
 
 This will:
@@ -36,7 +51,7 @@ This will:
 Verify everything is working:
 
 ```bash
-conversation-search search "test" --json
+ai-conversation-search search "test" --json
 ```
 
 ## You're Ready!
@@ -52,12 +67,12 @@ Claude will use a progressive search strategy to find specific message UUIDs you
 ## Troubleshooting
 
 **Tool not found:**
-- Make sure `conversation-search` is in your PATH
-- Try: `which conversation-search`
+- Make sure `ai-conversation-search` is in your PATH
+- Try: `which ai-conversation-search`
 
 **No conversations found:**
 - Verify `~/.claude/projects/` exists and contains .jsonl files
-- Try: `conversation-search list --days 30`
+- Try: `ai-conversation-search list --days 30`
 
 **For help:**
 - Documentation: https://github.com/yoshi47/ai-conversation-search

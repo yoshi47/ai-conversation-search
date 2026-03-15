@@ -31,20 +31,33 @@ Install the complete plugin (skill + CLI tool instructions) directly in Claude C
 /plugin install conversation-search
 ```
 
-Then follow the installation instructions shown by Claude to:
-1. Install the CLI tool: `uv tool install ai-conversation-search`
-2. Initialize the database: `ai-conversation-search init`
+Then follow the installation instructions shown by Claude to install the CLI tool and initialize the database.
 
 ### Manual Installation
 
 #### 1. Install CLI Tool
 
 ```bash
-# Using uv (recommended)
-uv tool install ai-conversation-search
+# Download pre-built binary (macOS/Linux)
+ARCH=$(uname -m)
+OS=$(uname -s)
+case "${OS}-${ARCH}" in
+    Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
+    Darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
+    Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
+    *) echo "Unsupported platform: ${OS}-${ARCH}"; exit 1 ;;
+esac
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-${TARGET}" \
+    -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
 
-# Or using pip
-pip install ai-conversation-search
+# Make sure ~/.local/bin is in your PATH
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Or build from source:
+```bash
+cargo install --git https://github.com/yoshi47/ai-conversation-search
 ```
 
 #### 2. Initialize Database
@@ -85,9 +98,6 @@ ai-conversation-search list --source codex --days 7
 
 # Get resume commands for a specific message
 ai-conversation-search resume <MESSAGE_UUID>
-
-# Use with uvx (no install needed)
-uvx ai-conversation-search search "query"
 ```
 
 ### Using with Claude Code Skill
@@ -99,7 +109,7 @@ Once installed, ask Claude:
 - "Locate the conversation about React hooks"
 - "What did we talk about regarding the database?"
 
-**Temporal queries (NEW in v0.4.8):**
+**Temporal queries:**
 - "What did we work on yesterday?"
 - "Summarize today's conversations"
 - "Show me this week's work"
@@ -108,7 +118,7 @@ Once installed, ask Claude:
 - "Find yesterday's authentication work"
 - "Show recent Redis discussions"
 
-**Auto-Installation**: If the CLI tool isn't installed, the skill will automatically attempt to install it via `uv` or `pip`, then initialize the database. In most cases, everything "just works" after installing the plugin!
+**Auto-Installation**: If the CLI tool isn't installed, the skill will automatically attempt to install it, then initialize the database. In most cases, everything "just works" after installing the plugin!
 
 Claude will show you the session ID, project path, and exact commands to resume the conversation.
 
@@ -134,7 +144,7 @@ Search conversations with flexible date filtering
 # Traditional relative time
 ai-conversation-search search "query" [--days N] [--project PATH] [--source SOURCE] [--content] [--json]
 
-# Calendar date filtering (v0.4.8+)
+# Calendar date filtering
 ai-conversation-search search "query" --date yesterday [--json]
 ai-conversation-search search "query" --date 2025-11-13 [--json]
 ai-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 [--json]
@@ -158,7 +168,7 @@ List recent conversations with calendar date support
 # Traditional relative time
 ai-conversation-search list [--days 7] [--limit 20] [--source SOURCE] [--json]
 
-# Calendar date filtering (v0.4.8+)
+# Calendar date filtering
 ai-conversation-search list --date yesterday [--json]
 ai-conversation-search list --since 2025-11-10 --until today [--json]
 ```
@@ -204,13 +214,6 @@ ai-conversation-search tree SESSION_ID [--json]
 
 **Key Purpose**: Find session IDs and project paths to resume past conversations across all AI coding tools.
 
-### Database Schema
-
-- **messages**: Individual messages with summaries, tree structure (parent_uuid), timestamps
-- **conversations**: Session metadata with conversation summaries
-- **message_summaries_fts**: FTS5 full-text search index
-- **index_queue**: Processing queue for batch operations
-
 ## How It Works
 
 1. **Multi-Source Indexer**: Scans Claude Code (JSONL), OpenCode (SQLite), and Codex CLI (JSONL) conversations
@@ -220,54 +223,6 @@ ai-conversation-search tree SESSION_ID [--json]
 5. **Calendar Date Filtering**: Intuitive date parameters (`--date yesterday`) using SQLite date functions
 6. **JIT Indexing**: Skill runs `index` before `search` for fresh data (instant, no AI calls)
 7. **Local Timezone Display**: All timestamps converted to your local timezone for readability
-
-## Claude Code Skill
-
-The included Skill allows Claude to search your conversation history automatically.
-
-**Example usage:**
-
-**Topic-based query:**
-```
-User: "Find that conversation where we started implementing the API"
-Claude: [Activates conversation-search Skill]
-        [Classifies as Topic query]
-        [Runs: ai-conversation-search search "implementing API" --days 14 --json]
-        [Finds match]
-        [Displays session ID, project path, and resume commands]
-
-        Output:
-        Session: abc-123-session-id
-        Project: /home/user/projects/myproject
-        Time: 2025-11-13 22:50 (local time)
-
-        To resume:
-          cd /home/user/projects/myproject
-          claude --resume abc-123-session-id
-```
-
-**Temporal query (NEW in v0.4.8):**
-```
-User: "What did we work on yesterday?"
-Claude: [Activates conversation-search Skill]
-        [Classifies as Temporal query]
-        [Runs: ai-conversation-search list --date yesterday --json]
-        [Analyzes conversations by project]
-
-        Output:
-        Yesterday's work summary:
-
-        Project: /home/user/projects/api-service
-        - Implemented Redis caching layer
-        - Fixed authentication timeout bug
-        Session: def-456-session-id
-
-        Project: /home/user/projects/frontend
-        - Updated React components for new API
-        Session: ghi-789-session-id
-```
-
-See `skills/conversation-search/SKILL.md` for progressive search workflow and complete documentation.
 
 ## Advanced Usage
 
@@ -280,35 +235,6 @@ ai-conversation-search search "authentication" --json > auth_convs.json
 
 # Programmatic processing
 ai-conversation-search list --days 30 --json | jq '.[] | .conversation_summary'
-```
-
-### Programmatic Use
-
-```python
-from conversation_search.core.search import ConversationSearch
-from conversation_search.core.indexer import ConversationIndexer
-
-# Search for messages with calendar date filtering
-search = ConversationSearch()
-
-# Traditional relative time
-results = search.search_conversations("authentication", days_back=7)
-
-# New calendar date filtering (v0.4.8+)
-results = search.search_conversations("authentication", date="yesterday")
-results = search.search_conversations("auth", since="2025-11-10", until="2025-11-13")
-
-for r in results:
-    print(f"{r['message_uuid']}: {r['summary']}")
-
-# List conversations by date
-convs = search.list_recent_conversations(date="yesterday")
-convs = search.list_recent_conversations(since="2025-11-10", until="today")
-
-# Index conversations
-indexer = ConversationIndexer()
-indexer.index_all(days_back=7)
-indexer.close()
 ```
 
 ## Configuration
@@ -332,41 +258,40 @@ indexer.close()
 ```bash
 git clone https://github.com/yoshi47/ai-conversation-search
 cd ai-conversation-search
-uv tool install -e .
+cargo build
 ```
 
 ### Run Tests
 
 ```bash
-pytest tests/
+cargo test
 ```
 
 ### Project Structure
 
 ```
-conversation-search/
+ai-conversation-search/
 ├── src/
-│   └── conversation_search/
-│       ├── __init__.py
-│       ├── cli.py              # Unified CLI
-│       ├── core/
-│       │   ├── indexer.py            # Claude Code indexing + meta-filtering
-│       │   ├── opencode_indexer.py   # OpenCode conversation indexing
-│       │   ├── codex_indexer.py      # Codex CLI conversation indexing
-│       │   ├── search.py             # Search functionality + date filtering
-│       │   ├── date_utils.py         # Calendar date parsing (v0.4.8+)
-│       │   └── summarization.py      # Smart hybrid extraction
-│       └── data/
-│           └── schema.sql      # Database schema
+│   ├── main.rs                # Entry point
+│   ├── cli.rs                 # CLI argument parsing and commands
+│   ├── search.rs              # Search functionality + date filtering
+│   ├── summarization.rs       # Smart hybrid extraction
+│   ├── date_utils.rs          # Calendar date parsing
+│   ├── db.rs                  # Database connection
+│   ├── schema.rs              # Schema migrations
+│   ├── error.rs               # Error types
+│   ├── git_utils.rs           # Git repo root detection
+│   └── indexer/
+│       ├── mod.rs             # Claude Code indexing + meta-filtering
+│       ├── codex.rs           # Codex CLI conversation indexing
+│       └── opencode.rs        # OpenCode conversation indexing
+├── data/
+│   └── schema.sql             # Database schema
 ├── skills/
 │   └── conversation-search/
 │       ├── SKILL.md           # Claude Code Skill with query classification
 │       └── REFERENCE.md       # Complete command reference
-├── tests/
-│   ├── test_date_utils.py     # Date parsing tests
-│   ├── test_date_filtering.py # Date filter integration tests
-│   └── test_search_pair_detection.py # Meta-filtering tests
-├── pyproject.toml
+├── Cargo.toml
 └── README.md
 ```
 
@@ -384,23 +309,11 @@ ai-conversation-search init
   - Codex CLI: `~/.codex/sessions/` contains JSONL files
 - Use one of the supported AI coding tools to create some conversations first
 
-**Want to skip extraction and use raw content only:**
-```bash
-# Store only raw content (even faster, but less optimized for search)
-ai-conversation-search init --no-extract
-```
-
 **Skill not activating:**
 - Check Skill location: `ls ~/.claude/skills/conversation-search/SKILL.md`
 - Verify YAML frontmatter format
 - Restart Claude Code
 - Try explicit trigger: "Search my conversations for X"
-
-**Import errors:**
-```bash
-uv tool uninstall ai-conversation-search
-uv tool install ai-conversation-search
-```
 
 ## Contributing
 
