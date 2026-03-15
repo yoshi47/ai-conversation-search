@@ -1,39 +1,7 @@
-.github/workflows/release.yml
-  513c3e16756ab493 1-40
-scripts/bump-version.sh
-  513c3e16756ab493 3,8,11,17-30,33,36,39-40,47
-.githooks/pre-push
-  513c3e16756ab493 2-3,5,7-8,11,15-19,21-23,25-26,30
-CLAUDE.md
-  513c3e16756ab493 5,12,16,22-23,27,29,31-35,37,39,42,44-45
-skills/conversation-search/REFERENCE.md
-  513c3e16756ab493 17,22,40,43,48,53,76,79,82,85,90,95,114,117,122,127,139,142,147,152,165,170,175,192,195,274,307,314,321,330,334
-.claude-plugin/INSTALL.md
-  513c3e16756ab493 7,9,12-27,30-31,33,41,54,70-71,75
-README.md
-  513c3e16756ab493 34,41-52,54-55,58-60,112,121,147,171,261,267,273,275-288,294
-.claude-plugin/README.md
-  513c3e16756ab493 28-36,40,61,67
-skills/conversation-search/SKILL.md
-  513c3e16756ab493 34,39-52,54-55,64-67
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.1.12",
   "base_commit_sha": "a6b22d67f261d017164feeba9313728f6d9b49fb",
-  "prompts": {
-    "513c3e16756ab493": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "6a64a347-b6d7-4fea-a730-a562d955f656",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47 <yoshix47@gmail.com>",
-      "messages": [],
-      "total_additions": 240,
-      "total_deletions": 263,
-      "accepted_lines": 229,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
