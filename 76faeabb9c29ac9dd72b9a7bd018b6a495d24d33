@@ -1,0 +1,29 @@
+README.md
+  513c3e16756ab493 48
+skills/conversation-search/SKILL.md
+  513c3e16756ab493 47
+.claude-plugin/INSTALL.md
+  513c3e16756ab493 19
+.github/workflows/release.yml
+  513c3e16756ab493 18-19,26-32
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.12",
+  "base_commit_sha": "76faeabb9c29ac9dd72b9a7bd018b6a495d24d33",
+  "prompts": {
+    "513c3e16756ab493": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "6a64a347-b6d7-4fea-a730-a562d955f656",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 12,
+      "total_deletions": 0,
+      "accepted_lines": 12,
+      "overriden_lines": 0
+    }
+  }
+}
