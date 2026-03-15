@@ -25,15 +25,13 @@ pub struct Message {
     pub is_meta_conversation: bool,
 }
 
-/// JSONL summary line (first line of conversation file).
-#[derive(Debug, Deserialize)]
-pub struct SummaryLine {
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    pub entry_type: Option<String>,
+/// Metadata extracted from a conversation JSONL file.
+#[derive(Debug)]
+pub struct ConversationMeta {
     pub summary: Option<String>,
-    #[serde(rename = "leafUuid")]
     pub leaf_uuid: Option<String>,
+    pub custom_title: Option<String>,
+    pub first_user_message: Option<String>,
 }
 
 /// JSONL message entry.
@@ -53,6 +51,8 @@ struct JsonlEntry {
     summary: Option<String>,
     #[serde(rename = "leafUuid")]
     leaf_uuid: Option<String>,
+    #[serde(rename = "customTitle")]
+    custom_title: Option<String>,
 }
 
 /// Content block types in assistant messages.
@@ -66,10 +66,29 @@ struct ContentBlock {
     input: Option<serde_json::Value>,
 }
 
+/// Wrapper for sessions-index.json.
+#[derive(Debug, Deserialize)]
+struct SessionsIndex {
+    entries: Vec<SessionsIndexEntry>,
+}
+
+/// Entry from sessions-index.json (Claude Code 2026+).
+#[derive(Debug, Deserialize)]
+struct SessionsIndexEntry {
+    #[serde(rename = "sessionId")]
+    session_id: String,
+    #[serde(rename = "firstPrompt")]
+    first_prompt: Option<String>,
+    summary: Option<String>,
+    #[serde(rename = "projectPath")]
+    project_path: Option<String>,
+}
+
 pub struct ConversationIndexer {
     conn: Connection,
     quiet: bool,
     summarizer_project_hash: Option<String>,
+    sessions_index_cache: HashMap<PathBuf, Option<Vec<SessionsIndexEntry>>>,
 }
 
 impl ConversationIndexer {
@@ -81,6 +100,7 @@ impl ConversationIndexer {
             conn,
             quiet,
             summarizer_project_hash: None,
+            sessions_index_cache: HashMap::new(),
         })
     }
 
@@ -174,6 +194,49 @@ impl ConversationIndexer {
         }
 
         None
+    }
+
+    /// Look up session info from sessions-index.json in the project directory.
+    fn lookup_session_info<'a>(
+        &'a mut self,
+        project_dir: &Path,
+        session_id: &str,
+    ) -> Option<&'a SessionsIndexEntry> {
+        let index_path = project_dir.join("sessions-index.json");
+        if !self.sessions_index_cache.contains_key(project_dir) {
+            let entries = if index_path.exists() {
+                match std::fs::read_to_string(&index_path) {
+                    Ok(content) => match serde_json::from_str::<SessionsIndex>(&content) {
+                        Ok(idx) => Some(idx.entries),
+                        Err(e) => {
+                            self.log(&format!(
+                                "  Warning: failed to parse {}: {}",
+                                index_path.display(),
+                                e
+                            ));
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        self.log(&format!(
+                            "  Warning: failed to read {}: {}",
+                            index_path.display(),
+                            e
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+            self.sessions_index_cache
+                .insert(project_dir.to_path_buf(), entries);
+        }
+
+        self.sessions_index_cache
+            .get(project_dir)
+            .and_then(|opt| opt.as_ref())
+            .and_then(|entries| entries.iter().find(|e| e.session_id == session_id))
     }
 
     /// Resolve repo root for a project path, using cache.
@@ -393,10 +456,13 @@ impl ConversationIndexer {
     pub fn parse_conversation_file(
         &self,
         file_path: &Path,
-    ) -> Result<(Option<SummaryLine>, Vec<Message>)> {
+    ) -> Result<(Option<ConversationMeta>, Vec<Message>)> {
         let content = std::fs::read_to_string(file_path)?;
         let mut messages = Vec::new();
-        let mut conv_meta = None;
+        let mut summary_from_jsonl: Option<String> = None;
+        let mut leaf_uuid_from_jsonl: Option<String> = None;
+        let mut custom_title_found: Option<String> = None;
+        let mut first_user_message: Option<String> = None;
 
         for (line_num, line) in content.lines().enumerate() {
             let line = line.trim();
@@ -417,13 +483,18 @@ impl ConversationIndexer {
                 }
             };
 
-            // First line is the summary
+            // Handle custom-title entries (can appear anywhere in the file)
+            if entry.entry_type.as_deref() == Some("custom-title") {
+                if let Some(title) = &entry.custom_title {
+                    custom_title_found = Some(title.clone());
+                }
+                continue;
+            }
+
+            // First line is the summary (older format)
             if line_num == 0 && entry.entry_type.as_deref() == Some("summary") {
-                conv_meta = Some(SummaryLine {
-                    entry_type: entry.entry_type,
-                    summary: entry.summary,
-                    leaf_uuid: entry.leaf_uuid,
-                });
+                summary_from_jsonl = entry.summary;
+                leaf_uuid_from_jsonl = entry.leaf_uuid;
                 continue;
             }
 
@@ -482,6 +553,11 @@ impl ConversationIndexer {
                 _ => String::new(),
             };
 
+            // Capture first user message for summary fallback
+            if first_user_message.is_none() && message_type == "user" && !msg_content.is_empty() {
+                first_user_message = Some(msg_content.chars().take(100).collect());
+            }
+
             messages.push(Message {
                 uuid,
                 parent_uuid: entry.parent_uuid,
@@ -493,6 +569,21 @@ impl ConversationIndexer {
                 is_meta_conversation: false,
             });
         }
+
+        let conv_meta = if summary_from_jsonl.is_some()
+            || leaf_uuid_from_jsonl.is_some()
+            || custom_title_found.is_some()
+            || first_user_message.is_some()
+        {
+            Some(ConversationMeta {
+                summary: summary_from_jsonl,
+                leaf_uuid: leaf_uuid_from_jsonl,
+                custom_title: custom_title_found,
+                first_user_message,
+            })
+        } else {
+            None
+        };
 
         Ok((conv_meta, messages))
     }
@@ -673,11 +764,19 @@ impl ConversationIndexer {
         }
 
         // Extract project path from file location
-        let project_path = file_path
+        let dir_name = file_path
             .parent()
             .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().replace('-', "/"))
+            .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+
+        let decoded_path = Self::decode_project_dir_name(&dir_name);
+        let decode_succeeded = decoded_path.is_some();
+        let mut project_path = decoded_path
+            .unwrap_or_else(|| {
+                let naive = dir_name.replace('-', "/");
+                if naive.starts_with('/') { naive } else { format!("/{}", naive) }
+            });
 
         // Get session ID
         let session_id = match messages[0].session_id.as_ref() {
@@ -690,6 +789,41 @@ impl ConversationIndexer {
 
         // Calculate depths
         let depths = Self::calculate_depth(&messages);
+
+        // Resolve conversation summary using priority chain:
+        // 1. JSONL summary line (older format)
+        // 2. JSONL custom-title line
+        // 3. sessions-index.json summary
+        // 4. sessions-index.json firstPrompt (truncated to 100 chars)
+        // 5. First user message (truncated to 100 chars)
+        // 6. "Untitled conversation"
+        let project_dir = file_path.parent().map(|p| p.to_path_buf());
+        let session_info = project_dir.as_ref().and_then(|pd| {
+            self.lookup_session_info(pd, &session_id)
+                .map(|e| (e.summary.clone(), e.first_prompt.clone(), e.project_path.clone()))
+        });
+        let (si_summary, si_first_prompt, si_project_path) = match session_info {
+            Some((s, fp, pp)) => (s, fp, pp),
+            None => (None, None, None),
+        };
+
+        // Use sessions-index.json projectPath as fallback when decode failed
+        if !decode_succeeded {
+            if let Some(ref pp) = si_project_path {
+                if !pp.is_empty() {
+                    project_path = pp.clone();
+                }
+            }
+        }
+
+        let conversation_summary = conv_meta
+            .as_ref()
+            .and_then(|m| m.summary.clone())
+            .or_else(|| conv_meta.as_ref().and_then(|m| m.custom_title.clone()))
+            .or(si_summary)
+            .or_else(|| si_first_prompt.map(|fp| fp.chars().take(100).collect()))
+            .or_else(|| conv_meta.as_ref().and_then(|m| m.first_user_message.clone()))
+            .unwrap_or_else(|| "Untitled conversation".to_string());
 
         // Check if already indexed
         let existing: Option<String> = self
@@ -734,13 +868,15 @@ impl ConversationIndexer {
                 messages.len()
             ));
 
-            // Update conversation metadata
+            // Update conversation metadata (including summary and project_path)
             self.conn.execute(
-                "UPDATE conversations SET last_message_at = ?, message_count = ?, leaf_message_uuid = ?, indexed_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                "UPDATE conversations SET last_message_at = ?, message_count = ?, leaf_message_uuid = ?, conversation_summary = ?, project_path = ?, indexed_at = CURRENT_TIMESTAMP WHERE session_id = ?",
                 rusqlite::params![
                     messages.last().and_then(|m| m.timestamp.as_ref()),
                     (existing_uuids.len() + new_messages.len()) as i64,
                     conv_meta.as_ref().and_then(|m| m.leaf_uuid.as_ref()),
+                    conversation_summary,
+                    project_path,
                     session_id,
                 ],
             )?;
@@ -765,7 +901,7 @@ impl ConversationIndexer {
                     file_path.to_string_lossy(),
                     root_message.uuid,
                     conv_meta.as_ref().and_then(|m| m.leaf_uuid.as_ref()),
-                    conv_meta.as_ref().and_then(|m| m.summary.as_ref()).unwrap_or(&"Untitled conversation".to_string()),
+                    conversation_summary,
                     messages[0].timestamp,
                     messages.last().and_then(|m| m.timestamp.as_ref()),
                     messages.len() as i64,
@@ -884,10 +1020,12 @@ mod tests {
 
         let (summary, messages) = indexer.parse_conversation_file(file.path()).unwrap();
 
-        // Verify summary
+        // Verify conversation meta
         let summary = summary.unwrap();
         assert_eq!(summary.summary.as_deref(), Some("Test conversation"));
         assert_eq!(summary.leaf_uuid.as_deref(), Some("uuid3"));
+        assert!(summary.custom_title.is_none());
+        assert_eq!(summary.first_user_message.as_deref(), Some("Hello world"));
 
         // Verify messages
         assert_eq!(messages.len(), 3);
@@ -1135,5 +1273,53 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0].content, "Valid message");
         assert_eq!(messages[1].content, "Also valid");
+    }
+
+    #[test]
+    fn test_parse_custom_title() {
+        let (_dir, indexer) = create_test_indexer();
+        let file = write_temp_jsonl(&[
+            r#"{"uuid":"uuid1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"Hello world"}}"#,
+            r#"{"uuid":"uuid2","parentUuid":"uuid1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess1","message":{"role":"assistant","content":"Hi!"}}"#,
+            r#"{"type":"custom-title","customTitle":"My Custom Title"}"#,
+        ]);
+
+        let (meta, messages) = indexer.parse_conversation_file(file.path()).unwrap();
+        assert_eq!(messages.len(), 2);
+
+        let meta = meta.unwrap();
+        assert!(meta.summary.is_none()); // no summary line
+        assert_eq!(meta.custom_title.as_deref(), Some("My Custom Title"));
+        assert_eq!(meta.first_user_message.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn test_parse_first_user_message_truncation() {
+        let (_dir, indexer) = create_test_indexer();
+        let long_message = "a".repeat(200);
+        let line = format!(
+            r#"{{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"s1","message":{{"role":"user","content":"{}"}}}}"#,
+            long_message
+        );
+        let file = write_temp_jsonl(&[&line]);
+
+        let (meta, _) = indexer.parse_conversation_file(file.path()).unwrap();
+        let meta = meta.unwrap();
+        assert_eq!(meta.first_user_message.as_ref().unwrap().len(), 100);
+    }
+
+    #[test]
+    fn test_parse_no_summary_no_custom_title_has_first_user_message() {
+        let (_dir, indexer) = create_test_indexer();
+        let file = write_temp_jsonl(&[
+            r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"s1","message":{"role":"user","content":"First question"}}"#,
+            r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"s1","message":{"role":"assistant","content":"Answer"}}"#,
+        ]);
+
+        let (meta, _) = indexer.parse_conversation_file(file.path()).unwrap();
+        let meta = meta.unwrap();
+        assert!(meta.summary.is_none());
+        assert!(meta.custom_title.is_none());
+        assert_eq!(meta.first_user_message.as_deref(), Some("First question"));
     }
 }

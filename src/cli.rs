@@ -9,9 +9,6 @@ use crate::search::{ConversationSearch, format_timestamp};
 
 /// Source display labels
 const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")];
-/// Sources that store real paths
-const EXTERNAL_SOURCES: &[&str] = &["opencode", "codex"];
-
 fn source_label(source: &str) -> &str {
     SOURCE_LABELS
         .iter()
@@ -476,14 +473,8 @@ fn cmd_search(
         );
         let source_str = result.get("source").and_then(|v| v.as_str()).unwrap_or("claude_code");
         let label = source_label(source_str);
-        let is_external = EXTERNAL_SOURCES.contains(&source_str);
 
-        let project_dir = if is_external {
-            result.get("project_path").and_then(|v| v.as_str()).unwrap_or("").to_string()
-        } else {
-            let pp = result.get("project_path").and_then(|v| v.as_str()).unwrap_or("").replace('-', "/");
-            if pp.starts_with('/') { pp } else { format!("/{}", pp) }
-        };
+        let project_dir = result.get("project_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
         let summary = result.get("conversation_summary").and_then(|v| v.as_str()).unwrap_or("");
         let session_id = result.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
@@ -699,11 +690,7 @@ fn cmd_resume(uuid: &str) -> Result<()> {
 
     match result {
         Ok((session_id, project_path)) => {
-            let mut project_dir = project_path.replace('-', "/");
-            if !project_dir.starts_with('/') {
-                project_dir = format!("/{}", project_dir);
-            }
-            println!("cd {}", project_dir);
+            println!("cd {}", project_path);
             println!("{} --resume {}", claude_cmd(), session_id);
         }
         Err(_) => {
