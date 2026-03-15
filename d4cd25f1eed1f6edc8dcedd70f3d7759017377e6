@@ -1,27 +1,7 @@
-src/search.rs
-  e2706497aefaae42 91-94,102-108,110-114,122,130,132,1058,1062,1064,1068-1146,1148-1188,1192-1212
-data/schema.sql
-  e2706497aefaae42 49,54-55
-src/schema.rs
-  e2706497aefaae42 1,60-136
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.1.12",
   "base_commit_sha": "d4cd25f1eed1f6edc8dcedd70f3d7759017377e6",
-  "prompts": {
-    "e2706497aefaae42": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "104d7548-015a-4f39-bbf7-4bcad0a8a369",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47 <yoshix47@gmail.com>",
-      "messages": [],
-      "total_additions": 276,
-      "total_deletions": 34,
-      "accepted_lines": 254,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
