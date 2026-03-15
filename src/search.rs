@@ -2,10 +2,161 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Local, TimeDelta, Utc};
 use rusqlite::Connection;
+use serde::Serialize;
 
 use crate::date_utils::build_date_filter;
 use crate::db;
 use crate::error::{AppError, Result};
+
+/// A single search result row (messages JOIN conversations).
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResultRow {
+    pub message_uuid: String,
+    pub session_id: String,
+    pub parent_uuid: Option<String>,
+    pub timestamp: String,
+    pub message_type: String,
+    pub project_path: Option<String>,
+    pub depth: i64,
+    pub is_sidechain: bool,
+    pub context_snippet: String,
+    pub conversation_summary: Option<String>,
+    pub conversation_file: Option<String>,
+    pub source: Option<String>,
+}
+
+impl SearchResultRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            message_uuid: row.get("message_uuid")?,
+            session_id: row.get("session_id")?,
+            parent_uuid: row.get("parent_uuid")?,
+            timestamp: row.get("timestamp")?,
+            message_type: row.get("message_type")?,
+            project_path: row.get("project_path")?,
+            depth: row.get("depth")?,
+            is_sidechain: row.get("is_sidechain")?,
+            context_snippet: row.get("context_snippet")?,
+            conversation_summary: row.get("conversation_summary")?,
+            conversation_file: row.get("conversation_file")?,
+            source: row.get("source")?,
+        })
+    }
+}
+
+/// A row from the conversations table.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationRow {
+    pub session_id: String,
+    pub project_path: Option<String>,
+    pub repo_root: Option<String>,
+    pub conversation_file: Option<String>,
+    pub root_message_uuid: Option<String>,
+    pub leaf_message_uuid: Option<String>,
+    pub conversation_summary: Option<String>,
+    pub first_message_at: Option<String>,
+    pub last_message_at: Option<String>,
+    pub message_count: i64,
+    pub source: Option<String>,
+    pub indexed_at: Option<String>,
+}
+
+impl ConversationRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            session_id: row.get("session_id")?,
+            project_path: row.get("project_path")?,
+            repo_root: row.get("repo_root")?,
+            conversation_file: row.get("conversation_file")?,
+            root_message_uuid: row.get("root_message_uuid")?,
+            leaf_message_uuid: row.get("leaf_message_uuid")?,
+            conversation_summary: row.get("conversation_summary")?,
+            first_message_at: row.get("first_message_at")?,
+            last_message_at: row.get("last_message_at")?,
+            message_count: row.get("message_count")?,
+            source: row.get("source")?,
+            indexed_at: row.get("indexed_at")?,
+        })
+    }
+}
+
+/// A row from the messages table.
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageRow {
+    pub message_uuid: String,
+    pub session_id: String,
+    pub parent_uuid: Option<String>,
+    pub is_sidechain: bool,
+    pub depth: i64,
+    pub timestamp: String,
+    pub message_type: String,
+    pub project_path: Option<String>,
+    pub conversation_file: Option<String>,
+    pub summary: Option<String>,
+    pub full_content: String,
+    pub is_summarized: bool,
+    pub is_tool_noise: bool,
+    pub is_meta_conversation: bool,
+}
+
+impl MessageRow {
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            message_uuid: row.get("message_uuid")?,
+            session_id: row.get("session_id")?,
+            parent_uuid: row.get("parent_uuid")?,
+            is_sidechain: row.get("is_sidechain")?,
+            depth: row.get("depth")?,
+            timestamp: row.get("timestamp")?,
+            message_type: row.get("message_type")?,
+            project_path: row.get("project_path")?,
+            conversation_file: row.get("conversation_file")?,
+            summary: row.get("summary")?,
+            full_content: row.get("full_content")?,
+            is_summarized: row.get("is_summarized")?,
+            is_tool_noise: row.get("is_tool_noise")?,
+            is_meta_conversation: row.get("is_meta_conversation")?,
+        })
+    }
+}
+
+/// Conversation context result.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationContext {
+    pub message: Option<MessageRow>,
+    pub ancestors: Vec<MessageRow>,
+    pub children: Vec<MessageRow>,
+    pub conversation: Option<ConversationRow>,
+    pub context_depth: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Conversation tree result.
+#[derive(Debug, Clone, Serialize)]
+pub struct ConversationTree {
+    pub conversation: Option<ConversationRow>,
+    pub tree: Vec<TreeNode>,
+    pub total_messages: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// A node in the conversation tree.
+#[derive(Debug, Clone, Serialize)]
+pub struct TreeNode {
+    pub message_uuid: String,
+    pub session_id: String,
+    pub parent_uuid: Option<String>,
+    pub is_sidechain: bool,
+    pub depth: i64,
+    pub timestamp: String,
+    pub message_type: String,
+    pub project_path: Option<String>,
+    pub summary: Option<String>,
+    pub full_content: String,
+    pub children: Vec<TreeNode>,
+}
 
 /// Escape special LIKE characters.
 fn escape_like(value: &str) -> String {
@@ -135,9 +286,9 @@ impl ConversationSearch {
         limit: i64,
         project_path: Option<&str>,
         repo: Option<&str>,
-        snippet_tokens: i32,
+        _snippet_tokens: i32,
         source: Option<&str>,
-    ) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+    ) -> Result<Vec<SearchResultRow>> {
         if days_back.is_some() && (since.is_some() || until.is_some() || date.is_some()) {
             return Err(AppError::General(
                 "Cannot use --days with --since/--until/--date".to_string(),
@@ -207,7 +358,7 @@ impl ConversationSearch {
 
             // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
             const BATCH_SIZE: usize = 500;
-            let mut all_results: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+            let mut all_results: Vec<SearchResultRow> = Vec::new();
 
             for chunk in rowids.chunks(BATCH_SIZE) {
                 let mut batch_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -225,30 +376,23 @@ impl ConversationSearch {
                 Self::append_filters(&mut sql, &mut batch_params, days_back, since, until, date, project_path, repo, source)?;
                 sql.push_str(" ORDER BY m.timestamp DESC");
 
-                let batch_results = self.execute_search(&sql, &batch_params)?;
+                let batch_results = self.execute_search_typed(&sql, &batch_params)?;
                 all_results.extend(batch_results);
             }
 
             // Sort all results by timestamp DESC and take limit
-            all_results.sort_by(|a, b| {
-                let ts_a = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-                let ts_b = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
-                ts_b.cmp(ts_a)
-            });
+            all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
             all_results.truncate(limit as usize);
 
             // Post-process: extract snippets with highlighting around match locations
             let search_terms: Vec<&str> = trimmed.split_whitespace().collect();
             for row in &mut all_results {
-                if let Some(serde_json::Value::String(content)) = row.get("context_snippet") {
-                    let snippet = extract_snippet(content, &search_terms, 200);
-                    row.insert("context_snippet".to_string(), serde_json::Value::String(snippet));
-                }
+                row.context_snippet = extract_snippet(&row.context_snippet, &search_terms, 200);
             }
             return Ok(all_results);
         };
 
-        self.execute_search(&sql, &params)
+        self.execute_search_typed(&sql, &params)
     }
 
     fn append_filters(
@@ -304,14 +448,14 @@ impl ConversationSearch {
         Ok(rowids)
     }
 
-    fn execute_search(
+    fn execute_search_typed(
         &mut self,
         sql: &str,
         params: &[Box<dyn rusqlite::types::ToSql>],
-    ) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+    ) -> Result<Vec<SearchResultRow>> {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
 
-        match self.query_to_maps(sql, &param_refs) {
+        match self.query_rows(sql, &param_refs, SearchResultRow::from_row) {
             Ok(results) => Ok(results),
             Err(e) => {
                 let err_str = e.to_string();
@@ -319,7 +463,7 @@ impl ConversationSearch {
                     eprintln!("FTS index corruption detected, rebuilding...");
                     self.rebuild_fts()?;
                     eprintln!("FTS index rebuilt, retrying search...");
-                    self.query_to_maps(sql, &param_refs)
+                    self.query_rows(sql, &param_refs, SearchResultRow::from_row)
                 } else {
                     Err(e)
                 }
@@ -327,38 +471,17 @@ impl ConversationSearch {
         }
     }
 
-    fn query_to_maps(
+    fn query_rows<T, F>(
         &self,
         sql: &str,
         params: &[&dyn rusqlite::types::ToSql],
-    ) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+        map_fn: F,
+    ) -> Result<Vec<T>>
+    where
+        F: Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
+    {
         let mut stmt = self.conn.prepare(sql)?;
-        let column_names: Vec<String> = stmt
-            .column_names()
-            .iter()
-            .map(|n| n.to_string())
-            .collect();
-
-        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| {
-            let mut map = HashMap::new();
-            for (i, name) in column_names.iter().enumerate() {
-                let val: rusqlite::types::Value = row.get(i)?;
-                let json_val = match val {
-                    rusqlite::types::Value::Null => serde_json::Value::Null,
-                    rusqlite::types::Value::Integer(n) => serde_json::Value::Number(n.into()),
-                    rusqlite::types::Value::Real(f) => {
-                        serde_json::Value::Number(serde_json::Number::from_f64(f).unwrap_or(0.into()))
-                    }
-                    rusqlite::types::Value::Text(s) => serde_json::Value::String(s),
-                    rusqlite::types::Value::Blob(b) => {
-                        serde_json::Value::String(format!("<blob {} bytes>", b.len()))
-                    }
-                };
-                map.insert(name.clone(), json_val);
-            }
-            Ok(map)
-        })?;
-
+        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| map_fn(row))?;
         let mut results = Vec::new();
         for row in rows {
             match row {
@@ -373,189 +496,148 @@ impl ConversationSearch {
         &self,
         message_uuid: &str,
         depth: i32,
-    ) -> Result<HashMap<String, serde_json::Value>> {
+    ) -> Result<ConversationContext> {
         // Get target message
-        let target = self.query_to_maps(
+        let target = self.query_rows(
             "SELECT * FROM messages WHERE message_uuid = ?",
             &[&message_uuid as &dyn rusqlite::types::ToSql],
+            MessageRow::from_row,
         )?;
 
         if target.is_empty() {
-            let mut result = HashMap::new();
-            result.insert(
-                "error".to_string(),
-                serde_json::Value::String(format!("Message {} not found", message_uuid)),
-            );
-            return Ok(result);
+            return Ok(ConversationContext {
+                message: None,
+                ancestors: Vec::new(),
+                children: Vec::new(),
+                conversation: None,
+                context_depth: 0,
+                error: Some(format!("Message {} not found", message_uuid)),
+            });
         }
 
         let target_msg = &target[0];
 
         // Walk up ancestors
         let mut ancestors = Vec::new();
-        let mut current_uuid = target_msg
-            .get("parent_uuid")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+        let mut current_uuid = target_msg.parent_uuid.clone();
         let mut levels = 0;
 
         while let Some(ref uuid) = current_uuid {
             if levels >= depth {
                 break;
             }
-            let parent = self.query_to_maps(
+            let parent = self.query_rows(
                 "SELECT * FROM messages WHERE message_uuid = ?",
                 &[uuid as &dyn rusqlite::types::ToSql],
+                MessageRow::from_row,
             )?;
-            if parent.is_empty() {
+            let Some(parent_msg) = parent.into_iter().next() else {
                 break;
-            }
-            ancestors.insert(0, serde_json::Value::Object(parent[0].clone().into_iter().collect()));
-            current_uuid = parent[0]
-                .get("parent_uuid")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
+            };
+            current_uuid = parent_msg.parent_uuid.clone();
+            ancestors.insert(0, parent_msg);
             levels += 1;
         }
 
         // Get conversation metadata
-        let session_id = target_msg
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let conv = self.query_to_maps(
+        let session_id = &target_msg.session_id;
+        let conv = self.query_rows(
             "SELECT * FROM conversations WHERE session_id = ?",
-            &[&session_id as &dyn rusqlite::types::ToSql],
+            &[session_id as &dyn rusqlite::types::ToSql],
+            ConversationRow::from_row,
         )?;
 
-        let mut result = HashMap::new();
-        result.insert(
-            "message".to_string(),
-            serde_json::Value::Object(target_msg.clone().into_iter().collect()),
-        );
-        result.insert("ancestors".to_string(), serde_json::Value::Array(ancestors));
-        result.insert(
-            "children".to_string(),
-            serde_json::Value::Array(vec![]),
-        );
-        if !conv.is_empty() {
-            result.insert(
-                "conversation".to_string(),
-                serde_json::Value::Object(conv[0].clone().into_iter().collect()),
-            );
-        }
-        result.insert(
-            "context_depth".to_string(),
-            serde_json::Value::Number(levels.into()),
-        );
-
-        Ok(result)
+        Ok(ConversationContext {
+            message: Some(target_msg.clone()),
+            ancestors,
+            children: Vec::new(),
+            conversation: conv.into_iter().next(),
+            context_depth: levels,
+            error: None,
+        })
     }
 
     pub fn get_conversation_tree(
         &self,
         session_id: &str,
-    ) -> Result<HashMap<String, serde_json::Value>> {
-        let messages = self.query_to_maps(
+    ) -> Result<ConversationTree> {
+        let messages = self.query_rows(
             "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
             &[&session_id as &dyn rusqlite::types::ToSql],
+            MessageRow::from_row,
         )?;
 
-        let conv = self.query_to_maps(
+        let conv = self.query_rows(
             "SELECT * FROM conversations WHERE session_id = ?",
             &[&session_id as &dyn rusqlite::types::ToSql],
+            ConversationRow::from_row,
         )?;
 
         if conv.is_empty() {
-            let mut result = HashMap::new();
-            result.insert(
-                "error".to_string(),
-                serde_json::Value::String(format!("Conversation {} not found", session_id)),
-            );
-            return Ok(result);
+            return Ok(ConversationTree {
+                conversation: None,
+                tree: Vec::new(),
+                total_messages: 0,
+                error: Some(format!("Conversation {} not found", session_id)),
+            });
         }
 
-        let tree = self.build_tree(&messages);
+        let tree = Self::build_tree(&messages);
 
-        let mut result = HashMap::new();
-        result.insert(
-            "conversation".to_string(),
-            serde_json::Value::Object(conv[0].clone().into_iter().collect()),
-        );
-        result.insert("tree".to_string(), serde_json::Value::Array(tree));
-        result.insert(
-            "total_messages".to_string(),
-            serde_json::Value::Number(messages.len().into()),
-        );
-
-        Ok(result)
+        Ok(ConversationTree {
+            conversation: conv.into_iter().next(),
+            tree,
+            total_messages: messages.len(),
+            error: None,
+        })
     }
 
-    fn build_tree(
-        &self,
-        messages: &[HashMap<String, serde_json::Value>],
-    ) -> Vec<serde_json::Value> {
-        let mut msg_map: HashMap<String, serde_json::Map<String, serde_json::Value>> = HashMap::new();
-
+    fn build_tree(messages: &[MessageRow]) -> Vec<TreeNode> {
+        let mut msg_map: HashMap<String, &MessageRow> = HashMap::new();
         for msg in messages {
-            let uuid = msg
-                .get("message_uuid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let mut obj: serde_json::Map<String, serde_json::Value> = msg.clone().into_iter().collect();
-            obj.insert("children".to_string(), serde_json::Value::Array(vec![]));
-            msg_map.insert(uuid, obj);
+            msg_map.insert(msg.message_uuid.clone(), msg);
         }
-
-        let _uuids: Vec<String> = messages
-            .iter()
-            .filter_map(|m| m.get("message_uuid").and_then(|v| v.as_str()).map(|s| s.to_string()))
-            .collect();
 
         let mut roots = Vec::new();
         let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
 
         for msg in messages {
-            let uuid = msg
-                .get("message_uuid")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let parent = msg
-                .get("parent_uuid")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            if let Some(ref p) = parent {
-                if msg_map.contains_key(p) {
-                    children_map.entry(p.clone()).or_default().push(uuid);
+            if let Some(ref parent_uuid) = msg.parent_uuid {
+                if msg_map.contains_key(parent_uuid) {
+                    children_map.entry(parent_uuid.clone()).or_default().push(msg.message_uuid.clone());
                     continue;
                 }
             }
-            roots.push(uuid);
+            roots.push(msg.message_uuid.clone());
         }
 
         fn build_node(
             uuid: &str,
-            msg_map: &HashMap<String, serde_json::Map<String, serde_json::Value>>,
+            msg_map: &HashMap<String, &MessageRow>,
             children_map: &HashMap<String, Vec<String>>,
-        ) -> serde_json::Value {
-            let mut node = msg_map.get(uuid).cloned().unwrap_or_default();
-            if let Some(kids) = children_map.get(uuid) {
-                let children: Vec<serde_json::Value> = kids
-                    .iter()
-                    .map(|k| build_node(k, msg_map, children_map))
-                    .collect();
-                node.insert("children".to_string(), serde_json::Value::Array(children));
+        ) -> TreeNode {
+            let msg = msg_map.get(uuid).expect("build_node called with uuid not in msg_map");
+            let children = if let Some(kids) = children_map.get(uuid) {
+                kids.iter().map(|k| build_node(k, msg_map, children_map)).collect()
+            } else {
+                Vec::new()
+            };
+            TreeNode {
+                message_uuid: msg.message_uuid.clone(),
+                session_id: msg.session_id.clone(),
+                parent_uuid: msg.parent_uuid.clone(),
+                is_sidechain: msg.is_sidechain,
+                depth: msg.depth,
+                timestamp: msg.timestamp.clone(),
+                message_type: msg.message_type.clone(),
+                project_path: msg.project_path.clone(),
+                summary: msg.summary.clone(),
+                full_content: msg.full_content.clone(),
+                children,
             }
-            serde_json::Value::Object(node)
         }
 
-        roots
-            .iter()
-            .map(|uuid| build_node(uuid, &msg_map, &children_map))
-            .collect()
+        roots.iter().map(|uuid| build_node(uuid, &msg_map, &children_map)).collect()
     }
 
     pub fn list_recent_conversations(
@@ -568,7 +650,7 @@ impl ConversationSearch {
         project_path: Option<&str>,
         repo: Option<&str>,
         source: Option<&str>,
-    ) -> Result<Vec<HashMap<String, serde_json::Value>>> {
+    ) -> Result<Vec<ConversationRow>> {
         let effective_days = if days_back.is_none() && since.is_none() && until.is_none() && date.is_none() {
             Some(7i64)
         } else {
@@ -618,7 +700,7 @@ impl ConversationSearch {
         params.push(Box::new(limit));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        self.query_to_maps(&sql, &param_refs)
+        self.query_rows(&sql, &param_refs, ConversationRow::from_row)
     }
 
     pub fn get_full_message_content(&self, message_uuid: &str) -> Option<String> {
@@ -663,7 +745,7 @@ impl ConversationSearch {
         params.push(Box::new(max_conversations));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-        let conversations = self.query_to_maps(&sql, &param_refs)?;
+        let conversations = self.query_rows(&sql, &param_refs, ConversationRow::from_row)?;
 
         if conversations.is_empty() {
             return Ok(format!("No conversations found in the last {} day(s).", days_back));
@@ -673,14 +755,13 @@ impl ConversationSearch {
         let mut lines = vec![format!("# Conversations (last {} day{})\n", days_back, day_word)];
 
         for conv in &conversations {
-            let session_id = conv.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-            let summary = conv.get("conversation_summary").and_then(|v| v.as_str()).unwrap_or("");
-            let project = conv.get("project_path").and_then(|v| v.as_str()).unwrap_or("");
-            let msg_count = conv.get("message_count").and_then(|v| v.as_i64()).unwrap_or(0);
-            let last_at = conv.get("last_message_at").and_then(|v| v.as_str()).unwrap_or("");
+            let session_id = &conv.session_id;
+            let summary = conv.conversation_summary.as_deref().unwrap_or("");
+            let project = conv.project_path.as_deref().unwrap_or("");
+            let msg_count = conv.message_count;
+            let last_at = conv.last_message_at.as_deref().unwrap_or("");
 
             let date_str = format_timestamp(last_at, true, false);
-            let _time_str = format_timestamp(last_at, false, false);
             let session_short = &session_id[..std::cmp::min(8, session_id.len())];
 
             lines.push(format!("## [{}] {}", session_short, summary));
@@ -688,16 +769,24 @@ impl ConversationSearch {
 
             // Fetch messages
             let msg_sql = "SELECT message_uuid, timestamp, message_type, summary, is_sidechain, project_path, is_tool_noise FROM messages WHERE session_id = ? AND is_tool_noise = FALSE AND is_meta_conversation = FALSE ORDER BY timestamp DESC LIMIT ?";
-            let msg_results = self.query_to_maps(
+            let mut msg_results = self.query_rows(
                 msg_sql,
-                &[&session_id as &dyn rusqlite::types::ToSql, &max_messages_per_conv as &dyn rusqlite::types::ToSql],
+                &[session_id as &dyn rusqlite::types::ToSql, &max_messages_per_conv as &dyn rusqlite::types::ToSql],
+                |row| {
+                    Ok((
+                        row.get::<_, String>("message_uuid")?,
+                        row.get::<_, String>("timestamp")?,
+                        row.get::<_, String>("message_type")?,
+                        row.get::<_, Option<String>>("summary")?,
+                        row.get::<_, bool>("is_sidechain")?,
+                    ))
+                },
             )?;
 
-            let mut msg_results = msg_results;
             msg_results.reverse();
 
-            for msg in &msg_results {
-                let msg_summary = msg.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+            for (uuid, timestamp, msg_type, summary_opt, is_sidechain) in &msg_results {
+                let msg_summary = summary_opt.as_deref().unwrap_or("");
                 if msg_summary.is_empty()
                     || msg_summary.starts_with("[Tool")
                     || msg_summary == "[Tool result]"
@@ -707,22 +796,10 @@ impl ConversationSearch {
                     continue;
                 }
 
-                let msg_time = format_timestamp(
-                    msg.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
-                    false,
-                    false,
-                );
-                let icon = if msg.get("message_type").and_then(|v| v.as_str()) == Some("user") {
-                    "\u{1f464}"
-                } else {
-                    "\u{1f916}"
-                };
-                let is_sidechain = msg.get("is_sidechain").and_then(|v| v.as_i64()).unwrap_or(0) != 0;
-                let branch = if is_sidechain { "\u{1f33f} " } else { "" };
-                let uuid_short = &msg
-                    .get("message_uuid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")[..8.min(msg.get("message_uuid").and_then(|v| v.as_str()).unwrap_or("").len())];
+                let msg_time = format_timestamp(timestamp, false, false);
+                let icon = if msg_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+                let branch = if *is_sidechain { "\u{1f33f} " } else { "" };
+                let uuid_short = &uuid[..8.min(uuid.len())];
 
                 lines.push(format!("{} {} `{}` {}{}", icon, msg_time, uuid_short, branch, msg_summary));
             }
@@ -882,9 +959,7 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         // Should be ordered by timestamp DESC
-        let ts0 = results[0].get("timestamp").and_then(|v| v.as_str()).unwrap();
-        let ts1 = results[1].get("timestamp").and_then(|v| v.as_str()).unwrap();
-        assert!(ts0 >= ts1);
+        assert!(results[0].timestamp >= results[1].timestamp);
     }
 
     #[test]
@@ -900,8 +975,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(uuid, "msg1");
+        assert_eq!(results[0].message_uuid, "msg1");
     }
 
     #[test]
@@ -936,8 +1010,7 @@ mod tests {
 
         // Only the recent message should be returned
         assert_eq!(results.len(), 1);
-        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(uuid, "new_msg");
+        assert_eq!(results[0].message_uuid, "new_msg");
     }
 
     #[test]
@@ -954,8 +1027,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let pp = results[0].get("project_path").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(pp, "/proj_a");
+        assert_eq!(results[0].project_path.as_deref(), Some("/proj_a"));
     }
 
     #[test]
@@ -972,8 +1044,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let source = results[0].get("source").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(source, "opencode");
+        assert_eq!(results[0].source.as_deref(), Some("opencode"));
     }
 
     #[test]
@@ -990,8 +1061,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(uuid, "msg1");
+        assert_eq!(results[0].message_uuid, "msg1");
     }
 
     #[test]
@@ -1007,8 +1077,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(uuid, "msg1");
+        assert_eq!(results[0].message_uuid, "msg1");
     }
 
     #[test]
@@ -1053,15 +1122,11 @@ mod tests {
         let searcher = ConversationSearch::from_connection(conn);
         let result = searcher.get_conversation_context("child1", 5).unwrap();
 
-        assert!(result.contains_key("message"));
-        assert!(result.contains_key("ancestors"));
-        assert!(result.contains_key("conversation"));
+        assert!(result.message.is_some());
+        assert!(result.conversation.is_some());
 
-        let ancestors = result.get("ancestors").unwrap().as_array().unwrap();
-        assert_eq!(ancestors.len(), 1);
-
-        let ancestor_uuid = ancestors[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(ancestor_uuid, "parent1");
+        assert_eq!(result.ancestors.len(), 1);
+        assert_eq!(result.ancestors[0].message_uuid, "parent1");
     }
 
     #[test]
@@ -1071,9 +1136,8 @@ mod tests {
 
         let result = searcher.get_conversation_context("nonexistent-uuid", 5).unwrap();
 
-        assert!(result.contains_key("error"));
-        let err_msg = result.get("error").and_then(|v| v.as_str()).unwrap();
-        assert!(err_msg.contains("not found"));
+        assert!(result.error.is_some());
+        assert!(result.error.unwrap().contains("not found"));
     }
 
     // ---- get_conversation_tree tests ----
@@ -1101,23 +1165,15 @@ mod tests {
         let searcher = ConversationSearch::from_connection(conn);
         let result = searcher.get_conversation_tree("sess1").unwrap();
 
-        assert!(result.contains_key("conversation"));
-        assert!(result.contains_key("tree"));
-        assert!(result.contains_key("total_messages"));
-
-        let total = result.get("total_messages").and_then(|v| v.as_i64()).unwrap();
-        assert_eq!(total, 3);
-
-        let tree = result.get("tree").unwrap().as_array().unwrap();
-        assert_eq!(tree.len(), 1); // One root
+        assert!(result.conversation.is_some());
+        assert_eq!(result.total_messages, 3);
+        assert_eq!(result.tree.len(), 1); // One root
 
         // Root should have children
-        let root_children = tree[0].get("children").unwrap().as_array().unwrap();
-        assert_eq!(root_children.len(), 1);
+        assert_eq!(result.tree[0].children.len(), 1);
 
         // Child should have grandchild
-        let child_children = root_children[0].get("children").unwrap().as_array().unwrap();
-        assert_eq!(child_children.len(), 1);
+        assert_eq!(result.tree[0].children[0].children.len(), 1);
     }
 
     // ---- list_recent_conversations tests ----
@@ -1142,16 +1198,14 @@ mod tests {
             .list_recent_conversations(Some(1), None, None, None, 10, Some("/proj_a"), None, None)
             .unwrap();
         assert_eq!(results.len(), 1);
-        let pp = results[0].get("project_path").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(pp, "/proj_a");
+        assert_eq!(results[0].project_path.as_deref(), Some("/proj_a"));
 
         // Filter by source
         let results = searcher
             .list_recent_conversations(Some(1), None, None, None, 10, None, None, Some("opencode"))
             .unwrap();
         assert_eq!(results.len(), 1);
-        let src = results[0].get("source").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(src, "opencode");
+        assert_eq!(results[0].source.as_deref(), Some("opencode"));
     }
 
     // ---- query sanitization tests ----
@@ -1192,8 +1246,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(uuid, "msg1");
+        assert_eq!(results[0].message_uuid, "msg1");
     }
 
     #[test]
@@ -1210,8 +1263,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(uuid, "msg1"); // Only msg1 contains both 認証 and 実装
+        assert_eq!(results[0].message_uuid, "msg1"); // Only msg1 contains both 認証 and 実装
     }
 
     #[test]
@@ -1255,8 +1307,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(uuid, "msg1");
+        assert_eq!(results[0].message_uuid, "msg1");
     }
 
     #[test]
@@ -1300,8 +1351,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let uuid = results[0].get("message_uuid").and_then(|v| v.as_str()).unwrap();
-        assert_eq!(uuid, "msg1");
+        assert_eq!(results[0].message_uuid, "msg1");
     }
 
     #[test]
@@ -1316,7 +1366,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(results.len(), 1);
-        let snippet = results[0].get("context_snippet").and_then(|v| v.as_str()).unwrap();
+        let snippet = &results[0].context_snippet;
         // Snippet should contain highlighted search terms
         assert!(snippet.contains("**brown**"), "snippet should highlight 'brown': {}", snippet);
         assert!(snippet.contains("**fox**"), "snippet should highlight 'fox': {}", snippet);

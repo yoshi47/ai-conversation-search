@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::indexer::ConversationIndexer;
 use crate::indexer::codex::CodexIndexer;
 use crate::indexer::opencode::{OpenCodeIndexer, get_opencode_db_path};
-use crate::search::{ConversationSearch, format_timestamp};
+use crate::search::{ConversationSearch, TreeNode, format_timestamp};
 
 /// Source display labels
 const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")];
@@ -464,21 +464,15 @@ fn cmd_search(
     println!("\u{1f50d} Found {} matches for '{}':\n", results.len(), query);
 
     for result in &results {
-        let msg_type = result.get("message_type").and_then(|v| v.as_str()).unwrap_or("");
-        let icon = if msg_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
-        let timestamp = format_timestamp(
-            result.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
-            true,
-            false,
-        );
-        let source_str = result.get("source").and_then(|v| v.as_str()).unwrap_or("claude_code");
+        let icon = if result.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+        let timestamp = format_timestamp(&result.timestamp, true, false);
+        let source_str = result.source.as_deref().unwrap_or("claude_code");
         let label = source_label(source_str);
 
-        let project_dir = result.get("project_path").and_then(|v| v.as_str()).unwrap_or("").to_string();
-
-        let summary = result.get("conversation_summary").and_then(|v| v.as_str()).unwrap_or("");
-        let session_id = result.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
-        let message_uuid = result.get("message_uuid").and_then(|v| v.as_str()).unwrap_or("");
+        let project_dir = result.project_path.as_deref().unwrap_or("");
+        let summary = result.conversation_summary.as_deref().unwrap_or("");
+        let session_id = &result.session_id;
+        let message_uuid = &result.message_uuid;
 
         println!("{} {} {}", icon, label, summary);
         println!("   Session: {}", session_id);
@@ -492,8 +486,7 @@ fn cmd_search(
                 println!("\n   {}...", truncated);
             }
         } else {
-            let snippet = result.get("context_snippet").and_then(|v| v.as_str()).unwrap_or("");
-            println!("\n   {}", snippet);
+            println!("\n   {}", result.context_snippet);
         }
 
         if source_str == "opencode" {
@@ -528,41 +521,30 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool, no
 
     println!("Context for message: {}\n", uuid);
 
-    if let Some(err) = result.get("error") {
+    if let Some(ref err) = result.error {
         println!("Error: {}", err);
         return Ok(());
     }
 
     // Show ancestors
-    if let Some(ancestors) = result.get("ancestors").and_then(|v| v.as_array()) {
-        if !ancestors.is_empty() {
-            println!("\u{1f4dc} Parent messages:");
-            for msg in ancestors {
-                let icon = if msg.get("message_type").and_then(|v| v.as_str()) == Some("user") {
-                    "\u{1f464}"
-                } else {
-                    "\u{1f916}"
-                };
-                let summary = msg.get("summary").and_then(|v| v.as_str()).unwrap_or("No summary");
-                println!("  {} {}", icon, summary);
-            }
-            println!();
+    if !result.ancestors.is_empty() {
+        println!("\u{1f4dc} Parent messages:");
+        for msg in &result.ancestors {
+            let icon = if msg.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+            let summary = msg.summary.as_deref().unwrap_or("No summary");
+            println!("  {} {}", icon, summary);
         }
+        println!();
     }
 
     // Show target
-    if let Some(msg) = result.get("message") {
+    if let Some(ref msg) = result.message {
         println!("\u{1f3af} Target message:");
-        let icon = if msg.get("message_type").and_then(|v| v.as_str()) == Some("user") {
-            "\u{1f464}"
-        } else {
-            "\u{1f916}"
-        };
+        let icon = if msg.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
         if show_content {
-            let content = msg.get("full_content").and_then(|v| v.as_str()).unwrap_or("No content");
-            println!("  {} {}", icon, content);
+            println!("  {} {}", icon, msg.full_content);
         } else {
-            let summary = msg.get("summary").and_then(|v| v.as_str()).unwrap_or("No summary");
+            let summary = msg.summary.as_deref().unwrap_or("No summary");
             println!("  {} {}", icon, summary);
         }
         println!();
@@ -615,19 +597,18 @@ fn cmd_list(
     println!("Recent conversations (last {} days):\n", display_days);
 
     for conv in &convs {
-        let last_at = conv.get("last_message_at").and_then(|v| v.as_str()).unwrap_or("");
+        let last_at = conv.last_message_at.as_deref().unwrap_or("");
         let timestamp = format_timestamp(last_at, true, false);
-        let source_str = conv.get("source").and_then(|v| v.as_str()).unwrap_or("claude_code");
+        let source_str = conv.source.as_deref().unwrap_or("claude_code");
         let label = source_label(source_str);
-        let summary = conv.get("conversation_summary").and_then(|v| v.as_str()).unwrap_or("");
-        let msg_count = conv.get("message_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let project = conv.get("project_path").and_then(|v| v.as_str()).unwrap_or("");
-        let session_id = conv.get("session_id").and_then(|v| v.as_str()).unwrap_or("");
+        let summary = conv.conversation_summary.as_deref().unwrap_or("");
+        let msg_count = conv.message_count;
+        let project = conv.project_path.as_deref().unwrap_or("");
 
         println!("{} [{}] {}", label, timestamp, summary);
         println!("  {} messages", msg_count);
         println!("  {}", project);
-        println!("  Session: {}", session_id);
+        println!("  Session: {}", conv.session_id);
         println!();
     }
 
@@ -647,35 +628,24 @@ fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
 
     println!("Conversation tree: {}\n", session_id);
 
-    if let Some(err) = tree.get("error") {
+    if let Some(ref err) = tree.error {
         println!("Error: {}", err);
         return Ok(());
     }
 
-    if let Some(nodes) = tree.get("tree").and_then(|v| v.as_array()) {
-        print_tree_nodes(nodes, 0);
-    }
+    print_tree_nodes(&tree.tree, 0);
 
     Ok(())
 }
 
-fn print_tree_nodes(nodes: &[serde_json::Value], indent: usize) {
+fn print_tree_nodes(nodes: &[TreeNode], indent: usize) {
     for node in nodes {
-        let icon = if node.get("message_type").and_then(|v| v.as_str()) == Some("user") {
-            "\u{1f464}"
-        } else {
-            "\u{1f916}"
-        };
-        let summary = node
-            .get("summary")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let icon = if node.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+        let summary = node.summary.as_deref().unwrap_or("");
         let truncated: String = summary.chars().take(80).collect();
         let prefix = "  ".repeat(indent);
         println!("{}{} {}", prefix, icon, truncated);
-        if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
-            print_tree_nodes(children, indent + 1);
-        }
+        print_tree_nodes(&node.children, indent + 1);
     }
 }
 
