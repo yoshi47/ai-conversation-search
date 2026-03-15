@@ -15,6 +15,65 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// Extract a snippet around the first occurrence of any search term in content.
+/// Returns a window of `max_len` chars centered on the match, with `**` highlighting.
+fn extract_snippet(content: &str, search_terms: &[&str], max_len: usize) -> String {
+    let content_lower = content.to_lowercase();
+
+    // Find the earliest match position
+    let mut best_pos: Option<(usize, usize)> = None; // (byte_start, byte_len)
+    for term in search_terms {
+        let term_lower = term.to_lowercase();
+        if let Some(byte_idx) = content_lower.find(&term_lower) {
+            match best_pos {
+                None => best_pos = Some((byte_idx, term.len())),
+                Some((prev, _)) if byte_idx < prev => best_pos = Some((byte_idx, term.len())),
+                _ => {}
+            }
+        }
+    }
+
+    let Some((match_byte_start, _)) = best_pos else {
+        // No match found, return beginning of content
+        return content.chars().take(max_len).collect();
+    };
+
+    // Convert byte position to char position
+    let match_char_start = content[..match_byte_start].chars().count();
+
+    // Calculate window: center on match
+    let half_window = max_len / 2;
+    let window_start = match_char_start.saturating_sub(half_window);
+    let snippet: String = content.chars().skip(window_start).take(max_len).collect();
+
+    // Add highlight markers for all terms
+    let mut result = snippet;
+    for term in search_terms {
+        let term_lower = term.to_lowercase();
+        let mut highlighted = String::new();
+        let mut remaining = result.as_str();
+        while !remaining.is_empty() {
+            let remaining_lower = remaining.to_lowercase();
+            if let Some(idx) = remaining_lower.find(&term_lower) {
+                highlighted.push_str(&remaining[..idx]);
+                let matched = &remaining[idx..idx + term_lower.len()];
+                highlighted.push_str("**");
+                highlighted.push_str(matched);
+                highlighted.push_str("**");
+                remaining = &remaining[idx + term_lower.len()..];
+            } else {
+                highlighted.push_str(remaining);
+                break;
+            }
+        }
+        result = highlighted;
+    }
+
+    let prefix = if window_start > 0 { "..." } else { "" };
+    let suffix = if window_start + max_len < content.chars().count() { "..." } else { "" };
+    format!("{}{}{}", prefix, result, suffix)
+}
+
 /// Convert UTC ISO timestamp to local time for display.
 pub fn format_timestamp(iso_timestamp: &str, include_date: bool, include_seconds: bool) -> String {
     let cleaned = iso_timestamp.replace('Z', "+00:00");
@@ -135,18 +194,58 @@ impl ConversationSearch {
                 query.to_string()
             };
 
-            let mut sql = String::from(
-                "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, snippet(message_content_fts, 1, '**', '**', '...', ?) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN message_content_fts ON m.rowid = message_content_fts.rowid JOIN conversations c ON m.session_id = c.session_id WHERE message_content_fts.full_content MATCH ? AND m.is_meta_conversation = FALSE"
-            );
+            // Two-phase query to work around SQLite trigram FTS performance issue.
+            // SQLite's planner incorrectly uses idx_is_meta_conversation as the driving index,
+            // scanning ~all messages and checking trigram FTS for each row (O(N) full table scan).
+            // Phase 1: Get matching rowids from FTS (fast, ~50ms for 1700 matches).
+            // Phase 2: Query messages+conversations by rowid IN batches.
+            let rowids = self.query_fts_rowids(&fts_query)?;
 
-            params.push(Box::new(snippet_tokens));
-            params.push(Box::new(fts_query));
+            if rowids.is_empty() {
+                return Ok(Vec::new());
+            }
 
-            Self::append_filters(&mut sql, &mut params, days_back, since, until, date, project_path, repo, source)?;
+            // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
+            const BATCH_SIZE: usize = 500;
+            let mut all_results: Vec<HashMap<String, serde_json::Value>> = Vec::new();
 
-            sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
-            params.push(Box::new(limit));
-            sql
+            for chunk in rowids.chunks(BATCH_SIZE) {
+                let mut batch_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let mut sql = format!(
+                    "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
+                    placeholders
+                );
+
+                for rowid in chunk {
+                    batch_params.push(Box::new(*rowid));
+                }
+
+                Self::append_filters(&mut sql, &mut batch_params, days_back, since, until, date, project_path, repo, source)?;
+                sql.push_str(" ORDER BY m.timestamp DESC");
+
+                let batch_results = self.execute_search(&sql, &batch_params)?;
+                all_results.extend(batch_results);
+            }
+
+            // Sort all results by timestamp DESC and take limit
+            all_results.sort_by(|a, b| {
+                let ts_a = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                let ts_b = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+                ts_b.cmp(ts_a)
+            });
+            all_results.truncate(limit as usize);
+
+            // Post-process: extract snippets with highlighting around match locations
+            let search_terms: Vec<&str> = trimmed.split_whitespace().collect();
+            for row in &mut all_results {
+                if let Some(serde_json::Value::String(content)) = row.get("context_snippet") {
+                    let snippet = extract_snippet(content, &search_terms, 200);
+                    row.insert("context_snippet".to_string(), serde_json::Value::String(snippet));
+                }
+            }
+            return Ok(all_results);
         };
 
         self.execute_search(&sql, &params)
@@ -193,6 +292,16 @@ impl ConversationSearch {
         }
 
         Ok(())
+    }
+
+    fn query_fts_rowids(&self, fts_query: &str) -> Result<Vec<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid FROM message_content_fts WHERE full_content MATCH ?"
+        )?;
+        let rowids = stmt
+            .query_map(rusqlite::params![fts_query], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<i64>, _>>()?;
+        Ok(rowids)
     }
 
     fn execute_search(
@@ -1208,7 +1317,8 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let snippet = results[0].get("context_snippet").and_then(|v| v.as_str()).unwrap();
-        // snippet() with trigram should contain highlight markers
-        assert!(snippet.contains("**"), "snippet should contain highlight markers: {}", snippet);
+        // Snippet should contain highlighted search terms
+        assert!(snippet.contains("**brown**"), "snippet should highlight 'brown': {}", snippet);
+        assert!(snippet.contains("**fox**"), "snippet should highlight 'fox': {}", snippet);
     }
 }
