@@ -1,0 +1,23 @@
+src/search.rs
+  e2706497aefaae42 18-76,197-202,204-206,208-210,212-213,215-248,297-306,1320-1322
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.12",
+  "base_commit_sha": "c9b55534db2345dfdb1ff7160344a256697c974d",
+  "prompts": {
+    "e2706497aefaae42": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "104d7548-015a-4f39-bbf7-4bcad0a8a369",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 221,
+      "total_deletions": 111,
+      "accepted_lines": 122,
+      "overriden_lines": 0
+    }
+  }
+}
