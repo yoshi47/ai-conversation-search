@@ -15,3 +15,8 @@ venv/
 dist/
 build/
 *.egg
+
+
+# Added by cargo
+
+/target
