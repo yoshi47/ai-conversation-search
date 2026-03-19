@@ -19,13 +19,11 @@ pub fn resolve_repo_root_cached(conn: &Connection, project_path: &str) -> Option
 
     let result = crate::git_utils::resolve_repo_root(project_path);
 
-    // Cache result (including None to avoid repeated lookups)
-    if let Some(ref root) = result {
-        let _ = conn.execute(
-            "INSERT OR REPLACE INTO repo_root_cache (project_path, repo_root) VALUES (?, ?)",
-            rusqlite::params![project_path, root],
-        );
-    }
+    // Cache result (including None to avoid repeated git lookups)
+    let _ = conn.execute(
+        "INSERT OR REPLACE INTO repo_root_cache (project_path, repo_root) VALUES (?, ?)",
+        rusqlite::params![project_path, result.as_deref()],
+    );
 
     result
 }

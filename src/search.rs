@@ -20,6 +20,21 @@ pub struct SearchFilter<'a> {
     pub source: Option<&'a str>,
 }
 
+impl Default for SearchFilter<'_> {
+    fn default() -> Self {
+        Self {
+            days_back: None,
+            since: None,
+            until: None,
+            date: None,
+            limit: 20,
+            project_path: None,
+            repo: None,
+            source: None,
+        }
+    }
+}
+
 /// A single search result row (messages JOIN conversations).
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResultRow {
@@ -850,16 +865,7 @@ mod tests {
     use super::*;
 
     fn default_filter() -> SearchFilter<'static> {
-        SearchFilter {
-            days_back: None,
-            since: None,
-            until: None,
-            date: None,
-            limit: 10,
-            project_path: None,
-            repo: None,
-            source: None,
-        }
+        SearchFilter { limit: 10, ..Default::default() }
     }
 
     fn setup_test_db() -> Connection {

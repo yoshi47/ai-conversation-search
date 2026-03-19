@@ -181,7 +181,7 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> bool {
                 .unwrap_or(None);
             fts_sql.map_or(true, |s| s.contains("trigram"))
         }
-        _ => false,
+        v => unreachable!("unhandled custom migration version: {}", v),
     }
 }
 
@@ -262,7 +262,7 @@ fn parse_create_index(sql: &str) -> Option<String> {
 fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
     match version {
         8 => migrate_fts_to_trigram(conn),
-        _ => Ok(()),
+        v => unreachable!("unhandled custom migration version: {}", v),
     }
 }
 
@@ -490,6 +490,80 @@ mod tests {
                 "migration {} should be recorded",
                 version
             );
+        }
+    }
+
+    #[test]
+    fn test_migration_versions_are_strictly_increasing() {
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|(v, _, _)| *v).collect();
+        for window in versions.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "Migration versions must be strictly increasing: {} >= {}",
+                window[0], window[1]
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_alter_add_column() {
+        let result = parse_alter_add_column(
+            "ALTER TABLE messages ADD COLUMN is_meta_conversation BOOLEAN DEFAULT FALSE",
+        );
+        assert_eq!(result, Some(("messages".to_string(), "is_meta_conversation".to_string())));
+
+        let result = parse_alter_add_column(
+            "ALTER TABLE conversations ADD COLUMN repo_root TEXT",
+        );
+        assert_eq!(result, Some(("conversations".to_string(), "repo_root".to_string())));
+
+        // Not an ALTER TABLE
+        assert_eq!(parse_alter_add_column("CREATE TABLE foo (id INT)"), None);
+    }
+
+    #[test]
+    fn test_parse_create_table() {
+        let result = parse_create_table(
+            "CREATE TABLE IF NOT EXISTS repo_root_cache (
+                project_path TEXT PRIMARY KEY,
+                repo_root TEXT
+            )",
+        );
+        assert_eq!(result, Some("repo_root_cache".to_string()));
+
+        let result = parse_create_table("CREATE TABLE foo (id INT)");
+        assert_eq!(result, Some("foo".to_string()));
+
+        assert_eq!(parse_create_table("ALTER TABLE foo ADD COLUMN bar"), None);
+    }
+
+    #[test]
+    fn test_parse_create_index() {
+        let result = parse_create_index(
+            "CREATE INDEX IF NOT EXISTS idx_conv_repo_root ON conversations(repo_root)",
+        );
+        assert_eq!(result, Some("idx_conv_repo_root".to_string()));
+
+        let result = parse_create_index("CREATE INDEX idx_foo ON bar(baz)");
+        assert_eq!(result, Some("idx_foo".to_string()));
+
+        assert_eq!(parse_create_index("ALTER TABLE foo ADD COLUMN bar"), None);
+    }
+
+    #[test]
+    fn test_parse_all_migration_sql() {
+        // Verify that all SQL migrations can be parsed by detect_sql_migration_applied
+        for (version, _desc, kind) in MIGRATIONS {
+            if let MigrationKind::Sql(sql) = kind {
+                let detected = sql.contains("ALTER TABLE")
+                    || sql.contains("CREATE TABLE")
+                    || sql.contains("CREATE INDEX");
+                assert!(
+                    detected,
+                    "Migration {} SQL should match at least one parser: {}",
+                    version, sql
+                );
+            }
         }
     }
 }
