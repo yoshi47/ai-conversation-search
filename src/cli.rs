@@ -205,6 +205,31 @@ pub enum Commands {
     },
 }
 
+fn index_other_sources(days_back: Option<i64>, quiet: bool) {
+    let oc_path = db::expand_path(&get_opencode_db_path());
+    if oc_path.exists() {
+        if !quiet {
+            eprintln!("\nIndexing OpenCode conversations...");
+        }
+        let mut oc = OpenCodeIndexer::new(None, None, quiet);
+        let _ = oc.scan_and_index(days_back);
+    }
+
+    let codex_dir = db::expand_path("~/.codex/sessions");
+    if codex_dir.exists() {
+        if !quiet {
+            eprintln!("\nIndexing Codex CLI conversations...");
+        }
+        let mut cx = CodexIndexer::new(None, None, quiet);
+        let _ = cx.scan_and_index(days_back);
+    }
+}
+
+fn touch_stamp_file() {
+    let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
+    let _ = std::fs::write(&stamp_file, "");
+}
+
 fn auto_index(days_back: i64, force: bool) {
     // TTL cooldown: skip if recently indexed (unless forced)
     let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
@@ -241,22 +266,8 @@ fn auto_index(days_back: i64, force: bool) {
         let _ = indexer.index_conversation(conv_file);
     }
 
-    // Index OpenCode
-    let oc_path = db::expand_path(&get_opencode_db_path());
-    if oc_path.exists() {
-        let mut oc = OpenCodeIndexer::new(None, None, true);
-        let _ = oc.scan_and_index(Some(days_back));
-    }
-
-    // Index Codex
-    let codex_dir = db::expand_path("~/.codex/sessions");
-    if codex_dir.exists() {
-        let mut cx = CodexIndexer::new(None, None, true);
-        let _ = cx.scan_and_index(Some(days_back));
-    }
-
-    // Update stamp file
-    let _ = std::fs::write(&stamp_file, "");
+    index_other_sources(Some(days_back), true);
+    touch_stamp_file();
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -367,29 +378,8 @@ fn cmd_init(days: i64, force: bool, quiet: bool) -> Result<()> {
         }
     }
 
-    // Index OpenCode
-    let oc_path = db::expand_path(&get_opencode_db_path());
-    if oc_path.exists() {
-        if !quiet {
-            eprintln!("\nIndexing OpenCode conversations...");
-        }
-        let mut oc = OpenCodeIndexer::new(None, None, quiet);
-        let _ = oc.scan_and_index(Some(days));
-    }
-
-    // Index Codex
-    let codex_dir = db::expand_path("~/.codex/sessions");
-    if codex_dir.exists() {
-        if !quiet {
-            eprintln!("\nIndexing Codex CLI conversations...");
-        }
-        let mut cx = CodexIndexer::new(None, None, quiet);
-        let _ = cx.scan_and_index(Some(days));
-    }
-
-    // Touch stamp file so auto_index skips on next search
-    let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
-    let _ = std::fs::write(&stamp_file, "");
+    index_other_sources(Some(days), quiet);
+    touch_stamp_file();
 
     if !quiet {
         eprintln!("\n\u{2713} Initialization complete!");
@@ -433,24 +423,9 @@ fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
         }
     }
 
-    // OpenCode
-    let oc_days = if all { Some(9999i64) } else { Some(days) };
-    let oc_path = db::expand_path(&get_opencode_db_path());
-    if oc_path.exists() {
-        let mut oc = OpenCodeIndexer::new(None, None, quiet);
-        let _ = oc.scan_and_index(oc_days);
-    }
-
-    // Codex
-    let codex_dir = db::expand_path("~/.codex/sessions");
-    if codex_dir.exists() {
-        let mut cx = CodexIndexer::new(None, None, quiet);
-        let _ = cx.scan_and_index(oc_days);
-    }
-
-    // Touch stamp file so auto_index skips on next search
-    let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
-    let _ = std::fs::write(&stamp_file, "");
+    let other_days = if all { Some(9999i64) } else { Some(days) };
+    index_other_sources(other_days, quiet);
+    touch_stamp_file();
 
     Ok(())
 }
