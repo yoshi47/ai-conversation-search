@@ -2,7 +2,33 @@ pub mod claude_code;
 pub mod codex;
 pub mod opencode;
 
+use rusqlite::Connection;
+
 pub use claude_code::ConversationIndexer;
+
+/// Resolve repo root with DB-backed cache.
+pub fn resolve_repo_root_cached(conn: &Connection, project_path: &str) -> Option<String> {
+    // Check cache
+    if let Ok(cached) = conn.query_row(
+        "SELECT repo_root FROM repo_root_cache WHERE project_path = ?",
+        [project_path],
+        |row| row.get::<_, Option<String>>(0),
+    ) {
+        return cached;
+    }
+
+    let result = crate::git_utils::resolve_repo_root(project_path);
+
+    // Cache result (including None to avoid repeated lookups)
+    if let Some(ref root) = result {
+        let _ = conn.execute(
+            "INSERT OR REPLACE INTO repo_root_cache (project_path, repo_root) VALUES (?, ?)",
+            rusqlite::params![project_path, root],
+        );
+    }
+
+    result
+}
 
 /// Parsed message from a JSONL file.
 #[derive(Debug, Clone)]

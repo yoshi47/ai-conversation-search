@@ -222,7 +222,7 @@ impl ConversationIndexer {
         project_path: &str,
         conversation_file: Option<&str>,
     ) -> Option<String> {
-        // Check cache
+        // Check DB cache first
         if let Ok(cached) = self.conn.query_row(
             "SELECT repo_root FROM repo_root_cache WHERE project_path = ?",
             [project_path],
@@ -231,22 +231,16 @@ impl ConversationIndexer {
             return cached;
         }
 
-        let mut repo_root = None;
-
-        if let Some(conv_file) = conversation_file {
+        // Claude Code stores project dirs as hashed names; decode from conversation file path
+        let repo_root = conversation_file.and_then(|conv_file| {
             let conv_path = Path::new(conv_file);
-            if let Some(parent) = conv_path.parent() {
-                if let Some(dir_name) = parent.file_name() {
-                    if let Some(real_path) =
-                        Self::decode_project_dir_name(&dir_name.to_string_lossy())
-                    {
-                        repo_root = resolve_repo_root(&real_path);
-                    }
-                }
-            }
-        }
+            let parent = conv_path.parent()?;
+            let dir_name = parent.file_name()?;
+            let real_path = Self::decode_project_dir_name(&dir_name.to_string_lossy())?;
+            resolve_repo_root(&real_path)
+        });
 
-        // Cache successful results
+        // Cache result
         if let Some(ref root) = repo_root {
             let _ = self.conn.execute(
                 "INSERT OR REPLACE INTO repo_root_cache (project_path, repo_root) VALUES (?, ?)",

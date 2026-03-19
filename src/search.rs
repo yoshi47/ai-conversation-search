@@ -298,9 +298,6 @@ impl ConversationSearch {
         let until = filter.until;
         let date = filter.date;
         let limit = filter.limit;
-        let project_path = filter.project_path;
-        let repo = filter.repo;
-        let source = filter.source;
 
         if days_back.is_some() && (since.is_some() || until.is_some() || date.is_some()) {
             return Err(AppError::General(

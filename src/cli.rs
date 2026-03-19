@@ -211,7 +211,7 @@ fn index_other_sources(days_back: Option<i64>, quiet: bool) {
         if !quiet {
             eprintln!("\nIndexing OpenCode conversations...");
         }
-        let mut oc = OpenCodeIndexer::new(None, None, quiet);
+        let oc = OpenCodeIndexer::new(None, None, quiet);
         let _ = oc.scan_and_index(days_back);
     }
 
@@ -220,7 +220,7 @@ fn index_other_sources(days_back: Option<i64>, quiet: bool) {
         if !quiet {
             eprintln!("\nIndexing Codex CLI conversations...");
         }
-        let mut cx = CodexIndexer::new(None, None, quiet);
+        let cx = CodexIndexer::new(None, None, quiet);
         let _ = cx.scan_and_index(days_back);
     }
 }

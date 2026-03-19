@@ -5,7 +5,6 @@ use rusqlite::Connection;
 
 use crate::db;
 use crate::error::Result;
-use crate::git_utils::resolve_repo_root;
 
 const DEFAULT_OPENCODE_DB: &str = "~/.local/share/opencode/opencode.db";
 const OC_PREFIX: &str = "oc:";
@@ -31,7 +30,6 @@ pub struct OpenCodeIndexer {
     search_db_path: String,
     opencode_db_path: PathBuf,
     quiet: bool,
-    repo_root_cache: HashMap<String, Option<String>>,
 }
 
 impl OpenCodeIndexer {
@@ -50,7 +48,6 @@ impl OpenCodeIndexer {
                 .to_string(),
             opencode_db_path: db::expand_path(&oc_path),
             quiet,
-            repo_root_cache: HashMap::new(),
         }
     }
 
@@ -77,15 +74,6 @@ impl OpenCodeIndexer {
                 | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .ok()
-    }
-
-    fn resolve_repo_root_cached(&mut self, worktree: &str) -> Option<String> {
-        if let Some(cached) = self.repo_root_cache.get(worktree) {
-            return cached.clone();
-        }
-        let result = resolve_repo_root(worktree);
-        self.repo_root_cache.insert(worktree.to_string(), result.clone());
-        result
     }
 
     fn epoch_ms_to_iso(epoch_ms: i64) -> String {
@@ -132,7 +120,7 @@ impl OpenCodeIndexer {
         text_parts.join("\n")
     }
 
-    pub fn scan_and_index(&mut self, days_back: Option<i64>) -> Result<usize> {
+    pub fn scan_and_index(&self, days_back: Option<i64>) -> Result<usize> {
         let oc_conn = match self.connect_opencode() {
             Some(c) => c,
             None => return Ok(0),
@@ -170,7 +158,7 @@ impl OpenCodeIndexer {
     }
 
     fn do_index(
-        &mut self,
+        &self,
         oc_conn: &Connection,
         search_conn: &Connection,
         days_back: Option<i64>,
@@ -261,7 +249,7 @@ impl OpenCodeIndexer {
     }
 
     fn index_session(
-        &mut self,
+        &self,
         oc_conn: &Connection,
         search_conn: &Connection,
         info: &SessionInfo<'_>,
@@ -326,7 +314,7 @@ impl OpenCodeIndexer {
         }
 
         let repo_root = if !work_dir.is_empty() {
-            self.resolve_repo_root_cached(work_dir)
+            super::resolve_repo_root_cached(search_conn, work_dir)
         } else {
             None
         };

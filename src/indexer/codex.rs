@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use regex::Regex;
@@ -6,7 +5,6 @@ use rusqlite::Connection;
 
 use crate::db;
 use crate::error::Result;
-use crate::git_utils::resolve_repo_root;
 
 const DEFAULT_CODEX_SESSIONS: &str = "~/.codex/sessions";
 const CX_PREFIX: &str = "codex:";
@@ -15,7 +13,6 @@ pub struct CodexIndexer {
     search_db_path: String,
     sessions_dir: PathBuf,
     quiet: bool,
-    repo_root_cache: HashMap<String, Option<String>>,
     uuid_re: Regex,
 }
 
@@ -31,7 +28,6 @@ impl CodexIndexer {
                 .to_string(),
             sessions_dir: db::expand_path(sessions_dir.unwrap_or(DEFAULT_CODEX_SESSIONS)),
             quiet,
-            repo_root_cache: HashMap::new(),
             uuid_re: Regex::new(
                 r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
             )
@@ -43,16 +39,6 @@ impl CodexIndexer {
         if !self.quiet {
             eprintln!("{}", msg);
         }
-    }
-
-    fn resolve_repo_root_cached(&mut self, worktree: &str) -> Option<String> {
-        if let Some(cached) = self.repo_root_cache.get(worktree) {
-            return cached.clone();
-        }
-        let result = resolve_repo_root(worktree);
-        self.repo_root_cache
-            .insert(worktree.to_string(), result.clone());
-        result
     }
 
     fn find_session_files(&self, days_back: Option<i64>) -> Vec<PathBuf> {
@@ -105,7 +91,7 @@ impl CodexIndexer {
         }
     }
 
-    pub fn scan_and_index(&mut self, days_back: Option<i64>) -> Result<usize> {
+    pub fn scan_and_index(&self, days_back: Option<i64>) -> Result<usize> {
         let session_files = self.find_session_files(days_back);
         if session_files.is_empty() {
             self.log("No Codex session files found");
@@ -126,7 +112,7 @@ impl CodexIndexer {
         self.do_index(&conn, &session_files)
     }
 
-    fn do_index(&mut self, conn: &Connection, session_files: &[PathBuf]) -> Result<usize> {
+    fn do_index(&self, conn: &Connection, session_files: &[PathBuf]) -> Result<usize> {
         let mut indexed_count: usize = 0;
 
         conn.execute_batch("BEGIN;")?;
@@ -189,7 +175,7 @@ impl CodexIndexer {
         Ok(indexed_count)
     }
 
-    fn index_session_file(&mut self, conn: &Connection, session_file: &Path) -> Result<usize> {
+    fn index_session_file(&self, conn: &Connection, session_file: &Path) -> Result<usize> {
         let content = std::fs::read_to_string(session_file)?;
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
@@ -221,7 +207,7 @@ impl CodexIndexer {
             .to_string();
 
         let repo_root = if !cwd.is_empty() {
-            self.resolve_repo_root_cached(&cwd)
+            super::resolve_repo_root_cached(conn, &cwd)
         } else {
             None
         };
@@ -481,7 +467,6 @@ mod tests {
             search_db_path: String::new(),
             sessions_dir: sessions_dir.to_path_buf(),
             quiet: true,
-            repo_root_cache: HashMap::new(),
             uuid_re: Regex::new(
                 r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
             )
@@ -515,7 +500,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         let count = indexer.index_session_file(&conn, &session_file).unwrap();
         assert_eq!(count, 2);
 
@@ -549,7 +534,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         indexer.index_session_file(&conn, &session_file).unwrap();
 
         let fts_count: i32 = conn
@@ -593,7 +578,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         let files = vec![session_file.clone()];
 
         // First index
@@ -629,7 +614,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         indexer.index_session_file(&conn, &session_file).unwrap();
 
         let session_id: String = conn
@@ -659,7 +644,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         let count = indexer.index_session_file(&conn, &session_file).unwrap();
         assert_eq!(count, 2);
 
@@ -687,7 +672,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         let count = indexer.index_session_file(&conn, &session_file).unwrap();
         assert_eq!(count, 0);
     }
@@ -706,7 +691,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         let count = indexer.index_session_file(&conn, &session_file).unwrap();
         assert_eq!(count, 0);
     }
@@ -744,7 +729,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         let count = indexer.index_session_file(&conn, &session_file).unwrap();
         // Two consecutive user messages consolidated into one, plus one agent message = 2
         assert_eq!(count, 2);
@@ -782,7 +767,7 @@ mod tests {
             ],
         );
 
-        let mut indexer = create_indexer(dir.path());
+        let indexer = create_indexer(dir.path());
         indexer.index_session_file(&conn, &session_file).unwrap();
 
         let (summary, source, first_at, last_at, msg_count, project): (
