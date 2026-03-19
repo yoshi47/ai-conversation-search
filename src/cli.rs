@@ -139,6 +139,9 @@ pub enum Commands {
         /// Skip auto-indexing
         #[arg(long)]
         no_index: bool,
+        /// Force re-index (ignore TTL cooldown)
+        #[arg(long)]
+        force_index: bool,
     },
     /// Get context around a message
     Context {
@@ -156,6 +159,9 @@ pub enum Commands {
         /// Skip auto-indexing
         #[arg(long)]
         no_index: bool,
+        /// Force re-index (ignore TTL cooldown)
+        #[arg(long)]
+        force_index: bool,
     },
     /// List recent conversations
     List {
@@ -186,6 +192,9 @@ pub enum Commands {
         /// Skip auto-indexing
         #[arg(long)]
         no_index: bool,
+        /// Force re-index (ignore TTL cooldown)
+        #[arg(long)]
+        force_index: bool,
     },
     /// Show conversation tree
     Tree {
@@ -202,11 +211,36 @@ pub enum Commands {
     },
 }
 
-fn auto_index(days_back: i64) {
+fn auto_index(days_back: i64, force: bool) {
+    // TTL cooldown: skip if recently indexed (unless forced)
+    let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
+    let ttl_secs = match std::env::var("CONVERSATION_SEARCH_INDEX_TTL") {
+        Ok(v) => match v.parse::<u64>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("Warning: invalid CONVERSATION_SEARCH_INDEX_TTL='{}', using default 60s", v);
+                60
+            }
+        },
+        Err(_) => 60,
+    };
+
+    if !force {
+        if let Ok(Ok(mtime)) = std::fs::metadata(&stamp_file).map(|m| m.modified()) {
+            if mtime.elapsed().unwrap_or_default() < std::time::Duration::from_secs(ttl_secs) {
+                return;
+            }
+        }
+    }
+
     let mut indexer = match ConversationIndexer::new(db::DEFAULT_DB_PATH, true) {
         Ok(i) => i,
         Err(_) => return,
     };
+
+    if force {
+        indexer.clear_sync_state();
+    }
 
     let files = indexer.scan_conversations(Some(days_back));
     for conv_file in &files {
@@ -226,6 +260,9 @@ fn auto_index(days_back: i64) {
         let mut cx = CodexIndexer::new(None, None, true);
         let _ = cx.scan_and_index(Some(days_back));
     }
+
+    // Update stamp file
+    let _ = std::fs::write(&stamp_file, "");
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -261,9 +298,10 @@ pub fn run(cli: Cli) -> Result<()> {
             content,
             json,
             no_index,
+            force_index,
         }) => cmd_search(
             &query, days, since, until, date, project, repo, source, limit, content, json,
-            no_index,
+            no_index, force_index,
         ),
         Some(Commands::Context {
             uuid,
@@ -271,7 +309,8 @@ pub fn run(cli: Cli) -> Result<()> {
             content,
             json,
             no_index,
-        }) => cmd_context(&uuid, depth, content, json, no_index),
+            force_index,
+        }) => cmd_context(&uuid, depth, content, json, no_index, force_index),
         Some(Commands::List {
             days,
             since,
@@ -282,7 +321,8 @@ pub fn run(cli: Cli) -> Result<()> {
             source,
             json,
             no_index,
-        }) => cmd_list(days, since, until, date, limit, repo, source, json, no_index),
+            force_index,
+        }) => cmd_list(days, since, until, date, limit, repo, source, json, no_index, force_index),
         Some(Commands::Tree { session_id, json }) => cmd_tree(&session_id, json),
         Some(Commands::Resume { uuid }) => cmd_resume(&uuid),
     }
@@ -355,6 +395,10 @@ fn cmd_init(days: i64, force: bool, quiet: bool) -> Result<()> {
         let _ = cx.scan_and_index(Some(days));
     }
 
+    // Touch stamp file so auto_index skips on next search
+    let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
+    let _ = std::fs::write(&stamp_file, "");
+
     if !quiet {
         eprintln!("\n\u{2713} Initialization complete!");
         eprintln!("  Database: {}", db_path.display());
@@ -412,6 +456,10 @@ fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
         let _ = cx.scan_and_index(oc_days);
     }
 
+    // Touch stamp file so auto_index skips on next search
+    let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
+    let _ = std::fs::write(&stamp_file, "");
+
     Ok(())
 }
 
@@ -429,9 +477,10 @@ fn cmd_search(
     show_content: bool,
     json_output: bool,
     no_index: bool,
+    force_index: bool,
 ) -> Result<()> {
     if !no_index {
-        auto_index(days.unwrap_or(30));
+        auto_index(days.unwrap_or(30), force_index);
     }
 
     let mut search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
@@ -504,9 +553,9 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool, no_index: bool) -> Result<()> {
+fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool, no_index: bool, force_index: bool) -> Result<()> {
     if !no_index {
-        auto_index(30);
+        auto_index(30, force_index);
     }
 
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
@@ -564,9 +613,10 @@ fn cmd_list(
     source: Option<String>,
     json_output: bool,
     no_index: bool,
+    force_index: bool,
 ) -> Result<()> {
     if !no_index {
-        auto_index(days.unwrap_or(30));
+        auto_index(days.unwrap_or(30), force_index);
     }
 
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;

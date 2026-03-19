@@ -107,6 +107,13 @@ CREATE TABLE IF NOT EXISTS codex_sync_state (
     indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Claude Code sync state (file-based incremental sync)
+CREATE TABLE IF NOT EXISTS claude_code_sync_state (
+    file_path TEXT PRIMARY KEY,
+    mtime REAL NOT NULL,
+    indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Cache for resolved repo roots (avoids repeated git commands)
 CREATE TABLE IF NOT EXISTS repo_root_cache (
     project_path TEXT PRIMARY KEY,

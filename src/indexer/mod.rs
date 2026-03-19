@@ -344,7 +344,7 @@ impl ConversationIndexer {
         // Get summarizer hash
         let summarizer_hash = self.get_summarizer_project_hash(&projects_dir);
 
-        let mut conversation_files = Vec::new();
+        let mut conversation_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
 
         let entries = match std::fs::read_dir(&projects_dir) {
             Ok(e) => e,
@@ -384,30 +384,28 @@ impl ConversationIndexer {
                     }
                 }
 
-                // Check modification time
+                // Always get mtime (used for both cutoff filter and sorting)
+                let mtime = match conv_file.metadata().and_then(|m| m.modified()) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+
+                // Check modification time against cutoff
                 if let Some(ref cutoff) = cutoff_time {
-                    if let Ok(metadata) = conv_file.metadata() {
-                        if let Ok(mtime) = metadata.modified() {
-                            let mtime_dt: chrono::DateTime<chrono::Local> = mtime.into();
-                            if mtime_dt < *cutoff {
-                                continue;
-                            }
-                        }
+                    let mtime_dt: chrono::DateTime<chrono::Local> = mtime.into();
+                    if mtime_dt < *cutoff {
+                        continue;
                     }
                 }
 
-                conversation_files.push(conv_file);
+                conversation_files.push((conv_file, mtime));
             }
         }
 
-        // Sort by mtime descending
-        conversation_files.sort_by(|a, b| {
-            let a_mtime = a.metadata().and_then(|m| m.modified()).ok();
-            let b_mtime = b.metadata().and_then(|m| m.modified()).ok();
-            b_mtime.cmp(&a_mtime)
-        });
+        // Sort by cached mtime descending (no additional stat calls)
+        conversation_files.sort_unstable_by(|a, b| b.1.cmp(&a.1));
 
-        conversation_files
+        conversation_files.into_iter().map(|(p, _)| p).collect()
     }
 
     fn get_summarizer_project_hash(&mut self, projects_dir: &Path) -> Option<String> {
@@ -738,6 +736,45 @@ impl ConversationIndexer {
 
     /// Index a single conversation file.
     pub fn index_conversation(&mut self, file_path: &Path) -> Result<()> {
+        // mtime-based skip: avoid re-parsing unchanged files
+        let file_mtime = match file_path.metadata().and_then(|m| m.modified()) {
+            Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
+                Ok(d) => d.as_secs_f64(),
+                Err(_) => return self.do_index_conversation(file_path),
+            },
+            Err(_) => return Ok(()),
+        };
+
+        if let Ok(existing_mtime) = self.conn.query_row(
+            "SELECT mtime FROM claude_code_sync_state WHERE file_path = ?",
+            [file_path.to_string_lossy().as_ref()],
+            |row| row.get::<_, f64>(0),
+        ) {
+            if (existing_mtime - file_mtime).abs() < 0.001 {
+                return Ok(());
+            }
+        }
+
+        let result = self.do_index_conversation(file_path);
+
+        // Only record sync state on success to avoid permanently skipping broken files
+        if result.is_ok() {
+            let _ = self.conn.execute(
+                "INSERT OR REPLACE INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
+                rusqlite::params![file_path.to_string_lossy().as_ref(), file_mtime],
+            );
+        }
+
+        result
+    }
+
+    /// Clear all sync state, forcing re-index of all files.
+    pub fn clear_sync_state(&self) {
+        let _ = self.conn.execute("DELETE FROM claude_code_sync_state", []);
+    }
+
+    /// Internal indexing logic for a single conversation file.
+    fn do_index_conversation(&mut self, file_path: &Path) -> Result<()> {
         self.log(&format!("Indexing: {}", file_path.display()));
 
         let (conv_meta, mut messages) = self.parse_conversation_file(file_path)?;

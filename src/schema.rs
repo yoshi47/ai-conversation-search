@@ -57,6 +57,15 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_conv_source ON conversations(source)",
     )?;
 
+    // Migration: Create claude_code_sync_state table
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS claude_code_sync_state (
+            file_path TEXT PRIMARY KEY,
+            mtime REAL NOT NULL,
+            indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )",
+    )?;
+
     // Migration: Switch FTS5 from unicode61 to trigram tokenizer for CJK support
     migrate_fts_to_trigram(conn)?;
 
