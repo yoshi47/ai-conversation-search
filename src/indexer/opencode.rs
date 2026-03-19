@@ -123,7 +123,7 @@ impl OpenCodeIndexer {
         text_parts.join("\n")
     }
 
-    pub fn scan_and_index(&mut self, days_back: Option<i64>) -> Result<i32> {
+    pub fn scan_and_index(&mut self, days_back: Option<i64>) -> Result<usize> {
         let oc_conn = match self.connect_opencode() {
             Some(c) => c,
             None => return Ok(0),
@@ -165,7 +165,7 @@ impl OpenCodeIndexer {
         oc_conn: &Connection,
         search_conn: &Connection,
         days_back: Option<i64>,
-    ) -> Result<i32> {
+    ) -> Result<usize> {
         search_conn.execute_batch("BEGIN;")?;
 
         let last_sync = Self::get_last_sync_time(search_conn);
@@ -212,7 +212,7 @@ impl OpenCodeIndexer {
         self.log(&format!("Found {} OpenCode sessions to index", sessions.len()));
 
         let mut max_time_updated = cutoff_ms;
-        let mut indexed_count = 0;
+        let mut indexed_count: usize = 0;
 
         for (id, _project_id, title, directory, time_created, time_updated, worktree) in &sessions {
             match self.index_session(oc_conn, search_conn, id, title.as_deref(), directory.as_deref(), *time_created, *time_updated, worktree.as_deref()) {
@@ -254,7 +254,7 @@ impl OpenCodeIndexer {
         time_created: i64,
         time_updated: i64,
         worktree: Option<&str>,
-    ) -> Result<i32> {
+    ) -> Result<usize> {
         let session_id = format!("{}{}", OC_PREFIX, session_id_raw);
         let work_dir = worktree.or(directory).unwrap_or("");
 
@@ -320,7 +320,7 @@ impl OpenCodeIndexer {
             None
         };
 
-        let mut msg_count: i32 = 0;
+        let mut msg_count: usize = 0;
         let mut first_timestamp: Option<String> = None;
 
         for (msg_id, _sess_id, msg_time_created, _msg_time_updated, data_str) in &messages {
@@ -356,7 +356,7 @@ impl OpenCodeIndexer {
                     session_id,
                     Option::<String>::None,
                     false,
-                    msg_count,
+                    msg_count as i64,
                     timestamp,
                     role,
                     work_dir,
@@ -388,7 +388,7 @@ impl OpenCodeIndexer {
                 display_title,
                 first_timestamp.as_deref().unwrap_or(&session_created_iso),
                 session_updated_iso,
-                msg_count,
+                msg_count as i64,
             ],
         )?;
 

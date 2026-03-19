@@ -77,9 +77,6 @@ pub enum Commands {
         /// Days of history to index (default: 7)
         #[arg(long, default_value_t = 7)]
         days: i64,
-        /// Skip smart extraction
-        #[arg(long)]
-        no_extract: bool,
         /// Reinitialize existing database
         #[arg(long)]
         force: bool,
@@ -95,9 +92,6 @@ pub enum Commands {
         /// Index all conversations
         #[arg(long)]
         all: bool,
-        /// Skip smart extraction
-        #[arg(long)]
-        no_extract: bool,
         /// Minimal output
         #[arg(long)]
         quiet: bool,
@@ -275,14 +269,12 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Some(Commands::Init {
             days,
-            no_extract: _,
             force,
             quiet,
         }) => cmd_init(days, force, quiet),
         Some(Commands::Index {
             days,
             all,
-            no_extract: _,
             quiet,
         }) => cmd_index(days, all, quiet),
         Some(Commands::Search {

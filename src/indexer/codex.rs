@@ -105,7 +105,7 @@ impl CodexIndexer {
         }
     }
 
-    pub fn scan_and_index(&mut self, days_back: Option<i64>) -> Result<i32> {
+    pub fn scan_and_index(&mut self, days_back: Option<i64>) -> Result<usize> {
         let session_files = self.find_session_files(days_back);
         if session_files.is_empty() {
             self.log("No Codex session files found");
@@ -126,8 +126,8 @@ impl CodexIndexer {
         self.do_index(&conn, &session_files)
     }
 
-    fn do_index(&mut self, conn: &Connection, session_files: &[PathBuf]) -> Result<i32> {
-        let mut indexed_count = 0;
+    fn do_index(&mut self, conn: &Connection, session_files: &[PathBuf]) -> Result<usize> {
+        let mut indexed_count: usize = 0;
 
         conn.execute_batch("BEGIN;")?;
 
@@ -189,7 +189,7 @@ impl CodexIndexer {
         Ok(indexed_count)
     }
 
-    fn index_session_file(&mut self, conn: &Connection, session_file: &Path) -> Result<i32> {
+    fn index_session_file(&mut self, conn: &Connection, session_file: &Path) -> Result<usize> {
         let content = std::fs::read_to_string(session_file)?;
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
@@ -392,7 +392,7 @@ impl CodexIndexer {
         }
 
         // Insert messages
-        let mut msg_count: i32 = 0;
+        let mut msg_count: usize = 0;
         let mut first_timestamp: Option<String> = None;
         let mut last_timestamp: Option<String> = None;
 
@@ -415,7 +415,7 @@ impl CodexIndexer {
                     session_id,
                     Option::<String>::None,
                     false,
-                    i as i32,
+                    i as i64,
                     ts,
                     role,
                     cwd,
@@ -450,7 +450,7 @@ impl CodexIndexer {
                 title,
                 first_timestamp.as_deref().unwrap_or(session_timestamp),
                 last_timestamp.as_deref().unwrap_or(session_timestamp),
-                msg_count,
+                msg_count as i64,
             ],
         )?;
 
