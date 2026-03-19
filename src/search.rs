@@ -8,6 +8,18 @@ use crate::date_utils::build_date_filter;
 use crate::db;
 use crate::error::{AppError, Result};
 
+/// Common filter parameters for search and list operations.
+pub struct SearchFilter<'a> {
+    pub days_back: Option<i64>,
+    pub since: Option<&'a str>,
+    pub until: Option<&'a str>,
+    pub date: Option<&'a str>,
+    pub limit: i64,
+    pub project_path: Option<&'a str>,
+    pub repo: Option<&'a str>,
+    pub source: Option<&'a str>,
+}
+
 /// A single search result row (messages JOIN conversations).
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResultRow {
@@ -279,16 +291,17 @@ impl ConversationSearch {
     pub fn search_conversations(
         &mut self,
         query: &str,
-        days_back: Option<i64>,
-        since: Option<&str>,
-        until: Option<&str>,
-        date: Option<&str>,
-        limit: i64,
-        project_path: Option<&str>,
-        repo: Option<&str>,
-        _snippet_tokens: i32,
-        source: Option<&str>,
+        filter: &SearchFilter<'_>,
     ) -> Result<Vec<SearchResultRow>> {
+        let days_back = filter.days_back;
+        let since = filter.since;
+        let until = filter.until;
+        let date = filter.date;
+        let limit = filter.limit;
+        let project_path = filter.project_path;
+        let repo = filter.repo;
+        let source = filter.source;
+
         if days_back.is_some() && (since.is_some() || until.is_some() || date.is_some()) {
             return Err(AppError::General(
                 "Cannot use --days with --since/--until/--date".to_string(),
@@ -307,7 +320,7 @@ impl ConversationSearch {
                 "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
             );
 
-            Self::append_filters(&mut sql, &mut params, days_back, since, until, date, project_path, repo, source)?;
+            Self::append_filters(&mut sql, &mut params, filter)?;
 
             sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
             params.push(Box::new(limit));
@@ -323,7 +336,7 @@ impl ConversationSearch {
                 params.push(Box::new(format!("%{}%", escape_like(term))));
             }
 
-            Self::append_filters(&mut sql, &mut params, days_back, since, until, date, project_path, repo, source)?;
+            Self::append_filters(&mut sql, &mut params, filter)?;
 
             sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
             params.push(Box::new(limit));
@@ -373,7 +386,7 @@ impl ConversationSearch {
                     batch_params.push(Box::new(*rowid));
                 }
 
-                Self::append_filters(&mut sql, &mut batch_params, days_back, since, until, date, project_path, repo, source)?;
+                Self::append_filters(&mut sql, &mut batch_params, filter)?;
                 sql.push_str(" ORDER BY m.timestamp DESC");
 
                 let batch_results = self.execute_search_typed(&sql, &batch_params)?;
@@ -398,14 +411,15 @@ impl ConversationSearch {
     fn append_filters(
         sql: &mut String,
         params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-        days_back: Option<i64>,
-        since: Option<&str>,
-        until: Option<&str>,
-        date: Option<&str>,
-        project_path: Option<&str>,
-        repo: Option<&str>,
-        source: Option<&str>,
+        filter: &SearchFilter<'_>,
     ) -> Result<()> {
+        let days_back = filter.days_back;
+        let since = filter.since;
+        let until = filter.until;
+        let date = filter.date;
+        let project_path = filter.project_path;
+        let repo = filter.repo;
+        let source = filter.source;
         if date.is_some() || since.is_some() || until.is_some() {
             let (date_sql, date_params) = build_date_filter(since, until, date)?;
             if !date_sql.is_empty() {
@@ -642,15 +656,17 @@ impl ConversationSearch {
 
     pub fn list_recent_conversations(
         &self,
-        days_back: Option<i64>,
-        since: Option<&str>,
-        until: Option<&str>,
-        date: Option<&str>,
-        limit: i64,
-        project_path: Option<&str>,
-        repo: Option<&str>,
-        source: Option<&str>,
+        filter: &SearchFilter<'_>,
     ) -> Result<Vec<ConversationRow>> {
+        let days_back = filter.days_back;
+        let since = filter.since;
+        let until = filter.until;
+        let date = filter.date;
+        let limit = filter.limit;
+        let project_path = filter.project_path;
+        let repo = filter.repo;
+        let source = filter.source;
+
         let effective_days = if days_back.is_none() && since.is_none() && until.is_none() && date.is_none() {
             Some(7i64)
         } else {
@@ -836,6 +852,19 @@ impl ConversationSearch {
 mod tests {
     use super::*;
 
+    fn default_filter() -> SearchFilter<'static> {
+        SearchFilter {
+            days_back: None,
+            since: None,
+            until: None,
+            date: None,
+            limit: 10,
+            project_path: None,
+            repo: None,
+            source: None,
+        }
+    }
+
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
@@ -954,7 +983,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("", &default_filter())
             .unwrap();
 
         assert_eq!(results.len(), 2);
@@ -971,7 +1000,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("fox", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("fox", &default_filter())
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -986,7 +1015,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("xyzzyzzy", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("xyzzyzzy", &default_filter())
             .unwrap();
 
         assert!(results.is_empty());
@@ -1005,7 +1034,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message content", Some(1), None, None, None, 10, None, None, 32, None)
+            .search_conversations("message content", &SearchFilter { days_back: Some(1), ..default_filter() })
             .unwrap();
 
         // Only the recent message should be returned
@@ -1023,7 +1052,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("hello", None, None, None, None, 10, Some("/proj_a"), None, 32, None)
+            .search_conversations("hello", &SearchFilter { project_path: Some("/proj_a"), ..default_filter() })
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1040,7 +1069,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message", None, None, None, None, 10, None, None, 32, Some("opencode"))
+            .search_conversations("message", &SearchFilter { source: Some("opencode"), ..default_filter() })
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1057,7 +1086,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("code", None, None, None, None, 10, None, Some("my-repo"), 32, None)
+            .search_conversations("code", &SearchFilter { repo: Some("my-repo"), ..default_filter() })
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1073,7 +1102,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message", None, None, None, Some("2025-01-15"), 10, None, None, 32, None)
+            .search_conversations("message", &SearchFilter { date: Some("2025-01-15"), ..default_filter() })
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1087,15 +1116,7 @@ mod tests {
 
         let result = searcher.search_conversations(
             "test",
-            Some(7),
-            Some("2025-01-01"),
-            None,
-            None,
-            10,
-            None,
-            None,
-            32,
-            None,
+            &SearchFilter { days_back: Some(7), since: Some("2025-01-01"), ..default_filter() },
         );
 
         assert!(result.is_err());
@@ -1189,20 +1210,20 @@ mod tests {
 
         // List all recent
         let results = searcher
-            .list_recent_conversations(Some(1), None, None, None, 10, None, None, None)
+            .list_recent_conversations(&SearchFilter { days_back: Some(1), ..default_filter() })
             .unwrap();
         assert_eq!(results.len(), 2);
 
         // Filter by project
         let results = searcher
-            .list_recent_conversations(Some(1), None, None, None, 10, Some("/proj_a"), None, None)
+            .list_recent_conversations(&SearchFilter { days_back: Some(1), project_path: Some("/proj_a"), ..default_filter() })
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].project_path.as_deref(), Some("/proj_a"));
 
         // Filter by source
         let results = searcher
-            .list_recent_conversations(Some(1), None, None, None, 10, None, None, Some("opencode"))
+            .list_recent_conversations(&SearchFilter { days_back: Some(1), source: Some("opencode"), ..default_filter() })
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source.as_deref(), Some("opencode"));
@@ -1220,13 +1241,13 @@ mod tests {
 
         // Single term — trigram substring match
         let results = searcher
-            .search_conversations("rustac", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("rustac", &default_filter())
             .unwrap();
         assert_eq!(results.len(), 1); // "rustac" is a substring of "rustacean"
 
         // Multi terms — AND join, each as substring match
         let results = searcher
-            .search_conversations("rustac programm", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("rustac programm", &default_filter())
             .unwrap();
         assert_eq!(results.len(), 1); // both substrings found
     }
@@ -1242,7 +1263,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("認証", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("認証", &default_filter())
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1259,7 +1280,7 @@ mod tests {
         let mut searcher = ConversationSearch::from_connection(conn);
         // Both terms must match (AND join)
         let results = searcher
-            .search_conversations("認証 実装", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("認証 実装", &default_filter())
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1276,13 +1297,13 @@ mod tests {
 
         // English term in mixed content
         let results = searcher
-            .search_conversations("OAuth", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("OAuth", &default_filter())
             .unwrap();
         assert_eq!(results.len(), 1);
 
         // Japanese term in mixed content
         let results = searcher
-            .search_conversations("認証", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("認証", &default_filter())
             .unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -1297,13 +1318,13 @@ mod tests {
         let mut searcher = ConversationSearch::from_connection(conn);
         // 1-byte short query (e.g. "ab") should use LIKE fallback
         let results = searcher
-            .search_conversations("ab", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("ab", &default_filter())
             .unwrap();
         assert!(results.is_empty()); // no match, but should not error
 
         // CJK 2-char query "型の" (6 bytes) should use LIKE fallback
         let results = searcher
-            .search_conversations("型の", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("型の", &default_filter())
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1332,7 +1353,7 @@ mod tests {
         // But search_conversations should still find it via LIKE fallback
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("認証", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("認証", &default_filter())
             .unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -1347,7 +1368,7 @@ mod tests {
         let mut searcher = ConversationSearch::from_connection(conn);
         // "rustac programm" should match msg1 (contains both substrings) but not msg2
         let results = searcher
-            .search_conversations("rustac programm", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("rustac programm", &default_filter())
             .unwrap();
 
         assert_eq!(results.len(), 1);
@@ -1362,7 +1383,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("brown fox", None, None, None, None, 10, None, None, 32, None)
+            .search_conversations("brown fox", &default_filter())
             .unwrap();
 
         assert_eq!(results.len(), 1);

@@ -5,7 +5,7 @@ use crate::error::Result;
 use crate::indexer::ConversationIndexer;
 use crate::indexer::codex::CodexIndexer;
 use crate::indexer::opencode::{OpenCodeIndexer, get_opencode_db_path};
-use crate::search::{ConversationSearch, TreeNode, format_timestamp};
+use crate::search::{ConversationSearch, SearchFilter, TreeNode, format_timestamp};
 
 /// Source display labels
 const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")];
@@ -302,10 +302,19 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
             no_index,
             force_index,
-        }) => cmd_search(
-            &query, days, since, until, date, project, repo, source, limit, content, json,
-            no_index, force_index,
-        ),
+        }) => {
+            let filter = SearchFilter {
+                days_back: days,
+                since: since.as_deref(),
+                until: until.as_deref(),
+                date: date.as_deref(),
+                limit,
+                project_path: project.as_deref(),
+                repo: repo.as_deref(),
+                source: source.as_deref(),
+            };
+            cmd_search(&query, &filter, content, json, no_index, force_index)
+        }
         Some(Commands::Context {
             uuid,
             depth,
@@ -325,7 +334,19 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
             no_index,
             force_index,
-        }) => cmd_list(days, since, until, date, limit, repo, source, json, no_index, force_index),
+        }) => {
+            let filter = SearchFilter {
+                days_back: days,
+                since: since.as_deref(),
+                until: until.as_deref(),
+                date: date.as_deref(),
+                limit,
+                project_path: None,
+                repo: repo.as_deref(),
+                source: source.as_deref(),
+            };
+            cmd_list(&filter, json, no_index, force_index)
+        }
         Some(Commands::Tree { session_id, json }) => cmd_tree(&session_id, json),
         Some(Commands::Resume { uuid }) => cmd_resume(&uuid),
     }
@@ -430,40 +451,21 @@ fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_search(
     query: &str,
-    days: Option<i64>,
-    since: Option<String>,
-    until: Option<String>,
-    date: Option<String>,
-    project: Option<String>,
-    repo: Option<String>,
-    source: Option<String>,
-    limit: i64,
+    filter: &SearchFilter<'_>,
     show_content: bool,
     json_output: bool,
     no_index: bool,
     force_index: bool,
 ) -> Result<()> {
     if !no_index {
-        auto_index(days.unwrap_or(30), force_index);
+        auto_index(filter.days_back.unwrap_or(30), force_index);
     }
 
     let mut search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
 
-    let results = search.search_conversations(
-        query,
-        days,
-        since.as_deref(),
-        until.as_deref(),
-        date.as_deref(),
-        limit,
-        project.as_deref(),
-        repo.as_deref(),
-        128,
-        source.as_deref(),
-    )?;
+    let results = search.search_conversations(query, filter)?;
 
     if json_output {
         let json_val: serde_json::Value = serde_json::to_value(&results)?;
@@ -569,34 +571,18 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool, no
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_list(
-    days: Option<i64>,
-    since: Option<String>,
-    until: Option<String>,
-    date: Option<String>,
-    limit: i64,
-    repo: Option<String>,
-    source: Option<String>,
+    filter: &SearchFilter<'_>,
     json_output: bool,
     no_index: bool,
     force_index: bool,
 ) -> Result<()> {
     if !no_index {
-        auto_index(days.unwrap_or(30), force_index);
+        auto_index(filter.days_back.unwrap_or(30), force_index);
     }
 
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
-    let convs = search.list_recent_conversations(
-        days,
-        since.as_deref(),
-        until.as_deref(),
-        date.as_deref(),
-        limit,
-        None,
-        repo.as_deref(),
-        source.as_deref(),
-    )?;
+    let convs = search.list_recent_conversations(filter)?;
 
     if json_output {
         let json_val = serde_json::to_value(&convs)?;
@@ -610,7 +596,7 @@ fn cmd_list(
         return Ok(());
     }
 
-    let display_days = days.unwrap_or(7);
+    let display_days = filter.days_back.unwrap_or(7);
     println!("Recent conversations (last {} days):\n", display_days);
 
     for conv in &convs {

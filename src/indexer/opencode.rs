@@ -10,6 +10,15 @@ use crate::git_utils::resolve_repo_root;
 const DEFAULT_OPENCODE_DB: &str = "~/.local/share/opencode/opencode.db";
 const OC_PREFIX: &str = "oc:";
 
+struct SessionInfo<'a> {
+    session_id_raw: &'a str,
+    title: Option<&'a str>,
+    directory: Option<&'a str>,
+    time_created: i64,
+    time_updated: i64,
+    worktree: Option<&'a str>,
+}
+
 pub fn get_opencode_db_path() -> String {
     if let Ok(home) = std::env::var("OPENCODE_HOME") {
         format!("{}/opencode.db", home)
@@ -215,7 +224,15 @@ impl OpenCodeIndexer {
         let mut indexed_count: usize = 0;
 
         for (id, _project_id, title, directory, time_created, time_updated, worktree) in &sessions {
-            match self.index_session(oc_conn, search_conn, id, title.as_deref(), directory.as_deref(), *time_created, *time_updated, worktree.as_deref()) {
+            let info = SessionInfo {
+                session_id_raw: id,
+                title: title.as_deref(),
+                directory: directory.as_deref(),
+                time_created: *time_created,
+                time_updated: *time_updated,
+                worktree: worktree.as_deref(),
+            };
+            match self.index_session(oc_conn, search_conn, &info) {
                 Ok(count) if count > 0 => {
                     indexed_count += 1;
                     if *time_updated > max_time_updated {
@@ -243,22 +260,16 @@ impl OpenCodeIndexer {
         Ok(indexed_count)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn index_session(
         &mut self,
         oc_conn: &Connection,
         search_conn: &Connection,
-        session_id_raw: &str,
-        title: Option<&str>,
-        directory: Option<&str>,
-        time_created: i64,
-        time_updated: i64,
-        worktree: Option<&str>,
+        info: &SessionInfo<'_>,
     ) -> Result<usize> {
-        let session_id = format!("{}{}", OC_PREFIX, session_id_raw);
-        let work_dir = worktree.or(directory).unwrap_or("");
+        let session_id = format!("{}{}", OC_PREFIX, info.session_id_raw);
+        let work_dir = info.worktree.or(info.directory).unwrap_or("");
 
-        let session_updated_iso = Self::epoch_ms_to_iso(time_updated);
+        let session_updated_iso = Self::epoch_ms_to_iso(info.time_updated);
 
         // Check if already up to date
         if let Ok(existing_last) = search_conn.query_row(
@@ -279,7 +290,7 @@ impl OpenCodeIndexer {
              FROM message WHERE session_id = ? ORDER BY time_created ASC",
         )?;
         let messages: Vec<(String, String, i64, i64, String)> = msg_stmt
-            .query_map([session_id_raw], |row| {
+            .query_map([info.session_id_raw], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -301,7 +312,7 @@ impl OpenCodeIndexer {
         )?;
         let mut parts_by_message: HashMap<String, Vec<(String,)>> = HashMap::new();
         let parts: Vec<(String, String, String, i64)> = parts_stmt
-            .query_map([session_id_raw], |row| {
+            .query_map([info.session_id_raw], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
             .filter_map(|r| r.ok())
@@ -373,8 +384,8 @@ impl OpenCodeIndexer {
             return Ok(0);
         }
 
-        let display_title = title.unwrap_or("Untitled");
-        let session_created_iso = Self::epoch_ms_to_iso(time_created);
+        let display_title = info.title.unwrap_or("Untitled");
+        let session_created_iso = Self::epoch_ms_to_iso(info.time_created);
 
         search_conn.execute(
             "INSERT OR REPLACE INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode')",
