@@ -9,7 +9,7 @@ Find and resume past AI coding conversations using smart hybrid extraction and J
 - **Unified CLI**: Single `ai-conversation-search` command with intuitive subcommands
 - **Calendar Date Filtering**: Intuitive `--date yesterday`, `--since`, `--until` parameters
 - **Smart Extraction**: Hybrid indexing (full user content + smart assistant extraction)
-- **JIT Indexing**: Instant indexing before search (no AI calls, no delays)
+- **Background Auto-Indexing**: Automatic background indexing with TTL-based cooldown (no CLI blocking)
 - **Local Timezone Display**: All timestamps shown in your local time
 - **Meta-Conversation Filtering**: Automatically excludes search tool usage from results
 - **Progressive Exploration**: Simple search → broader search → manual exploration
@@ -119,7 +119,7 @@ Once installed, ask Claude:
 - "Find yesterday's authentication work"
 - "Show recent Redis discussions"
 
-**Auto-Installation**: If the CLI tool isn't installed, the skill will automatically attempt to install it, then initialize the database. In most cases, everything "just works" after installing the plugin!
+**Auto-Installation & Upgrade**: If the CLI tool isn't installed, the skill will automatically install it, then initialize the database. If a newer version is available, it auto-upgrades. In most cases, everything "just works" after installing the plugin!
 
 Claude will show you the session ID, project path, and exact commands to resume the conversation.
 
@@ -137,7 +137,7 @@ JIT index conversations (instant, no AI calls)
 ai-conversation-search index [--days N] [--all] [--no-extract]
 ```
 
-**IMPORTANT**: The skill always runs `index` before `search` for fresh data.
+**Note**: Indexing runs automatically in the background. Run `index` manually if results seem stale.
 
 ### `ai-conversation-search search`
 Search conversations with flexible date filtering
@@ -222,7 +222,7 @@ ai-conversation-search tree SESSION_ID [--json]
 3. **Meta-Conversation Filtering**: Automatically detects and excludes conversations where Claude used the search tool (prevents search results pollution)
 4. **Search**: FTS5 full-text search over extracted content with conversation tree traversal
 5. **Calendar Date Filtering**: Intuitive date parameters (`--date yesterday`) using SQLite date functions
-6. **JIT Indexing**: Skill runs `index` before `search` for fresh data (instant, no AI calls)
+6. **Background Auto-Indexing**: Automatic background indexing with TTL-based cooldown (never blocks CLI)
 7. **Local Timezone Display**: All timestamps converted to your local timezone for readability
 
 ## Advanced Usage
