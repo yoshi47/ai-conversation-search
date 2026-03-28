@@ -739,11 +739,6 @@ impl ConversationIndexer {
         result
     }
 
-    /// Clear all sync state, forcing re-index of all files.
-    pub fn clear_sync_state(&self) {
-        let _ = self.conn.execute("DELETE FROM claude_code_sync_state", []);
-    }
-
     /// Internal indexing logic for a single conversation file.
     fn do_index_conversation(&mut self, file_path: &Path) -> Result<()> {
         self.log(&format!("Indexing: {}", file_path.display()));

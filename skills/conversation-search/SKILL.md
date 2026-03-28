@@ -123,7 +123,7 @@ ai-conversation-search list --date yesterday --json  # or --days N, --since, --u
 
 **Parse the JSON output.** If you find relevant matches → skip to Level 4 (present results).
 
-**Note:** Search auto-indexes recent conversations for fresh data.
+**Note:** If results seem stale or incomplete, run `ai-conversation-search index` to update the index.
 
 ### Level 2: Broader Search
 

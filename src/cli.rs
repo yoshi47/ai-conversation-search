@@ -9,6 +9,10 @@ use crate::search::{ConversationSearch, SearchFilter, TreeNode, format_timestamp
 
 /// Source display labels
 const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")];
+
+const AUTO_INDEX_TTL_SECS: u64 = 300;
+const STAMP_FILE_PATH: &str = "~/.conversation-search/.last-auto-index";
+
 fn source_label(source: &str) -> &str {
     SOURCE_LABELS
         .iter()
@@ -130,12 +134,6 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-        /// Skip auto-indexing
-        #[arg(long)]
-        no_index: bool,
-        /// Force re-index (ignore TTL cooldown)
-        #[arg(long)]
-        force_index: bool,
     },
     /// Get context around a message
     Context {
@@ -150,12 +148,6 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-        /// Skip auto-indexing
-        #[arg(long)]
-        no_index: bool,
-        /// Force re-index (ignore TTL cooldown)
-        #[arg(long)]
-        force_index: bool,
     },
     /// List recent conversations
     List {
@@ -183,12 +175,6 @@ pub enum Commands {
         /// Output as JSON
         #[arg(long)]
         json: bool,
-        /// Skip auto-indexing
-        #[arg(long)]
-        no_index: bool,
-        /// Force re-index (ignore TTL cooldown)
-        #[arg(long)]
-        force_index: bool,
     },
     /// Show conversation tree
     Tree {
@@ -212,7 +198,9 @@ fn index_other_sources(days_back: Option<i64>, quiet: bool) {
             eprintln!("\nIndexing OpenCode conversations...");
         }
         let oc = OpenCodeIndexer::new(None, None, quiet);
-        let _ = oc.scan_and_index(days_back);
+        if let Err(e) = oc.scan_and_index(days_back) {
+            eprintln!("Warning: failed to index OpenCode conversations: {}", e);
+        }
     }
 
     let codex_dir = db::expand_path("~/.codex/sessions");
@@ -221,53 +209,65 @@ fn index_other_sources(days_back: Option<i64>, quiet: bool) {
             eprintln!("\nIndexing Codex CLI conversations...");
         }
         let cx = CodexIndexer::new(None, None, quiet);
-        let _ = cx.scan_and_index(days_back);
+        if let Err(e) = cx.scan_and_index(days_back) {
+            eprintln!("Warning: failed to index Codex CLI conversations: {}", e);
+        }
     }
 }
 
 fn touch_stamp_file() {
-    let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
-    let _ = std::fs::write(&stamp_file, "");
+    touch_stamp_at(&db::expand_path(STAMP_FILE_PATH));
 }
 
-fn auto_index(days_back: i64, force: bool) {
-    // TTL cooldown: skip if recently indexed (unless forced)
-    let stamp_file = db::expand_path("~/.conversation-search/.last-auto-index");
-    let ttl_secs = match std::env::var("CONVERSATION_SEARCH_INDEX_TTL") {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(n) => n,
-            Err(_) => {
-                eprintln!("Warning: invalid CONVERSATION_SEARCH_INDEX_TTL='{}', using default 60s", v);
-                60
-            }
+fn touch_stamp_at(stamp_path: &std::path::Path) {
+    if let Some(parent) = stamp_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(stamp_path, "");
+}
+
+/// Returns true if the stamp file is stale (older than TTL or missing).
+fn is_stamp_stale(stamp_path: &std::path::Path, ttl_secs: u64) -> bool {
+    match std::fs::metadata(stamp_path) {
+        Ok(meta) => match meta.modified() {
+            Ok(mtime) => mtime.elapsed().unwrap_or_default() >= std::time::Duration::from_secs(ttl_secs),
+            Err(_) => true,
         },
-        Err(_) => 60,
-    };
+        Err(_) => true,
+    }
+}
 
-    if !force {
-        if let Ok(Ok(mtime)) = std::fs::metadata(&stamp_file).map(|m| m.modified()) {
-            if mtime.elapsed().unwrap_or_default() < std::time::Duration::from_secs(ttl_secs) {
-                return;
-            }
-        }
+/// Spawn a background index process if the stamp file is stale.
+/// All errors are silently ignored — this must never block or fail the caller.
+fn maybe_background_index() {
+    let _ = try_background_index();
+}
+
+fn try_background_index() -> Option<()> {
+    let stamp_path = db::expand_path(STAMP_FILE_PATH);
+
+    let ttl_secs = std::env::var("CONVERSATION_SEARCH_INDEX_TTL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(AUTO_INDEX_TTL_SECS);
+
+    if !is_stamp_stale(&stamp_path, ttl_secs) {
+        return Some(());
     }
 
-    let mut indexer = match ConversationIndexer::new(db::DEFAULT_DB_PATH, true) {
-        Ok(i) => i,
-        Err(_) => return,
-    };
+    // Touch stamp file before spawning to reduce (not eliminate) concurrent spawns.
+    // TOCTOU race is possible but benign: SQLite WAL handles concurrent index writes safely.
+    touch_stamp_at(&stamp_path);
 
-    if force {
-        indexer.clear_sync_state();
-    }
+    let exe = std::env::current_exe().ok()?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args(["index", "--days", "1", "--quiet"]);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null());
 
-    let files = indexer.scan_conversations(Some(days_back));
-    for conv_file in &files {
-        let _ = indexer.index_conversation(conv_file);
-    }
-
-    index_other_sources(Some(days_back), true);
-    touch_stamp_file();
+    let _ = cmd.spawn();
+    Some(())
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -300,8 +300,6 @@ pub fn run(cli: Cli) -> Result<()> {
             limit,
             content,
             json,
-            no_index,
-            force_index,
         }) => {
             let filter = SearchFilter {
                 days_back: days,
@@ -313,16 +311,14 @@ pub fn run(cli: Cli) -> Result<()> {
                 repo: repo.as_deref(),
                 source: source.as_deref(),
             };
-            cmd_search(&query, &filter, content, json, no_index, force_index)
+            cmd_search(&query, &filter, content, json)
         }
         Some(Commands::Context {
             uuid,
             depth,
             content,
             json,
-            no_index,
-            force_index,
-        }) => cmd_context(&uuid, depth, content, json, no_index, force_index),
+        }) => cmd_context(&uuid, depth, content, json),
         Some(Commands::List {
             days,
             since,
@@ -332,8 +328,6 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             source,
             json,
-            no_index,
-            force_index,
         }) => {
             let filter = SearchFilter {
                 days_back: days,
@@ -345,7 +339,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 repo: repo.as_deref(),
                 source: source.as_deref(),
             };
-            cmd_list(&filter, json, no_index, force_index)
+            cmd_list(&filter, json)
         }
         Some(Commands::Tree { session_id, json }) => cmd_tree(&session_id, json),
         Some(Commands::Resume { uuid }) => cmd_resume(&uuid),
@@ -456,13 +450,8 @@ fn cmd_search(
     filter: &SearchFilter<'_>,
     show_content: bool,
     json_output: bool,
-    no_index: bool,
-    force_index: bool,
 ) -> Result<()> {
-    if !no_index {
-        auto_index(filter.days_back.unwrap_or(30), force_index);
-    }
-
+    maybe_background_index();
     let mut search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
 
     let results = search.search_conversations(query, filter)?;
@@ -522,11 +511,8 @@ fn cmd_search(
     Ok(())
 }
 
-fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool, no_index: bool, force_index: bool) -> Result<()> {
-    if !no_index {
-        auto_index(30, force_index);
-    }
-
+fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool) -> Result<()> {
+    maybe_background_index();
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
     let result = search.get_conversation_context(uuid, depth)?;
 
@@ -574,13 +560,8 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool, no
 fn cmd_list(
     filter: &SearchFilter<'_>,
     json_output: bool,
-    no_index: bool,
-    force_index: bool,
 ) -> Result<()> {
-    if !no_index {
-        auto_index(filter.days_back.unwrap_or(30), force_index);
-    }
-
+    maybe_background_index();
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
     let convs = search.list_recent_conversations(filter)?;
 
@@ -619,6 +600,7 @@ fn cmd_list(
 }
 
 fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
+    maybe_background_index();
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
     let tree = search.get_conversation_tree(session_id)?;
 
@@ -673,4 +655,76 @@ fn cmd_resume(uuid: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn unique_stamp_path(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("conv-search-{}-{}", name, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join(".last-auto-index")
+    }
+
+    #[test]
+    fn test_is_stamp_stale_missing_file() {
+        let path = unique_stamp_path("missing");
+        let _ = std::fs::remove_file(&path);
+        assert!(is_stamp_stale(&path, 300));
+    }
+
+    #[test]
+    fn test_is_stamp_stale_fresh() {
+        let path = unique_stamp_path("fresh");
+        touch_stamp_at(&path);
+        assert!(!is_stamp_stale(&path, 300));
+    }
+
+    #[test]
+    fn test_is_stamp_stale_expired() {
+        let path = unique_stamp_path("expired");
+        touch_stamp_at(&path);
+        // TTL=0 means always stale
+        assert!(is_stamp_stale(&path, 0));
+    }
+
+    #[test]
+    fn test_touch_stamp_at_creates_nested_dirs() {
+        let dir = std::env::temp_dir().join(format!("conv-search-nested-{}", std::process::id()));
+        let path = dir.join("subdir").join("stamp");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        touch_stamp_at(&path);
+        assert!(path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_touch_stamp_at_updates_mtime() {
+        let path = unique_stamp_path("mtime");
+
+        touch_stamp_at(&path);
+        let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        touch_stamp_at(&path);
+        let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        assert!(mtime2 > mtime1);
+    }
+
+    #[test]
+    fn test_is_stamp_stale_boundary() {
+        let path = unique_stamp_path("boundary");
+        touch_stamp_at(&path);
+
+        // Freshly written stamp with huge TTL is not stale
+        assert!(!is_stamp_stale(&path, u64::MAX));
+        // TTL=0 means always stale
+        assert!(is_stamp_stale(&path, 0));
+    }
 }
