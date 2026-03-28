@@ -1,0 +1,31 @@
+Cargo.toml
+  22eb2b6f5f54f67c 3
+CHANGELOG.md
+  22eb2b6f5f54f67c 1-20
+.claude-plugin/plugin.json
+  22eb2b6f5f54f67c 3
+.claude-plugin/marketplace.json
+  22eb2b6f5f54f67c 12
+README.md
+  22eb2b6f5f54f67c 12,122,140,225
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "4d385f5e123b91e48aa500771ead23b78dd6f21c",
+  "prompts": {
+    "22eb2b6f5f54f67c": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "cf2210c1-2432-4e8c-a448-80698e896a76",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 29,
+      "total_deletions": 9,
+      "accepted_lines": 27,
+      "overriden_lines": 0
+    }
+  }
+}
