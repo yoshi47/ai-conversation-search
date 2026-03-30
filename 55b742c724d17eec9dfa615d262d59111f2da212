@@ -1,0 +1,35 @@
+.claude-plugin/marketplace.json
+  041837d428adec14 12
+skills/conversation-search/REFERENCE.md
+  041837d428adec14 53,60,62-64,66,70-72,77,80-81,87-88,93-98,109-138,176,181-183,185,187,189,196-200,314-328
+Cargo.toml
+  041837d428adec14 3
+.claude-plugin/plugin.json
+  041837d428adec14 3
+CHANGELOG.md
+  041837d428adec14 7-21
+README.md
+  041837d428adec14 12-14,159-164,169-174
+skills/conversation-search/SKILL.md
+  041837d428adec14 217-225,257-262
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "55b742c724d17eec9dfa615d262d59111f2da212",
+  "prompts": {
+    "041837d428adec14": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "43d47cf6-7a89-417a-a48d-85bb2c39eaf7",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 129,
+      "total_deletions": 9,
+      "accepted_lines": 129,
+      "overriden_lines": 0
+    }
+  }
+}
