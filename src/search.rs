@@ -404,13 +404,19 @@ impl ConversationSearch {
         let db_path = db::expand_path(&self.db_path);
         let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
-        let fts_healthy = match self.conn.execute(
-            "INSERT INTO message_content_fts(message_content_fts) VALUES('integrity-check')",
-            [],
-        ) {
-            Ok(_) => true,
+        let fts_healthy = match db::connect(&self.db_path, false) {
+            Ok(rw_conn) => match rw_conn.execute(
+                "INSERT INTO message_content_fts(message_content_fts) VALUES('integrity-check')",
+                [],
+            ) {
+                Ok(_) => true,
+                Err(e) => {
+                    log::warn!("FTS integrity check failed: {}", e);
+                    false
+                }
+            },
             Err(e) => {
-                log::warn!("FTS integrity check failed: {}", e);
+                log::warn!("Failed to open rw connection for FTS check: {}", e);
                 false
             }
         };
