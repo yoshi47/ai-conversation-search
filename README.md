@@ -9,6 +9,9 @@ Find and resume past AI coding conversations using smart hybrid extraction and J
 - **Unified CLI**: Single `ai-conversation-search` command with intuitive subcommands
 - **Calendar Date Filtering**: Intuitive `--date yesterday`, `--since`, `--until` parameters
 - **Smart Extraction**: Hybrid indexing (full user content + smart assistant extraction)
+- **Index Status**: `status` command to check index health and coverage
+- **Session Grouping**: Group search results by session with `--group-by-session`
+- **Exact Match**: `--exact` flag for precise phrase matching
 - **Background Auto-Indexing**: Automatic background indexing with TTL-based cooldown (no CLI blocking)
 - **Local Timezone Display**: All timestamps shown in your local time
 - **Meta-Conversation Filtering**: Automatically excludes search tool usage from results
@@ -153,8 +156,20 @@ ai-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 [--j
 # Date formats: YYYY-MM-DD, "yesterday", "today"
 # Note: --days cannot be combined with --date/--since/--until
 
+# Exact phrase matching
+ai-conversation-search search "query" --exact
+
+# Group results by session
+ai-conversation-search search "query" --group-by-session
+
 # Filter by source (claude_code, opencode, codex)
 ai-conversation-search search "query" --source opencode --json
+```
+
+### `ai-conversation-search status`
+Check index health and coverage
+```bash
+ai-conversation-search status [--json]
 ```
 
 ### `ai-conversation-search context`

@@ -50,39 +50,88 @@ ai-conversation-search init --no-extract
 Search conversations using full-text search on smart-extracted content.
 
 ```bash
-ai-conversation-search search QUERY [--days DAYS] [--project PROJECT] [--source SOURCE] [--limit LIMIT] [--content] [--json]
+ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--source SOURCE] [--limit LIMIT] [--content] [--group-by-session] [-v] [--json]
 ```
 
 **Arguments:**
 - `QUERY`: Search query (supports FTS5 syntax)
 
 **Options:**
+- `--exact`: Exact phrase match (wraps query in quotes, prevents FTS5 operator injection)
 - `--days DAYS`: Limit to last N days
+- `--since DATE`: Start date (YYYY-MM-DD, yesterday, today)
+- `--until DATE`: End date (YYYY-MM-DD, yesterday, today)
+- `--date DATE`: Specific date (YYYY-MM-DD, yesterday, today)
 - `--project PROJECT`: Filter by project path
+- `--repo REPO`: Filter by repository root (partial match)
 - `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
 - `--limit LIMIT`: Max results (default: 20)
 - `--content`: Show full message content instead of summaries
-- `--json`: Output as JSON
+- `--group-by-session`: Group results by session (show best match per session with match count)
+- `-v, --verbose`: Show search diagnostics (sessions scanned, messages matched, unindexed warnings)
+- `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions)
 
 **Search Syntax:**
 - Simple: `authentication bug`
 - Multiple terms: `react hooks useEffect` (implicit AND)
-- Phrases: `"exact phrase"`
+- Phrases: `"exact phrase"` (or use `--exact`)
 - Operators: `auth AND bug`, `react OR vue`
+
+**Note:** Cannot mix `--days` with `--date/--since/--until`.
 
 **Examples:**
 ```bash
 # Basic search
 ai-conversation-search search "authentication"
 
+# Exact phrase match (safe from FTS5 injection)
+ai-conversation-search search "exact phrase here" --exact
+
 # Time-scoped search
 ai-conversation-search search "database" --days 30
+
+# Calendar date filtering
+ai-conversation-search search "auth" --date yesterday --json
+ai-conversation-search search "hooks" --since 2025-11-10 --until 2025-11-13
+
+# Group by session
+ai-conversation-search search "api" --group-by-session --json
 
 # Project-specific search
 ai-conversation-search search "api" --project /home/user/myapp
 
 # Get JSON output (for programmatic use)
 ai-conversation-search search "hooks" --json
+```
+
+---
+
+### ai-conversation-search status
+
+Show index health, coverage, and statistics.
+
+```bash
+ai-conversation-search status [--json]
+```
+
+**Options:**
+- `--json`: Output as JSON
+
+**What it shows:**
+- Database location and size
+- FTS5 health check (OK / CORRUPTED)
+- Total sessions and messages, broken down by source
+- Date coverage (earliest to latest conversation)
+- Top repositories by session count
+- Indexed files vs files on disk (with warnings for unindexed files)
+
+**Example:**
+```bash
+# Human-readable status
+ai-conversation-search status
+
+# JSON output (for programmatic use)
+ai-conversation-search status --json
 ```
 
 ---
@@ -124,19 +173,31 @@ ai-conversation-search context abc-123-def --content --json
 List recent conversations.
 
 ```bash
-ai-conversation-search list [--days DAYS] [--limit LIMIT] [--source SOURCE] [--json]
+ai-conversation-search list [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--limit LIMIT] [--repo REPO] [--source SOURCE] [--json]
 ```
 
 **Options:**
 - `--days DAYS`: Show conversations from last N days (default: 7)
+- `--since DATE`: Start date (YYYY-MM-DD, yesterday, today)
+- `--until DATE`: End date (YYYY-MM-DD, yesterday, today)
+- `--date DATE`: Specific date (YYYY-MM-DD, yesterday, today)
 - `--limit LIMIT`: Max conversations to show (default: 20)
+- `--repo REPO`: Filter by repository root (partial match)
 - `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
-- `--json`: Output as JSON
+- `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions)
+
+**Note:** Cannot mix `--days` with `--date/--since/--until`.
 
 **Example:**
 ```bash
 # List last week's conversations
 ai-conversation-search list --days 7
+
+# List yesterday's conversations
+ai-conversation-search list --date yesterday --json
+
+# List by date range
+ai-conversation-search list --since 2025-11-10 --until today --json
 
 # List last 50 conversations
 ai-conversation-search list --limit 50 --json
@@ -250,7 +311,21 @@ All commands support `--json` for structured output.
     "session_id": "session-xyz",
     "source": "claude_code",
     "depth": 3,
-    "is_sidechain": false
+    "is_sidechain": false,
+    "resume_command": "cd /home/user/projects/myapp && claude --resume session-xyz"
+  }
+]
+```
+
+**Search results with `--group-by-session`:**
+```json
+[
+  {
+    "message_uuid": "abc-123",
+    "session_id": "session-xyz",
+    "source": "claude_code",
+    "match_count": 5,
+    "resume_command": "cd /home/user/projects/myapp && claude --resume session-xyz"
   }
 ]
 ```

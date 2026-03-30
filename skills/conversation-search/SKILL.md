@@ -214,6 +214,15 @@ ai-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 --js
 # All time
 ai-conversation-search search "query" --json
 
+# Exact phrase match (prevents FTS5 operator injection)
+ai-conversation-search search "query" --exact --json
+
+# Group results by session (best match per session)
+ai-conversation-search search "query" --group-by-session --json
+
+# Show search diagnostics (session/message counts)
+ai-conversation-search search "query" -v --json
+
 # Filter by repository (partial match on repo root path)
 ai-conversation-search search "query" --repo myproject --json
 
@@ -243,6 +252,12 @@ ai-conversation-search list --days 7 --repo myproject --json
 
 # Filter by source
 ai-conversation-search list --source codex --json
+```
+
+### Status
+```bash
+# Check index health, coverage, and unindexed files
+ai-conversation-search status --json
 ```
 
 ### Context & Tree
