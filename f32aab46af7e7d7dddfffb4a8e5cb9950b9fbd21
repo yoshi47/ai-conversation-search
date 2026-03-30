@@ -1,0 +1,29 @@
+src/cli.rs
+  dda1c4038d51303f 8,104-109,114-116,144-149,307,310,320-321,324-329,340,474-578,583-584,590-592,595-610,612-616,622-624,628-631,634-650,653-656,658,660-661,663-687,689-698,705-723,782-783,801
+src/search.rs
+  dda1c4038d51303f 188-203,298-326,351-460,465,481-482,484,537-538,574-576,579-582
+src/indexer/mod.rs
+  dda1c4038d51303f 8
+src/indexer/claude_code.rs
+  dda1c4038d51303f 64-115
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.1.22",
+  "base_commit_sha": "f32aab46af7e7d7dddfffb4a8e5cb9950b9fbd21",
+  "prompts": {
+    "dda1c4038d51303f": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "82406dc6-08b8-4ca7-8a2e-94013e3dbf4f",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>",
+      "messages": [],
+      "total_additions": 534,
+      "total_deletions": 106,
+      "accepted_lines": 474,
+      "overriden_lines": 0
+    }
+  }
+}
