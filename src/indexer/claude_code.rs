@@ -61,6 +61,58 @@ struct SessionsIndexEntry {
     project_path: Option<String>,
 }
 
+/// Count conversation files on disk without needing a DB connection.
+/// Used by `status` command and unindexed file warnings.
+pub fn count_conversation_files_on_disk() -> usize {
+    let projects_dir = match dirs::home_dir() {
+        Some(h) => h.join(".claude").join("projects"),
+        None => {
+            eprintln!("Warning: could not determine home directory; file count unavailable");
+            return 0;
+        }
+    };
+
+    if !projects_dir.exists() {
+        return 0;
+    }
+
+    let entries = match std::fs::read_dir(&projects_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("Warning: could not read {}: {}", projects_dir.display(), e);
+            return 0;
+        }
+    };
+
+    let mut count = 0;
+    for entry in entries.flatten() {
+        let project_dir = entry.path();
+        if !project_dir.is_dir() {
+            continue;
+        }
+
+        let dir_entries = match std::fs::read_dir(&project_dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        for file_entry in dir_entries.flatten() {
+            let conv_file = file_entry.path();
+            if conv_file.extension().map_or(true, |e| e != "jsonl") {
+                continue;
+            }
+            if let Some(stem) = conv_file.file_stem() {
+                if stem.to_string_lossy().starts_with("agent-") {
+                    continue;
+                }
+            }
+            count += 1;
+        }
+    }
+
+    count
+}
+
 pub struct ConversationIndexer {
     conn: Connection,
     quiet: bool,

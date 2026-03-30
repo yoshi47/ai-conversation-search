@@ -185,6 +185,22 @@ pub struct TreeNode {
     pub children: Vec<TreeNode>,
 }
 
+/// Search statistics for verbose output.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchStats {
+    pub total_indexed_sessions: i64,
+    pub total_indexed_messages: i64,
+    pub sessions_in_scope: i64,
+    pub matched_messages: i64,
+}
+
+/// Search result with statistics.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResult {
+    pub rows: Vec<SearchResultRow>,
+    pub stats: SearchStats,
+}
+
 /// Escape special LIKE characters.
 fn escape_like(value: &str) -> String {
     value
@@ -279,6 +295,35 @@ pub fn format_timestamp(iso_timestamp: &str, include_date: bool, include_seconds
     }
 }
 
+/// Source breakdown entry for index status.
+#[derive(Debug, Clone, Serialize)]
+pub struct SourceCount {
+    pub source: String,
+    pub count: i64,
+}
+
+/// Repository breakdown entry for index status.
+#[derive(Debug, Clone, Serialize)]
+pub struct RepoCount {
+    pub repo_root: String,
+    pub count: i64,
+}
+
+/// Index status information.
+#[derive(Debug, Clone, Serialize)]
+pub struct IndexStatus {
+    pub total_conversations: i64,
+    pub total_messages: i64,
+    pub earliest_conversation: Option<String>,
+    pub latest_conversation: Option<String>,
+    pub by_source: Vec<SourceCount>,
+    pub by_repo: Vec<RepoCount>,
+    pub db_size_bytes: u64,
+    pub indexed_files: i64,
+    pub files_on_disk: usize,
+    pub fts_healthy: bool,
+}
+
 pub struct ConversationSearch {
     conn: Connection,
     db_path: String,
@@ -303,11 +348,121 @@ impl ConversationSearch {
         })
     }
 
+    pub fn count_indexed_files(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM claude_code_sync_state", [], |r| r.get(0),
+        )?)
+    }
+
+    pub fn get_index_status(&self, files_on_disk: usize) -> Result<IndexStatus> {
+        let total_conversations: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM conversations", [], |r| r.get(0),
+        )?;
+
+        let total_messages: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages", [], |r| r.get(0),
+        )?;
+
+        let earliest_conversation: Option<String> = self.conn.query_row(
+            "SELECT MIN(first_message_at) FROM conversations", [], |r| r.get(0),
+        )?;
+
+        let latest_conversation: Option<String> = self.conn.query_row(
+            "SELECT MAX(last_message_at) FROM conversations", [], |r| r.get(0),
+        )?;
+
+        let mut by_source = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT COALESCE(source, 'claude_code'), COUNT(*) FROM conversations GROUP BY source ORDER BY COUNT(*) DESC"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(SourceCount { source: row.get(0)?, count: row.get(1)? })
+            })?;
+            for row in rows.flatten() {
+                by_source.push(row);
+            }
+        }
+
+        let mut by_repo = Vec::new();
+        {
+            let mut stmt = self.conn.prepare(
+                "SELECT repo_root, COUNT(*) as cnt FROM conversations WHERE repo_root IS NOT NULL GROUP BY repo_root ORDER BY cnt DESC LIMIT 20"
+            )?;
+            let rows = stmt.query_map([], |row| {
+                Ok(RepoCount { repo_root: row.get(0)?, count: row.get(1)? })
+            })?;
+            for row in rows.flatten() {
+                by_repo.push(row);
+            }
+        }
+
+        let indexed_files: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM claude_code_sync_state", [], |r| r.get(0),
+        )?;
+
+        let db_path = db::expand_path(&self.db_path);
+        let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+
+        let fts_healthy = match self.conn.execute(
+            "INSERT INTO message_content_fts(message_content_fts) VALUES('integrity-check')",
+            [],
+        ) {
+            Ok(_) => true,
+            Err(e) => {
+                log::warn!("FTS integrity check failed: {}", e);
+                false
+            }
+        };
+
+        Ok(IndexStatus {
+            total_conversations,
+            total_messages,
+            earliest_conversation,
+            latest_conversation,
+            by_source,
+            by_repo,
+            db_size_bytes,
+            indexed_files,
+            files_on_disk,
+            fts_healthy,
+        })
+    }
+
+    /// Gather search statistics (total indexed and in-scope counts).
+    fn gather_search_stats(&self, filter: &SearchFilter<'_>, matched: i64) -> Result<SearchStats> {
+        let total_indexed_sessions: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM conversations", [], |r| r.get(0),
+        )?;
+
+        let total_indexed_messages: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE is_meta_conversation = FALSE", [], |r| r.get(0),
+        )?;
+
+        // Count sessions in scope (after filters)
+        let mut sql = String::from(
+            "SELECT COUNT(DISTINCT m.session_id) FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        Self::append_filters(&mut sql, &mut params, filter)?;
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
+        let sessions_in_scope: i64 = self.conn.prepare(&sql)
+            .and_then(|mut stmt| stmt.query_row(rusqlite::params_from_iter(&param_refs), |r| r.get(0)))?;
+
+        Ok(SearchStats {
+            total_indexed_sessions,
+            total_indexed_messages,
+            sessions_in_scope,
+            matched_messages: matched,
+        })
+    }
+
     pub fn search_conversations(
         &mut self,
         query: &str,
         filter: &SearchFilter<'_>,
-    ) -> Result<Vec<SearchResultRow>> {
+    ) -> Result<SearchResult> {
         let days_back = filter.days_back;
         let since = filter.since;
         let until = filter.until;
@@ -323,9 +478,10 @@ impl ConversationSearch {
         let trimmed = query.trim();
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        // Check if any search term has < 3 characters (trigram minimum)
+        // Check if any search term has < 3 characters (trigram minimum).
+        // Skip this check when query contains quotes (FTS5 phrase queries handle short words).
         let terms: Vec<&str> = trimmed.split_whitespace().collect();
-        let has_short_term = terms.iter().any(|t| t.chars().count() < 3);
+        let has_short_term = !trimmed.contains('"') && terms.iter().any(|t| t.chars().count() < 3);
 
         let sql = if trimmed.is_empty() {
             let mut sql = String::from(
@@ -378,7 +534,8 @@ impl ConversationSearch {
             let rowids = self.query_fts_rowids(&fts_query)?;
 
             if rowids.is_empty() {
-                return Ok(Vec::new());
+                let stats = self.gather_search_stats(filter, 0)?;
+                return Ok(SearchResult { rows: Vec::new(), stats });
             }
 
             // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
@@ -414,10 +571,15 @@ impl ConversationSearch {
             for row in &mut all_results {
                 row.context_snippet = extract_snippet(&row.context_snippet, &search_terms, 200);
             }
-            return Ok(all_results);
+            let matched = all_results.len() as i64;
+            let stats = self.gather_search_stats(filter, matched)?;
+            return Ok(SearchResult { rows: all_results, stats });
         };
 
-        self.execute_search_typed(&sql, &params)
+        let rows = self.execute_search_typed(&sql, &params)?;
+        let matched = rows.len() as i64;
+        let stats = self.gather_search_stats(filter, matched)?;
+        Ok(SearchResult { rows, stats })
     }
 
     fn append_filters(
@@ -986,8 +1148,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("", &default_filter())
-            .unwrap();
+            .search_conversations("", &default_filter()).unwrap().rows;
 
         assert_eq!(results.len(), 2);
         // Should be ordered by timestamp DESC
@@ -1003,8 +1164,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("fox", &default_filter())
-            .unwrap();
+            .search_conversations("fox", &default_filter()).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1018,8 +1178,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("xyzzyzzy", &default_filter())
-            .unwrap();
+            .search_conversations("xyzzyzzy", &default_filter()).unwrap().rows;
 
         assert!(results.is_empty());
     }
@@ -1037,8 +1196,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message content", &SearchFilter { days_back: Some(1), ..default_filter() })
-            .unwrap();
+            .search_conversations("message content", &SearchFilter { days_back: Some(1), ..default_filter() }).unwrap().rows;
 
         // Only the recent message should be returned
         assert_eq!(results.len(), 1);
@@ -1055,8 +1213,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("hello", &SearchFilter { project_path: Some("/proj_a"), ..default_filter() })
-            .unwrap();
+            .search_conversations("hello", &SearchFilter { project_path: Some("/proj_a"), ..default_filter() }).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].project_path.as_deref(), Some("/proj_a"));
@@ -1072,8 +1229,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message", &SearchFilter { source: Some("opencode"), ..default_filter() })
-            .unwrap();
+            .search_conversations("message", &SearchFilter { source: Some("opencode"), ..default_filter() }).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source.as_deref(), Some("opencode"));
@@ -1089,8 +1245,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("code", &SearchFilter { repo: Some("my-repo"), ..default_filter() })
-            .unwrap();
+            .search_conversations("code", &SearchFilter { repo: Some("my-repo"), ..default_filter() }).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1105,8 +1260,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message", &SearchFilter { date: Some("2025-01-15"), ..default_filter() })
-            .unwrap();
+            .search_conversations("message", &SearchFilter { date: Some("2025-01-15"), ..default_filter() }).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1244,14 +1398,12 @@ mod tests {
 
         // Single term — trigram substring match
         let results = searcher
-            .search_conversations("rustac", &default_filter())
-            .unwrap();
+            .search_conversations("rustac", &default_filter()).unwrap().rows;
         assert_eq!(results.len(), 1); // "rustac" is a substring of "rustacean"
 
         // Multi terms — AND join, each as substring match
         let results = searcher
-            .search_conversations("rustac programm", &default_filter())
-            .unwrap();
+            .search_conversations("rustac programm", &default_filter()).unwrap().rows;
         assert_eq!(results.len(), 1); // both substrings found
     }
 
@@ -1266,8 +1418,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("認証", &default_filter())
-            .unwrap();
+            .search_conversations("認証", &default_filter()).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1283,8 +1434,7 @@ mod tests {
         let mut searcher = ConversationSearch::from_connection(conn);
         // Both terms must match (AND join)
         let results = searcher
-            .search_conversations("認証 実装", &default_filter())
-            .unwrap();
+            .search_conversations("認証 実装", &default_filter()).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1"); // Only msg1 contains both 認証 and 実装
@@ -1300,14 +1450,12 @@ mod tests {
 
         // English term in mixed content
         let results = searcher
-            .search_conversations("OAuth", &default_filter())
-            .unwrap();
+            .search_conversations("OAuth", &default_filter()).unwrap().rows;
         assert_eq!(results.len(), 1);
 
         // Japanese term in mixed content
         let results = searcher
-            .search_conversations("認証", &default_filter())
-            .unwrap();
+            .search_conversations("認証", &default_filter()).unwrap().rows;
         assert_eq!(results.len(), 1);
     }
 
@@ -1321,14 +1469,12 @@ mod tests {
         let mut searcher = ConversationSearch::from_connection(conn);
         // 1-byte short query (e.g. "ab") should use LIKE fallback
         let results = searcher
-            .search_conversations("ab", &default_filter())
-            .unwrap();
+            .search_conversations("ab", &default_filter()).unwrap().rows;
         assert!(results.is_empty()); // no match, but should not error
 
         // CJK 2-char query "型の" (6 bytes) should use LIKE fallback
         let results = searcher
-            .search_conversations("型の", &default_filter())
-            .unwrap();
+            .search_conversations("型の", &default_filter()).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1356,8 +1502,7 @@ mod tests {
         // But search_conversations should still find it via LIKE fallback
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("認証", &default_filter())
-            .unwrap();
+            .search_conversations("認証", &default_filter()).unwrap().rows;
         assert_eq!(results.len(), 1);
     }
 
@@ -1371,8 +1516,7 @@ mod tests {
         let mut searcher = ConversationSearch::from_connection(conn);
         // "rustac programm" should match msg1 (contains both substrings) but not msg2
         let results = searcher
-            .search_conversations("rustac programm", &default_filter())
-            .unwrap();
+            .search_conversations("rustac programm", &default_filter()).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1386,8 +1530,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("brown fox", &default_filter())
-            .unwrap();
+            .search_conversations("brown fox", &default_filter()).unwrap().rows;
 
         assert_eq!(results.len(), 1);
         let snippet = &results[0].context_snippet;
