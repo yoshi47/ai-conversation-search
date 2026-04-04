@@ -12,7 +12,9 @@ use crate::search::{ConversationSearch, SearchFilter, TreeNode, format_timestamp
 const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")];
 
 const AUTO_INDEX_TTL_SECS: u64 = 300;
+const FULL_INDEX_TTL_SECS: u64 = 86400;
 const STAMP_FILE_PATH: &str = "~/.conversation-search/.last-auto-index";
+const FULL_STAMP_FILE_PATH: &str = "~/.conversation-search/.last-full-index";
 
 fn source_label(source: &str) -> &str {
     SOURCE_LABELS
@@ -261,23 +263,39 @@ fn maybe_background_index() {
 
 fn try_background_index() -> Option<()> {
     let stamp_path = db::expand_path(STAMP_FILE_PATH);
+    let full_stamp_path = db::expand_path(FULL_STAMP_FILE_PATH);
 
     let ttl_secs = std::env::var("CONVERSATION_SEARCH_INDEX_TTL")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(AUTO_INDEX_TTL_SECS);
 
-    if !is_stamp_stale(&stamp_path, ttl_secs) {
+    let full_ttl_secs = std::env::var("CONVERSATION_SEARCH_FULL_INDEX_TTL")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(FULL_INDEX_TTL_SECS);
+
+    let needs_full = is_stamp_stale(&full_stamp_path, full_ttl_secs);
+    let needs_incremental = is_stamp_stale(&stamp_path, ttl_secs);
+
+    if !needs_full && !needs_incremental {
         return Some(());
     }
 
-    // Touch stamp file before spawning to reduce (not eliminate) concurrent spawns.
+    // Touch stamps before spawning to reduce (not eliminate) concurrent spawns.
     // TOCTOU race is possible but benign: SQLite WAL handles concurrent index writes safely.
     touch_stamp_at(&stamp_path);
+    if needs_full {
+        touch_stamp_at(&full_stamp_path);
+    }
 
     let exe = std::env::current_exe().ok()?;
     let mut cmd = std::process::Command::new(exe);
-    cmd.args(["index", "--days", "1", "--quiet"]);
+    if needs_full {
+        cmd.args(["index", "--all", "--quiet"]);
+    } else {
+        cmd.args(["index", "--days", "1", "--quiet"]);
+    }
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     cmd.stdin(std::process::Stdio::null());
@@ -421,6 +439,7 @@ fn cmd_init(days: i64, force: bool, quiet: bool) -> Result<()> {
 
     index_other_sources(Some(days), quiet);
     touch_stamp_file();
+    touch_stamp_at(&db::expand_path(FULL_STAMP_FILE_PATH));
 
     if !quiet {
         eprintln!("\n\u{2713} Initialization complete!");
@@ -467,6 +486,9 @@ fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
     let other_days = if all { Some(9999i64) } else { Some(days) };
     index_other_sources(other_days, quiet);
     touch_stamp_file();
+    if all {
+        touch_stamp_at(&db::expand_path(FULL_STAMP_FILE_PATH));
+    }
 
     Ok(())
 }
