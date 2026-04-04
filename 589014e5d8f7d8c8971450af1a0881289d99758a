@@ -1,23 +1,7 @@
-scripts/bump-version.sh
-  b65958e4e11b223d 17,19,21-22,29-30
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.2.5",
   "base_commit_sha": "589014e5d8f7d8c8971450af1a0881289d99758a",
-  "prompts": {
-    "b65958e4e11b223d": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "9ef55ab4-9159-4c1d-8f0b-a938ee5dc5d2",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47",
-      "messages": [],
-      "total_additions": 6,
-      "total_deletions": 6,
-      "accepted_lines": 6,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
