@@ -1,0 +1,23 @@
+src/cli.rs
+  b65958e4e11b223d 15,17,266,273-281,285,288-290,294-298,442,489-491
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "8de7d9a3e998039e8f45c908935fcd234ea46cfe",
+  "prompts": {
+    "b65958e4e11b223d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ef55ab4-9159-4c1d-8f0b-a938ee5dc5d2",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47",
+      "messages": [],
+      "total_additions": 25,
+      "total_deletions": 3,
+      "accepted_lines": 25,
+      "overriden_lines": 0
+    }
+  }
+}
