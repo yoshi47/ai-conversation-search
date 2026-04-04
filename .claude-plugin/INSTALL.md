@@ -2,52 +2,14 @@
 
 Thank you for installing the **conversation-search** plugin!
 
-## Step 1: Install the CLI Tool
+## Automatic Setup
 
-The skill requires the `ai-conversation-search` CLI tool.
+The `ai-conversation-search` CLI tool is automatically downloaded and managed by the plugin.
+On first use, it will:
+- Download the correct binary for your platform (macOS/Linux, arm64/x86_64)
+- Initialize the search index with your last 7 days of conversations
 
-### Download pre-built binary
-
-```bash
-# Detect platform and download
-ARCH=$(uname -m)
-OS=$(uname -s)
-case "${OS}-${ARCH}" in
-    Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
-    Darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
-    Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-    Linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-    *) echo "Unsupported platform: ${OS}-${ARCH}"; exit 1 ;;
-esac
-
-mkdir -p ~/.local/bin
-curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-${TARGET}" \
-    -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
-
-# Ensure ~/.local/bin is in your PATH
-export PATH="$HOME/.local/bin:$PATH"
-```
-
-### Alternative: Build from source
-
-```bash
-cargo install --git https://github.com/yoshi47/ai-conversation-search
-```
-
-## Step 2: Initialize the Database
-
-Create the search index for your conversation history:
-
-```bash
-ai-conversation-search init
-```
-
-This will:
-- Create `~/.conversation-search/index.db`
-- Index your last 7 days of conversations
-- Extract searchable content using smart hybrid extraction (instant, no AI calls)
-
-## Step 3: Test the Installation
+## Test the Installation
 
 Verify everything is working:
 
@@ -63,13 +25,21 @@ The **conversation-search** skill is now active. Try asking Claude:
 - "What did we talk about regarding React hooks?"
 - "Locate the conversation where we fixed the database bug"
 
-Claude will use a progressive search strategy to find specific message UUIDs you can branch from.
+## Alternative: Build from Source
+
+If you prefer to build from source instead of using the auto-managed binary:
+
+```bash
+cargo install --git https://github.com/yoshi47/ai-conversation-search
+ai-conversation-search init
+```
 
 ## Troubleshooting
 
 **Tool not found:**
-- Make sure `ai-conversation-search` is in your PATH
+- The plugin wrapper should make the command available automatically
 - Try: `which ai-conversation-search`
+- Reinstall the plugin if needed
 
 **No conversations found:**
 - Verify `~/.claude/projects/` exists and contains .jsonl files

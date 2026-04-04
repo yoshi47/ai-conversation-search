@@ -16,6 +16,7 @@ This updates all version locations:
 - `Cargo.toml` (Rust package)
 - `.claude-plugin/plugin.json` (plugin metadata)
 - `.claude-plugin/marketplace.json` (marketplace metadata)
+- `bin/ai-conversation-search` (wrapper script version)
 
 ## Pre-push Hook
 

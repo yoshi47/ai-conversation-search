@@ -29,64 +29,21 @@ Find past conversations across Claude Code, OpenCode, and Codex CLI and get the 
 
 Mark each todo as `in_progress` when starting it, `completed` when done.
 
-## Prerequisites & Auto-Installation
+## Prerequisites
 
-The skill requires the `ai-conversation-search` CLI tool (v0.7.0+ minimum).
+The `ai-conversation-search` CLI is automatically managed by the plugin wrapper.
+On first use, it downloads the correct binary for your platform and caches it.
 
-**First todo: Ensure tool is installed and upgraded**
+**First todo: Verify tool is available**
 
 ```bash
-_acs_install() {
-    local VERSION="${1:?version required}"
-    ARCH=$(uname -m)
-    OS=$(uname -s)
-    case "${OS}-${ARCH}" in
-        Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
-        Darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
-        Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-        Linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-        *) echo "Unsupported platform: ${OS}-${ARCH}"; return 1 ;;
-    esac
-    mkdir -p ~/.local/bin
-    curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/download/v${VERSION}/ai-conversation-search-${TARGET}" \
-        -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
-    export PATH="$HOME/.local/bin:$PATH"
-}
-
-if [ -n "$ACS_VERSION" ]; then
-    WANT="$ACS_VERSION"
-else
-    WANT=$(curl -fsSL -o /dev/null -w '%{url_effective}' https://github.com/yoshi47/ai-conversation-search/releases/latest | grep -o '[^/v]*$')
-fi
-
-if ! command -v ai-conversation-search &> /dev/null; then
-    echo "Installing ai-conversation-search v${WANT}..."
-    _acs_install "$WANT" && ai-conversation-search init --days 7
-else
-    CURRENT=$(ai-conversation-search --version | awk '{print $2}')
-    if [ "$CURRENT" != "$WANT" ]; then
-        echo "Upgrading ai-conversation-search: $CURRENT -> $WANT"
-        _acs_install "$WANT"
-    fi
-    echo "ai-conversation-search v$(ai-conversation-search --version | awk '{print $2}')"
-fi
+ai-conversation-search --version
 ```
 
-**If installation fails**, guide the user:
-```
-The conversation-search plugin requires the ai-conversation-search CLI tool.
+If the command is not found, the plugin may not be properly installed.
+Guide the user: reinstall the plugin or visit https://github.com/yoshi47/ai-conversation-search
 
-Install manually:
-  ARCH=$(uname -m); OS=$(uname -s)
-  # Determine TARGET: aarch64-apple-darwin, x86_64-apple-darwin, or x86_64-unknown-linux-gnu
-  curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-${TARGET}" \
-      -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
-
-Then initialize:
-  ai-conversation-search init
-```
-
-**Do not proceed with search** until installation is confirmed.
+**Do not proceed with search** until the version check succeeds.
 
 ## Query Type Classification
 
