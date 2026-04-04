@@ -1,0 +1,31 @@
+bin/ai-conversation-search
+  c2e1ac6f665e5742 1-44
+CLAUDE.md
+  c2e1ac6f665e5742 19
+.claude-plugin/INSTALL.md
+  c2e1ac6f665e5742 5,7-10,12,28-35,40,42
+scripts/bump-version.sh
+  c2e1ac6f665e5742 38-40,46,51
+skills/conversation-search/SKILL.md
+  c2e1ac6f665e5742 32,34-35,37,40,43-44,46
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "991f40bc4e858b019378b72055b0730b745b7f58",
+  "prompts": {
+    "c2e1ac6f665e5742": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "fd28d40a-272e-449d-921f-48a8b6d515b2",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47",
+      "messages": [],
+      "total_additions": 81,
+      "total_deletions": 105,
+      "accepted_lines": 74,
+      "overriden_lines": 0
+    }
+  }
+}
