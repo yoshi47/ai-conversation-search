@@ -14,20 +14,20 @@ fi
 
 NEW_VERSION="$1"
 
-# Cross-platform sed -i
+# Portable sed -i (works with both GNU sed and BSD sed)
 sedi() {
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        sed -i '' "$@"
-    else
+    if sed --version 2>/dev/null | grep -q 'GNU sed'; then
         sed -i "$@"
+    else
+        sed -i '' "$@"
     fi
 }
 
 # Update Cargo.toml
 sedi "s/^version = \".*\"/version = \"$NEW_VERSION\"/" Cargo.toml
 
-# Update Cargo.lock
-cargo generate-lockfile 2>/dev/null || true
+# Update Cargo.lock (cargo check only updates our version, preserving dep versions)
+cargo check --quiet 2>/dev/null || true
 
 # Update plugin.json
 sedi "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/plugin.json
