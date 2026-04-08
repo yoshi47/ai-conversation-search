@@ -348,80 +348,174 @@ impl ConversationIndexer {
         }
     }
 
-    /// Scan ~/.claude/projects for conversation files.
-    pub fn scan_conversations(&mut self, days_back: Option<i64>) -> Vec<PathBuf> {
-        let projects_dir = match dirs::home_dir() {
-            Some(h) => h.join(".claude").join("projects"),
-            None => return vec![],
+    /// Discover all Claude project directories to scan.
+    /// Auto-discovers ~/.claude/projects and ~/.claude-*/projects,
+    /// plus any directories specified in CONVERSATION_SEARCH_EXTRA_DIRS (colon-separated).
+    fn discover_project_dirs(&self) -> Vec<PathBuf> {
+        let home = match dirs::home_dir() {
+            Some(h) => h,
+            None => {
+                self.log("Warning: could not determine home directory");
+                return vec![];
+            }
         };
 
-        if !projects_dir.exists() {
-            self.log(&format!("Projects directory not found: {}", projects_dir.display()));
+        let mut dirs = Vec::new();
+
+        // Auto-discover: ~/.claude/projects, ~/.claude-*/projects
+        match std::fs::read_dir(&home) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => {
+                            self.log(&format!(
+                                "Warning: failed to read entry in {}: {}",
+                                home.display(), e
+                            ));
+                            continue;
+                        }
+                    };
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if (name_str == ".claude" || name_str.starts_with(".claude-"))
+                        && entry.path().is_dir()
+                    {
+                        let projects = entry.path().join("projects");
+                        if projects.is_dir() {
+                            dirs.push(projects);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                self.log(&format!(
+                    "Warning: failed to read home directory {}: {}",
+                    home.display(), e
+                ));
+            }
+        }
+
+        // Extra dirs from env var (colon-separated, supports ~ expansion)
+        if let Ok(extra) = std::env::var("CONVERSATION_SEARCH_EXTRA_DIRS") {
+            for dir in extra.split(':').filter(|s| !s.is_empty()) {
+                let expanded = if dir == "~" {
+                    home.clone()
+                } else if dir.starts_with("~/") {
+                    home.join(&dir[2..])
+                } else {
+                    PathBuf::from(dir)
+                };
+                if expanded.is_dir() {
+                    dirs.push(expanded);
+                } else {
+                    self.log(&format!(
+                        "Warning: CONVERSATION_SEARCH_EXTRA_DIRS entry '{}' (resolved to '{}') is not a directory, skipping",
+                        dir, expanded.display()
+                    ));
+                }
+            }
+        }
+
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
+    /// Scan Claude project directories for conversation files.
+    /// Auto-discovers multiple profiles (e.g. ~/.claude, ~/.claude-personal).
+    pub fn scan_conversations(&mut self, days_back: Option<i64>) -> Vec<PathBuf> {
+        let project_dirs = self.discover_project_dirs();
+
+        if project_dirs.is_empty() {
+            self.log("No Claude project directories found");
             return vec![];
         }
+
+        self.log(&format!(
+            "Scanning {} project directories: {}",
+            project_dirs.len(),
+            project_dirs.iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
 
         let cutoff_time = days_back.map(|d| {
             chrono::Local::now() - chrono::TimeDelta::days(d)
         });
 
-        // Get summarizer hash
-        let summarizer_hash = self.get_summarizer_project_hash(&projects_dir);
-
         let mut conversation_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
 
-        let entries = match std::fs::read_dir(&projects_dir) {
-            Ok(e) => e,
-            Err(_) => return vec![],
-        };
+        for projects_dir in &project_dirs {
+            // Reset cached summarizer hash for each profile directory
+            self.summarizer_project_hash = None;
+            let summarizer_hash = self.get_summarizer_project_hash(projects_dir);
 
-        for entry in entries.flatten() {
-            let project_dir = entry.path();
-            if !project_dir.is_dir() {
-                continue;
-            }
-
-            // Skip summarizer project
-            if let Some(ref hash) = summarizer_hash {
-                if let Some(name) = project_dir.file_name() {
-                    if name.to_string_lossy() == *hash {
-                        continue;
-                    }
-                }
-            }
-
-            let dir_entries = match std::fs::read_dir(&project_dir) {
+            let entries = match std::fs::read_dir(projects_dir) {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(e) => {
+                    self.log(&format!(
+                        "Warning: failed to read project directory {}: {}",
+                        projects_dir.display(), e
+                    ));
+                    continue;
+                }
             };
 
-            for file_entry in dir_entries.flatten() {
-                let conv_file = file_entry.path();
-                if conv_file.extension().map_or(true, |e| e != "jsonl") {
+            for entry in entries.flatten() {
+                let project_dir = entry.path();
+                if !project_dir.is_dir() {
                     continue;
                 }
 
-                // Skip agent files
-                if let Some(stem) = conv_file.file_stem() {
-                    if stem.to_string_lossy().starts_with("agent-") {
-                        continue;
-                    }
+                // Skip summarizer project
+                if summarizer_hash.as_ref().is_some_and(|hash| {
+                    project_dir.file_name().map_or(false, |name| name.to_string_lossy() == *hash)
+                }) {
+                    continue;
                 }
 
-                // Always get mtime (used for both cutoff filter and sorting)
-                let mtime = match conv_file.metadata().and_then(|m| m.modified()) {
-                    Ok(t) => t,
-                    Err(_) => continue,
+                let dir_entries = match std::fs::read_dir(&project_dir) {
+                    Ok(e) => e,
+                    Err(e) => {
+                        self.log(&format!(
+                            "Warning: failed to read project subdirectory {}: {}",
+                            project_dir.display(), e
+                        ));
+                        continue;
+                    }
                 };
 
-                // Check modification time against cutoff
-                if let Some(ref cutoff) = cutoff_time {
-                    let mtime_dt: chrono::DateTime<chrono::Local> = mtime.into();
-                    if mtime_dt < *cutoff {
+                for file_entry in dir_entries.flatten() {
+                    let conv_file = file_entry.path();
+                    if conv_file.extension().map_or(true, |e| e != "jsonl") {
                         continue;
                     }
-                }
 
-                conversation_files.push((conv_file, mtime));
+                    // Skip agent files
+                    if let Some(stem) = conv_file.file_stem() {
+                        if stem.to_string_lossy().starts_with("agent-") {
+                            continue;
+                        }
+                    }
+
+                    // Always get mtime (used for both cutoff filter and sorting)
+                    let mtime = match conv_file.metadata().and_then(|m| m.modified()) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+
+                    // Check modification time against cutoff
+                    if let Some(ref cutoff) = cutoff_time {
+                        let mtime_dt: chrono::DateTime<chrono::Local> = mtime.into();
+                        if mtime_dt < *cutoff {
+                            continue;
+                        }
+                    }
+
+                    conversation_files.push((conv_file, mtime));
+                }
             }
         }
 
