@@ -1,0 +1,23 @@
+src/indexer/claude_code.rs
+  71e7bf5039d6dfa0 351-355,357-360,363-418,420-431,435-442,450-453,455,457-463,466-468,472-476,479-487,490-492,496-507,509-518
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.5",
+  "base_commit_sha": "8e6f9362b11d4c69595032d6e187be55ae35c579",
+  "prompts": {
+    "71e7bf5039d6dfa0": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "acc77365-eb79-49d7-a54e-6e58aa8d1150",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47",
+      "messages": [],
+      "total_additions": 165,
+      "total_deletions": 71,
+      "accepted_lines": 142,
+      "overriden_lines": 0
+    }
+  }
+}
