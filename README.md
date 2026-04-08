@@ -199,7 +199,7 @@ ai-conversation-search tree SESSION_ID [--json]
 
 | Source | Data Location | Session Prefix |
 |--------|--------------|---------------|
-| **Claude Code** | `~/.claude/projects/{project}/{session}.jsonl` | *(none)* |
+| **Claude Code** | `~/.claude*/projects/{project}/{session}.jsonl` | *(none)* |
 | **OpenCode** | `~/.local/share/opencode/opencode.db` (SQLite) | `oc:` |
 | **Codex CLI** | `~/.codex/sessions/{year}/{month}/{day}/*.jsonl` | `codex:` |
 
@@ -210,12 +210,17 @@ ai-conversation-search tree SESSION_ID [--json]
 ## Architecture
 
 ```
-~/.claude/
-├── projects/           # Claude Code conversation files (JSONL)
+~/.claude/                     # Default profile
+├── projects/                  # Claude Code conversation files (JSONL)
 │   └── {project}/
 │       └── {session}.jsonl
 └── skills/
     └── conversation-search/  # Optional Skill
+
+~/.claude-personal/            # Additional profiles (auto-discovered)
+└── projects/
+    └── {project}/
+        └── {session}.jsonl
 
 ~/.local/share/opencode/
 └── opencode.db         # OpenCode conversations (SQLite)
@@ -257,7 +262,16 @@ ai-conversation-search list --days 30 --json | jq '.[] | .conversation_summary'
 
 **Database location:** `~/.conversation-search/index.db`
 
-**No configuration file needed** - all settings via command-line flags.
+**No configuration file needed** - all settings via command-line flags and environment variables.
+
+| Environment Variable | Description |
+|---------------------|-------------|
+| `CONVERSATION_SEARCH_EXTRA_DIRS` | Additional project directories to scan (colon-separated, `~` expansion supported) |
+| `CONVERSATION_SEARCH_INDEX_TTL` | Auto-index cooldown in seconds (default: 300) |
+| `CONVERSATION_SEARCH_FULL_INDEX_TTL` | Full index cooldown in seconds (default: 86400) |
+| `OPENCODE_HOME` | Override OpenCode data directory |
+
+**Multi-profile support**: All `~/.claude*/projects/` directories are automatically discovered and indexed.
 
 ## Performance
 

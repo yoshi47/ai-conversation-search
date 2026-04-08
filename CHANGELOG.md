@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.10.0] - 2026-04-08
+
+### Added
+
+- 複数の Claude プロファイルディレクトリを自動検出してスキャン（`~/.claude`, `~/.claude-personal` 等）
+- `CONVERSATION_SEARCH_EXTRA_DIRS` 環境変数で追加スキャンディレクトリを指定可能（コロン区切り、`~` 展開対応）
+- ディレクトリ検出・読み取り失敗時の警告ログ出力
+
+### Fixed
+
+- summarizer プロジェクトハッシュのキャッシュが複数ディレクトリ間で誤って共有されるバグを修正
+
 ## [0.9.0] - 2026-03-30
 
 ### Added
