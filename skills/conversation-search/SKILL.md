@@ -225,6 +225,21 @@ ai-conversation-search tree <SESSION_ID> --json
 
 **Always use `--json` for structured output.**
 
+### Interactive Session Picker (requires fzf + jq)
+```bash
+# Browse recent sessions interactively with fzf preview
+ai-conversation-search pick
+
+# Search and pick interactively
+ai-conversation-search pick "authentication bug"
+
+# Filter by project or time range
+ai-conversation-search pick --days 30 --repo myproject
+
+# Pick a session and execute the resume command
+eval "$(ai-conversation-search pick)"
+```
+
 ## Examples
 
 **Example 1: Topic query**

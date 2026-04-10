@@ -41,4 +41,141 @@ if [ ! -f "${HOME}/.conversation-search/index.db" ]; then
     "$BINARY" init --days 7 || echo "Warning: index initialization failed. Run 'ai-conversation-search init' manually." >&2
 fi
 
+# --- pick subcommand (interactive fzf session picker) ---
+acs_pick() {
+    if ! command -v fzf >/dev/null 2>&1; then
+        echo "Error: fzf is required. Install: brew install fzf" >&2
+        exit 1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "Error: jq is required. Install: brew install jq" >&2
+        exit 1
+    fi
+
+    PICK_QUERY=""
+    PICK_DAYS=""
+    PICK_REPO=""
+    PICK_SOURCE=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --days)   [ -z "${2:-}" ] && { echo "Error: --days requires a value" >&2; exit 1; }
+                      PICK_DAYS="$2"; shift 2 ;;
+            --repo)   [ -z "${2:-}" ] && { echo "Error: --repo requires a value" >&2; exit 1; }
+                      PICK_REPO="$2"; shift 2 ;;
+            --source) [ -z "${2:-}" ] && { echo "Error: --source requires a value" >&2; exit 1; }
+                      PICK_SOURCE="$2"; shift 2 ;;
+            --help)
+                echo "Usage: ai-conversation-search pick [QUERY] [OPTIONS]"
+                echo ""
+                echo "Interactive session picker using fzf."
+                echo ""
+                echo "Arguments:"
+                echo "  QUERY           Search query (optional, uses list mode if omitted)"
+                echo ""
+                echo "Options:"
+                echo "  --days N        Limit to last N days (default: 14 for list, unlimited for search)"
+                echo "  --repo REPO     Filter by repository name (partial match)"
+                echo "  --source SRC    Filter by source (claude_code, opencode, codex)"
+                echo "  --help          Show this help"
+                echo ""
+                echo "Examples:"
+                echo "  ai-conversation-search pick                    # browse recent sessions"
+                echo "  ai-conversation-search pick \"auth bug\"         # search and pick"
+                echo "  ai-conversation-search pick --repo myproject   # filter by project"
+                echo "  eval \"\$(ai-conversation-search pick)\"          # pick and resume"
+                exit 0
+                ;;
+            -*)       echo "Unknown option: $1" >&2; exit 1 ;;
+            *)        PICK_QUERY="$1"; shift ;;
+        esac
+    done
+
+    # Build command
+    if [ -n "$PICK_QUERY" ]; then
+        set -- search "$PICK_QUERY" --group-by-session --json
+    else
+        set -- list --json
+        [ -z "$PICK_DAYS" ] && PICK_DAYS=14
+    fi
+    [ -n "$PICK_DAYS" ]   && set -- "$@" --days "$PICK_DAYS"
+    [ -n "$PICK_REPO" ]   && set -- "$@" --repo "$PICK_REPO"
+    [ -n "$PICK_SOURCE" ] && set -- "$@" --source "$PICK_SOURCE"
+
+    # Fetch JSON into tempfile
+    PICK_TMPFILE=$(mktemp)
+    PICK_ERRFILE=$(mktemp)
+    trap 'rm -f "$PICK_TMPFILE" "$PICK_ERRFILE"' EXIT
+    if ! "$BINARY" "$@" > "$PICK_TMPFILE" 2>"$PICK_ERRFILE"; then
+        echo "Error: failed to fetch sessions:" >&2
+        cat "$PICK_ERRFILE" >&2
+        exit 1
+    fi
+
+    # Transform JSON to fzf display lines
+    # Format: SESSION_ID<TAB>[CC] 04-09 14:30  42msg  project-dir  Summary...
+    if ! LINES=$(jq -r '.[] |
+      "\(.session_id)\t" +
+      (if .source == "opencode" then "[OC]"
+       elif .source == "codex" then "[CX]"
+       else "[CC]" end) + " " +
+      ((.last_message_at // .timestamp // "") | .[0:16] | gsub("T"; " ")) + "  " +
+      (if .match_count then "\(.match_count) matches  "
+       else "\(.message_count // "?")msg  " end) +
+      ((.project_path // "") | split("/") | last) + "  " +
+      ((.conversation_summary // "[no summary]") | gsub("[\\n\\r]"; " ") | .[0:60])
+    ' "$PICK_TMPFILE"); then
+        echo "Error: failed to parse session data. Try: ai-conversation-search init --force" >&2
+        exit 1
+    fi
+
+    if [ -z "$LINES" ]; then
+        echo "No sessions found." >&2
+        exit 1
+    fi
+
+    TAB=$(printf '\t')
+    PREVIEW_CMD="$BINARY tree {1} --json 2>/dev/null | jq -r '
+      \"📁 \" + (.conversation.project_path // \"unknown\"),
+      \"💬 \" + (.total_messages | tostring) + \" messages\",
+      \"🕐 \" + ((.conversation.first_message_at // \"\")[0:16] | gsub(\"T\"; \" \")) + \" → \" + ((.conversation.last_message_at // \"\")[0:16] | gsub(\"T\"; \" \")),
+      \"\",
+      ([.tree[] | recurse(.children[]?)]
+       | map(select(
+           .full_content != null and .full_content != \"\"
+           and (.full_content | startswith(\"[Tool\") | not)
+         ))
+       | .[-12:]
+       | .[]
+       | (if .message_type == \"user\" then \"👤 \" else \"🤖 \" end)
+         + (.full_content | gsub(\"[\\\\n\\\\r]+\"; \" \") | .[0:150])
+      )
+    ' 2>/dev/null || echo '[Preview unavailable]'"
+    SELECTED=$(printf '%s\n' "$LINES" | fzf \
+        --delimiter="$TAB" \
+        --with-nth=2.. \
+        --preview="$PREVIEW_CMD" \
+        --preview-window=right:50%:wrap \
+        --header="Select a session to resume (ESC to cancel)" \
+        --no-sort)
+
+    [ -z "$SELECTED" ] && exit 0
+
+    SESSION_ID=$(printf '%s' "$SELECTED" | cut -f1)
+    RESUME_CMD=$(jq -r --arg sid "$SESSION_ID" \
+      '.[] | select(.session_id == $sid) | .resume_command // empty' "$PICK_TMPFILE")
+
+    if [ -z "$RESUME_CMD" ] || [ "$RESUME_CMD" = "null" ]; then
+        echo "This session does not support resume (source may be OpenCode/Codex)." >&2
+        exit 1
+    fi
+
+    echo "$RESUME_CMD"
+}
+
+if [ "$1" = "pick" ]; then
+    shift
+    acs_pick "$@"
+    exit $?
+fi
+
 exec "$BINARY" "$@"
