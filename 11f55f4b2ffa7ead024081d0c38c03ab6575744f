@@ -1,25 +1,7 @@
-README.md
-  71e7bf5039d6dfa0 202,213-214,220-223,265-274
-CHANGELOG.md
-  71e7bf5039d6dfa0 7-18
 ---
 {
   "schema_version": "authorship/3.0.0",
-  "git_ai_version": "1.2.5",
+  "git_ai_version": "1.2.6",
   "base_commit_sha": "11f55f4b2ffa7ead024081d0c38c03ab6575744f",
-  "prompts": {
-    "71e7bf5039d6dfa0": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "acc77365-eb79-49d7-a54e-6e58aa8d1150",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47",
-      "messages": [],
-      "total_additions": 30,
-      "total_deletions": 4,
-      "accepted_lines": 30,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
