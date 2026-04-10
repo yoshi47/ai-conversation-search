@@ -1,25 +1,7 @@
-bin/ai-conversation-search
-  ca4dfa18fa115613 44-180
-skills/conversation-search/SKILL.md
-  ca4dfa18fa115613 228-242
 ---
 {
   "schema_version": "authorship/3.0.0",
   "git_ai_version": "1.2.6",
   "base_commit_sha": "57e6eada0924f8af44cb6bf025225dbf5c790e40",
-  "prompts": {
-    "ca4dfa18fa115613": {
-      "agent_id": {
-        "tool": "claude",
-        "id": "a80579c6-adb3-472d-a9d3-133e51cea51c",
-        "model": "claude-opus-4-6"
-      },
-      "human_author": "yoshi47",
-      "messages": [],
-      "total_additions": 182,
-      "total_deletions": 30,
-      "accepted_lines": 152,
-      "overriden_lines": 0
-    }
-  }
+  "prompts": {}
 }
