@@ -1,0 +1,25 @@
+tests/test_pick.sh
+  ca4dfa18fa115613 1-330
+bin/ai-conversation-search
+  ca4dfa18fa115613 58,66-74,88,109-115,117-120,132-138
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "c43b845e2b2def86b9de55e579ca5715024ad0d8",
+  "prompts": {
+    "ca4dfa18fa115613": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a80579c6-adb3-472d-a9d3-133e51cea51c",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47",
+      "messages": [],
+      "total_additions": 364,
+      "total_deletions": 9,
+      "accepted_lines": 359,
+      "overriden_lines": 0
+    }
+  }
+}
