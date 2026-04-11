@@ -1,6 +1,6 @@
 ---
 name: conversation-search
-description: Find and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by searching topics or filtering by date. Returns session IDs and project paths for easy resumption. Use when user asks "find that conversation about X", "what did we discuss", "what did we work on yesterday", "summarize today's work", "show this week's conversations", "recent projects we accomplished", or wants to locate past work by topic, date, or time period (yesterday, today, last week, specific dates).
+description: Find and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by searching topics or filtering by date. Returns session IDs and project paths for easy resumption. Use when user asks "find that conversation about X", "what did we discuss", "what did we work on yesterday", "summarize today's work", "show this week's conversations", "recent projects we accomplished", or wants to locate past work by topic, date, or time period (yesterday, today, last week, specific dates). Also use when the user provides a session ID (UUID format like abc12345-...) to look up, when they reference past conversations implicitly ("〜だっけ？", "前に話した", "あの会話", "過去のセッション", "前にやった", "前に決めた", "あのとき"), or when they ask about decisions, results, or context from prior sessions.
 allowed-tools: Bash, TodoWrite
 ---
 
