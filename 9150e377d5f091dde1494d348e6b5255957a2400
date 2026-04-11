@@ -1,5 +1,13 @@
 skills/conversation-search/SKILL.md
   0f2940353dfc0823 3
+src/cli.rs
+  b65958e4e11b223d 15,17,266,273-281,285,288-290,294-298,442,489-491
+CHANGELOG.md
+  438cfcba36df5b1d 7-14
+bin/ai-conversation-search
+  ca4dfa18fa115613 58,66-74,88,109-115,117-120,132-138
+tests/test_pick.sh
+  ca4dfa18fa115613 1-330
 ---
 {
   "schema_version": "authorship/3.0.0",
@@ -14,9 +22,48 @@ skills/conversation-search/SKILL.md
       },
       "human_author": "yoshi47",
       "messages": [],
-      "total_additions": 1,
-      "total_deletions": 1,
+      "total_additions": 0,
+      "total_deletions": 0,
       "accepted_lines": 1,
+      "overriden_lines": 0
+    },
+    "438cfcba36df5b1d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0c1e516d-bbde-44ca-b37a-4ce9c8ad0e53",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": null,
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 8,
+      "overriden_lines": 0
+    },
+    "b65958e4e11b223d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "9ef55ab4-9159-4c1d-8f0b-a938ee5dc5d2",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 48,
+      "overriden_lines": 0
+    },
+    "ca4dfa18fa115613": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "a80579c6-adb3-472d-a9d3-133e51cea51c",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47",
+      "messages": [],
+      "total_additions": 0,
+      "total_deletions": 0,
+      "accepted_lines": 359,
       "overriden_lines": 0
     }
   }
