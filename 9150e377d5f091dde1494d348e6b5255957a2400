@@ -1,0 +1,23 @@
+skills/conversation-search/SKILL.md
+  0f2940353dfc0823 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.8",
+  "base_commit_sha": "9150e377d5f091dde1494d348e6b5255957a2400",
+  "prompts": {
+    "0f2940353dfc0823": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "166956bf-d447-483a-8172-476827b41eee",
+        "model": "claude-opus-4-6"
+      },
+      "human_author": "yoshi47",
+      "messages": [],
+      "total_additions": 1,
+      "total_deletions": 1,
+      "accepted_lines": 1,
+      "overriden_lines": 0
+    }
+  }
+}
