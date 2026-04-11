@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.11.0] - 2026-04-11
+
+### Added
+
+- `--here` オプションを追加して現在のディレクトリでの会話検索をサポート
+- 対話型セッションピッカー機能を追加（検索結果からセッションを選択して再開）
+- 会話検索スキルの使用ケースを拡張
+
 ## [0.10.0] - 2026-04-08
 
 ### Added
