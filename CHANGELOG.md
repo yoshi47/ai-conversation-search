@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.0] - 2026-04-23
+
+### Added
+
+- `pick` コマンドをライブ全文検索対応に刷新（検索しながら結果を絞り込んでセッション選択）
+- セッション単位でのグループ化検索機能を実装
+
 ## [0.11.0] - 2026-04-11
 
 ### Added
