@@ -3,7 +3,7 @@ tests/test_pick.sh
 skills/conversation-search/SKILL.md
   0f2940353dfc0823 3
 bin/ai-conversation-search
-  ca4dfa18fa115613 58-119
+  ca4dfa18fa115613 58,60,67-75,81-83,86,89,91,97,107-113,116-119
 ---
 {
   "schema_version": "authorship/3.0.0",
