@@ -41,10 +41,10 @@ if [ ! -f "${HOME}/.conversation-search/index.db" ]; then
     "$BINARY" init --days 7 || echo "Warning: index initialization failed. Run 'ai-conversation-search init' manually." >&2
 fi
 
-# --- pick subcommand (interactive fzf session picker) ---
+# --- pick subcommand (interactive fzf session picker with live body search) ---
 acs_pick() {
     if ! command -v fzf >/dev/null 2>&1; then
-        echo "Error: fzf is required. Install: brew install fzf" >&2
+        echo "Error: fzf is required (version 0.28+). Install: brew install fzf" >&2
         exit 1
     fi
     if ! command -v jq >/dev/null 2>&1; then
@@ -57,6 +57,7 @@ acs_pick() {
     PICK_REPO=""
     PICK_PROJECT=""
     PICK_SOURCE=""
+    PICK_LIMIT=""
     while [ $# -gt 0 ]; do
         case "$1" in
             --days)   [ -z "${2:-}" ] && { echo "Error: --days requires a value" >&2; exit 1; }
@@ -77,13 +78,15 @@ acs_pick() {
             --help)
                 echo "Usage: ai-conversation-search pick [QUERY] [OPTIONS]"
                 echo ""
-                echo "Interactive session picker using fzf."
+                echo "Interactive session picker using fzf with live body/content search."
+                echo "Typing in the picker runs a full-text search against message bodies"
+                echo "using SQLite FTS5 (trigram tokenizer, Japanese/CJK friendly)."
                 echo ""
                 echo "Arguments:"
-                echo "  QUERY           Search query (optional, uses list mode if omitted)"
+                echo "  QUERY           Initial search query (optional, shown in the prompt)"
                 echo ""
                 echo "Options:"
-                echo "  --days N        Limit to last N days (default: 14 for list, unlimited for search)"
+                echo "  --days N        Limit to last N days (default: 14, or 90 with --here)"
                 echo "  --repo REPO     Filter by repository name (partial match)"
                 echo "  --here          Filter to current directory only"
                 echo "  --source SRC    Filter by source (claude_code, opencode, codex)"
@@ -91,7 +94,7 @@ acs_pick() {
                 echo ""
                 echo "Examples:"
                 echo "  ai-conversation-search pick                    # browse recent sessions"
-                echo "  ai-conversation-search pick \"auth bug\"         # search and pick"
+                echo "  ai-conversation-search pick \"auth bug\"         # pre-fill query"
                 echo "  ai-conversation-search pick --repo myproject   # filter by project"
                 echo "  eval \"\$(ai-conversation-search pick)\"          # pick and resume"
                 exit 0
@@ -101,64 +104,26 @@ acs_pick() {
         esac
     done
 
-    # Build command
-    if [ -n "$PICK_QUERY" ]; then
-        set -- search "$PICK_QUERY" --group-by-session --json
-    else
-        set -- list --json
-        if [ -z "$PICK_DAYS" ]; then
-            if [ -n "$PICK_PROJECT" ]; then
-                PICK_DAYS=90
-            else
-                PICK_DAYS=14
-            fi
+    # Default date window (overridable by --days).
+    if [ -z "$PICK_DAYS" ]; then
+        if [ -n "$PICK_PROJECT" ]; then
+            PICK_DAYS=90
+        else
+            PICK_DAYS=14
         fi
     fi
-    [ -n "$PICK_DAYS" ]    && set -- "$@" --days "$PICK_DAYS"
-    [ -n "$PICK_REPO" ]    && set -- "$@" --repo "$PICK_REPO"
-    [ -n "$PICK_PROJECT" ] && set -- "$@" --limit 100
-    [ -n "$PICK_SOURCE" ]  && set -- "$@" --source "$PICK_SOURCE"
 
-    # Fetch JSON into tempfile
-    PICK_TMPFILE=$(mktemp)
-    PICK_ERRFILE=$(mktemp)
-    trap 'rm -f "$PICK_TMPFILE" "$PICK_ERRFILE"' EXIT
-    if ! "$BINARY" "$@" > "$PICK_TMPFILE" 2>"$PICK_ERRFILE"; then
-        echo "Error: failed to fetch sessions:" >&2
-        cat "$PICK_ERRFILE" >&2
-        exit 1
-    fi
-
-    # --here: filter JSON to current directory only
+    # Live-filtered picker is unhelpful with too few rows. Default 50 (vs the
+    # binary's 20-row search default), 100 when --here narrows scope further.
     if [ -n "$PICK_PROJECT" ]; then
-        FILTERED=$(mktemp)
-        jq --arg pp "$PICK_PROJECT" '[.[] | select(.project_path == $pp)]' "$PICK_TMPFILE" > "$FILTERED"
-        mv "$FILTERED" "$PICK_TMPFILE"
-    fi
-
-    # Transform JSON to fzf display lines
-    # Format: SESSION_ID<TAB>[CC] 04-09 14:30  42msg  project-dir  Summary...
-    if ! LINES=$(jq -r '.[] |
-      "\(.session_id)\t" +
-      (if .source == "opencode" then "[OC]"
-       elif .source == "codex" then "[CX]"
-       else "[CC]" end) + " " +
-      ((.last_message_at // .timestamp // "") | .[0:16] | gsub("T"; " ")) + "  " +
-      (if .match_count then "\(.match_count) matches  "
-       else "\(.message_count // "?")msg  " end) +
-      ((.project_path // "") | split("/") | last) + "  " +
-      ((.conversation_summary // "[no summary]") | gsub("[\\n\\r]"; " ") | .[0:60])
-    ' "$PICK_TMPFILE"); then
-        echo "Error: failed to parse session data. Try: ai-conversation-search init --force" >&2
-        exit 1
-    fi
-
-    if [ -z "$LINES" ]; then
-        echo "No sessions found." >&2
-        exit 1
+        PICK_LIMIT=100
+    else
+        PICK_LIMIT=50
     fi
 
     TAB=$(printf '\t')
+
+    # Preview: unchanged semantics — {1} is the session_id column.
     PREVIEW_CMD="$BINARY tree {1} --json 2>/dev/null | jq -r '
       \"📁 \" + (.conversation.project_path // \"unknown\"),
       \"💬 \" + (.total_messages | tostring) + \" messages\",
@@ -175,21 +140,99 @@ acs_pick() {
          + (.full_content | gsub(\"[\\\\n\\\\r]+\"; \" \") | .[0:150])
       )
     ' 2>/dev/null || echo '[Preview unavailable]'"
-    SELECTED=$(printf '%s\n' "$LINES" | fzf \
+
+    # Reload script — runs on every keystroke with fzf's {q} as "$1".
+    # Emits tab-separated: SESSION_ID \t RESUME_CMD \t DISPLAY
+    # stderr is suppressed so that mid-typing FTS syntax errors (e.g. an
+    # unclosed quote the user is still typing) don't spam the UI; startup
+    # errors are caught separately by the probe below.
+    # Heredoc with 'RELOAD_EOF' (quoted delimiter) keeps the body literal.
+    RELOAD_SCRIPT=$(cat <<'RELOAD_EOF'
+q="$1"
+out=$("$ACS_BIN" search "$q" --group-by-session --json \
+    ${ACS_DAYS:+--days "$ACS_DAYS"} \
+    ${ACS_REPO:+--repo "$ACS_REPO"} \
+    ${ACS_SOURCE:+--source "$ACS_SOURCE"} \
+    ${ACS_PROJECT:+--project "$ACS_PROJECT"} \
+    ${ACS_LIMIT:+--limit "$ACS_LIMIT"} \
+    2>/dev/null) || out="[]"
+[ -z "$out" ] && out="[]"
+printf '%s' "$out" | jq -r '
+    .[] |
+    "\(.session_id)\t\(.resume_command // "")\t" +
+    (if .source == "opencode" then "[OC]"
+     elif .source == "codex" then "[CX]"
+     else "[CC]" end) + " " +
+    ((.last_message_at // .timestamp // "") | .[0:16] | gsub("T"; " ")) + "  " +
+    "\(.match_count // 0) matches  " +
+    ((.project_path // "") | split("/") | last) + "  " +
+    ((.conversation_summary // "[no summary]") | gsub("[\\n\\r]"; " ") | .[0:60])
+' 2>/dev/null || true
+RELOAD_EOF
+)
+
+    export ACS_BIN="$BINARY"
+    export ACS_DAYS="$PICK_DAYS"
+    export ACS_REPO="$PICK_REPO"
+    export ACS_SOURCE="$PICK_SOURCE"
+    export ACS_PROJECT="$PICK_PROJECT"
+    export ACS_LIMIT="$PICK_LIMIT"
+    export ACS_RELOAD_SCRIPT="$RELOAD_SCRIPT"
+
+    # Startup probe: run search WITHOUT suppressing stderr so real failures —
+    # bad --source value, missing DB, corrupted FTS index, wrong binary —
+    # surface loudly. The query "the" is a 3+ codepoint trigram so the FTS
+    # path is exercised (empty query takes a non-FTS branch in src/search.rs
+    # that wouldn't catch FTS table corruption). Zero hits is fine — we only
+    # care about the exit status. Once past this, the reload script's
+    # 2>/dev/null is justified because the only remaining failure mode is
+    # partial FTS syntax while the user types.
+    PROBE_ERR=$("$BINARY" search "the" --group-by-session --json --limit 1 \
+        ${PICK_DAYS:+--days "$PICK_DAYS"} \
+        ${PICK_REPO:+--repo "$PICK_REPO"} \
+        ${PICK_SOURCE:+--source "$PICK_SOURCE"} \
+        ${PICK_PROJECT:+--project "$PICK_PROJECT"} \
+        2>&1 >/dev/null) || {
+        echo "Error: conversation-search failed to start." >&2
+        [ -n "$PROBE_ERR" ] && echo "$PROBE_ERR" >&2
+        echo "Try: ai-conversation-search init --force" >&2
+        exit 1
+    }
+
+    # Seed fzf with initial results. On every keystroke, fzf triggers
+    # change:reload which re-runs the same script with the current query as
+    # $1. fzf's {q} substitution is shell-quoted so user input is
+    # injection-safe.
+    INITIAL=$(sh -c "$RELOAD_SCRIPT" _ "$PICK_QUERY")
+
+    if [ -z "$INITIAL" ]; then
+        # Probe succeeded but current filters/query returned nothing.
+        if [ -n "$PICK_QUERY" ]; then
+            echo "No sessions matched \"$PICK_QUERY\" in the last $PICK_DAYS days." >&2
+        else
+            echo "No sessions found in the last $PICK_DAYS days." >&2
+        fi
+        echo "Try loosening --days, --repo, or --source filters." >&2
+        exit 1
+    fi
+
+    SELECTED=$(printf '%s\n' "$INITIAL" | fzf --disabled \
+        --query="$PICK_QUERY" \
+        --bind 'change:reload:sh -c "$ACS_RELOAD_SCRIPT" _ {q}' \
         --delimiter="$TAB" \
-        --with-nth=2.. \
+        --with-nth=3.. \
+        --nth=3.. \
         --preview="$PREVIEW_CMD" \
         --preview-window=right:50%:wrap \
-        --header="Select a session to resume (ESC to cancel)" \
+        --header="Select a session to resume (ESC to cancel — type to search titles + content)" \
         --no-sort)
 
     [ -z "$SELECTED" ] && exit 0
 
     SESSION_ID=$(printf '%s' "$SELECTED" | cut -f1)
-    RESUME_CMD=$(jq -r --arg sid "$SESSION_ID" \
-      '.[] | select(.session_id == $sid) | .resume_command // empty' "$PICK_TMPFILE")
+    RESUME_CMD=$(printf '%s' "$SELECTED" | cut -f2)
 
-    if [ -z "$RESUME_CMD" ] || [ "$RESUME_CMD" = "null" ]; then
+    if [ -z "$RESUME_CMD" ]; then
         echo "This session does not support resume (source may be OpenCode/Codex)." >&2
         exit 1
     fi

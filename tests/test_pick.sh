@@ -115,49 +115,36 @@ else
 fi
 echo ""
 
-# --- JSON fetching (list mode) ---
-echo "--- JSON fetching (list mode) ---"
+# --- JSON fetching (search mode, used by pick) ---
+echo "--- JSON fetching (search mode) ---"
 
 TMPFILE=$(mktemp)
 trap 'rm -f "$TMPFILE"' EXIT
-if "$BINARY" list --json --days 14 > "$TMPFILE" 2>/dev/null; then
-    pass "list --json succeeds"
+if "$BINARY" search "" --group-by-session --json --days 14 > "$TMPFILE" 2>/dev/null; then
+    pass "search --group-by-session --json succeeds with empty query"
 else
-    fail "list --json succeeds"
+    fail "search --json succeeds"
 fi
 
 COUNT=$(jq 'length' "$TMPFILE")
 if [ "$COUNT" -gt 0 ]; then
-    pass "list returns results ($COUNT sessions)"
+    pass "search returns results ($COUNT sessions)"
 else
-    fail "list returns results" "Got 0"
+    fail "search returns results" "Got 0"
 fi
 echo ""
 
-# --- JSON fetching (search mode) ---
-echo "--- JSON fetching (search mode) ---"
-
-TMPFILE_SEARCH=$(mktemp)
-if "$BINARY" search "test" --group-by-session --json --days 30 > "$TMPFILE_SEARCH" 2>/dev/null; then
-    pass "search --json succeeds"
-else
-    # search with no results is still valid
-    pass "search --json completes (may have 0 results)"
-fi
-rm -f "$TMPFILE_SEARCH"
-echo ""
-
-# --- jq transformation (list mode) ---
+# --- jq transformation (pick's 3-column format) ---
+# Format: SESSION_ID<TAB>RESUME_CMD<TAB>DISPLAY
 echo "--- jq transformation ---"
 
 LINES=$(jq -r '.[] |
-  "\(.session_id)\t" +
+  "\(.session_id)\t\(.resume_command // "")\t" +
   (if .source == "opencode" then "[OC]"
    elif .source == "codex" then "[CX]"
    else "[CC]" end) + " " +
   ((.last_message_at // .timestamp // "") | .[0:16] | gsub("T"; " ")) + "  " +
-  (if .match_count then "\(.match_count) matches  "
-   else "\(.message_count // "?")msg  " end) +
+  "\(.match_count // 0) matches  " +
   ((.project_path // "") | split("/") | last) + "  " +
   ((.conversation_summary // "[no summary]") | gsub("[\\n\\r]"; " ") | .[0:60])
 ' "$TMPFILE")
@@ -169,15 +156,26 @@ else
 fi
 
 FIRST_LINE=$(echo "$LINES" | head -1)
-# Check tab-separated format: session_id<TAB>display
 TAB=$(printf '\t')
 SESSION_ID=$(echo "$FIRST_LINE" | cut -f1)
-DISPLAY=$(echo "$FIRST_LINE" | cut -f2-)
+RESUME_FIELD=$(echo "$FIRST_LINE" | cut -f2)
+DISPLAY=$(echo "$FIRST_LINE" | cut -f3)
 
 if echo "$SESSION_ID" | grep -qE '^[a-f0-9-]+$'; then
     pass "first field is a UUID-like session_id"
 else
     fail "first field is a UUID-like session_id" "Got: $SESSION_ID"
+fi
+
+# resume_command may be empty for opencode/codex sources; only assert format if non-empty
+if [ -n "$RESUME_FIELD" ]; then
+    if echo "$RESUME_FIELD" | grep -q "^cd .* && .* --resume "; then
+        pass "second field is a valid resume command"
+    else
+        fail "second field is a valid resume command" "Got: $RESUME_FIELD"
+    fi
+else
+    pass "second field is empty (opencode/codex session, expected)"
 fi
 
 if echo "$DISPLAY" | grep -qE '^\[C[CX]\]|\[OC\]'; then
@@ -192,30 +190,24 @@ else
     fail "display contains timestamp" "Got: $DISPLAY"
 fi
 
-if echo "$DISPLAY" | grep -qE '[0-9]+msg'; then
-    pass "display contains message count"
+if echo "$DISPLAY" | grep -qE '[0-9]+ matches'; then
+    pass "display contains match count"
 else
-    fail "display contains message count" "Got: $DISPLAY"
+    fail "display contains match count" "Got: $DISPLAY"
 fi
 echo ""
 
-# --- resume_command extraction ---
-echo "--- resume_command extraction ---"
+# --- resume_command availability ---
+# With the 3-column format, pick extracts resume via `cut -f2`, but we
+# still verify that the JSON itself carries resume_command for at least
+# one session so downstream resume-by-cut works.
+echo "--- resume_command availability ---"
 
-FIRST_SESSION=$(jq -r '.[0].session_id' "$TMPFILE")
-RESUME_CMD=$(jq -r --arg sid "$FIRST_SESSION" \
-  '.[] | select(.session_id == $sid) | .resume_command // empty' "$TMPFILE")
-
-if [ -n "$RESUME_CMD" ] && [ "$RESUME_CMD" != "null" ]; then
-    pass "resume_command extracted for session $FIRST_SESSION"
+RESUMABLE_COUNT=$(jq '[.[] | select(.resume_command != null and .resume_command != "")] | length' "$TMPFILE")
+if [ "$RESUMABLE_COUNT" -gt 0 ]; then
+    pass "$RESUMABLE_COUNT sessions carry resume_command"
 else
-    fail "resume_command extracted" "Got: $RESUME_CMD"
-fi
-
-if echo "$RESUME_CMD" | grep -q "^cd .* && .* --resume"; then
-    pass "resume_command has expected format"
-else
-    fail "resume_command format" "Got: $RESUME_CMD"
+    fail "at least one session should have resume_command" "Got 0"
 fi
 echo ""
 
@@ -270,6 +262,11 @@ echo ""
 # --- preview command ---
 echo "--- preview command ---"
 
+# Pick a real session from the fetched JSON to exercise the preview path.
+FIRST_SESSION=$(jq -r '.[0].session_id // empty' "$TMPFILE")
+if [ -z "$FIRST_SESSION" ]; then
+    echo "  SKIP: preview tests (no sessions available)"
+else
 PREVIEW_OUTPUT=$("$BINARY" tree "$FIRST_SESSION" --json 2>/dev/null | jq -r '
   "📁 " + (.conversation.project_path // "unknown"),
   "💬 " + (.total_messages | tostring) + " messages",
@@ -293,6 +290,7 @@ if echo "$PREVIEW_OUTPUT" | grep -q "🕐"; then
 else
     fail "preview shows time range"
 fi
+fi
 echo ""
 
 # --- Variable shadowing ---
@@ -305,10 +303,12 @@ else
     fail "REPO variable shadowing check"
 fi
 
-if grep -q 'PICK_TMPFILE' "$WRAPPER" && ! grep -q '^\s*TMPFILE=.*mktemp' "$WRAPPER"; then
-    pass "no TMPFILE variable shadowing (uses PICK_TMPFILE)"
+# The pick function should not introduce a top-level TMPFILE (reserved by the
+# download wrapper). Reload-based pick has no mktemp call at all.
+if ! grep -q '^\s*TMPFILE=.*mktemp' "$WRAPPER"; then
+    pass "no TMPFILE variable shadowing"
 else
-    fail "TMPFILE variable shadowing check"
+    fail "TMPFILE variable shadowing detected"
 fi
 
 # POSIX compliance: no $'\t' bashism
@@ -316,6 +316,97 @@ if grep -q "\$'\\\\t'" "$WRAPPER"; then
     fail "POSIX compliance: found bashism \$'\\t'"
 else
     pass "POSIX compliance: no \$'\\t' bashism"
+fi
+echo ""
+
+# --- Reload script smoke test ---
+# Verify the reload flow end-to-end: extract the RELOAD_SCRIPT heredoc from
+# the wrapper, invoke it against the real binary, and assert the 3-column
+# output format is well-formed. This is the exact path fzf --bind triggers.
+echo "--- Reload script smoke test ---"
+
+RELOAD_SCRIPT=$(sed -n "/<<'RELOAD_EOF'/,/^RELOAD_EOF$/{//!p;}" "$WRAPPER")
+if [ -z "$RELOAD_SCRIPT" ]; then
+    fail "RELOAD_SCRIPT heredoc extracted from wrapper"
+else
+    pass "RELOAD_SCRIPT heredoc extracted from wrapper"
+
+    export ACS_BIN="$BINARY"
+    export ACS_DAYS=14
+    export ACS_REPO=""
+    export ACS_SOURCE=""
+    export ACS_PROJECT=""
+    export ACS_LIMIT=""
+
+    # run_reload QUERY — captures output and exit code separately.
+    # Without this the `|| true` pattern swallowed real failures and made
+    # every "no-crash" assertion vacuously pass.
+    run_reload() {
+        OUT=$(sh -c "$RELOAD_SCRIPT" _ "$1" 2>/dev/null)
+        RC=$?
+    }
+
+    run_reload ""
+    if [ "$RC" -eq 0 ] && [ -n "$OUT" ] && echo "$OUT" | head -1 | grep -qE '^[a-f0-9-]+'"$TAB"; then
+        pass "reload script produces tab-separated lines starting with UUID"
+    else
+        fail "reload script output format" "rc=$RC, first line: $(echo "$OUT" | head -1)"
+    fi
+
+    # Japanese body search (FTS trigram). Must exit 0; output may be empty
+    # (no match) or well-formed tab-separated lines.
+    run_reload "認証"
+    if [ "$RC" -eq 0 ]; then
+        if [ -z "$OUT" ] || echo "$OUT" | head -1 | grep -qE '^[a-f0-9-]+'"$TAB"; then
+            pass "reload script handles CJK queries cleanly"
+        else
+            fail "CJK output format malformed" "$(echo "$OUT" | head -1)"
+        fi
+    else
+        fail "reload script CJK query crashed" "rc=$RC"
+    fi
+
+    # FTS syntax-degrade resilience: unclosed quote must exit 0 with empty
+    # or well-formed output, not crash.
+    run_reload '"unclosed'
+    if [ "$RC" -eq 0 ]; then
+        if [ -z "$OUT" ] || echo "$OUT" | head -1 | grep -qE '^[a-f0-9-]+'"$TAB"; then
+            pass "reload script handles malformed FTS input cleanly"
+        else
+            fail "malformed FTS output format" "$(echo "$OUT" | head -1)"
+        fi
+    else
+        fail "reload script malformed FTS crashed" "rc=$RC"
+    fi
+fi
+echo ""
+
+# --- fzf contract assertions ---
+# If these flags drift, the 3-column cut -f1/-f2 extraction silently breaks.
+echo "--- fzf contract ---"
+
+if grep -q -- '--with-nth=3\.\.' "$WRAPPER"; then
+    pass "fzf --with-nth=3.. hides session_id + resume_cmd columns"
+else
+    fail "fzf --with-nth=3.. flag missing"
+fi
+
+if grep -q -- '--nth=3\.\.' "$WRAPPER"; then
+    pass "fzf --nth=3.. restricts fzf-side matching (disabled mode anyway)"
+else
+    fail "fzf --nth=3.. flag missing"
+fi
+
+if grep -q -- '--delimiter="\$TAB"' "$WRAPPER"; then
+    pass "fzf --delimiter is TAB (required for cut -f1/-f2)"
+else
+    fail "fzf --delimiter=TAB missing"
+fi
+
+if grep -qF 'change:reload:sh -c "$ACS_RELOAD_SCRIPT"' "$WRAPPER"; then
+    pass "fzf change:reload wired to ACS_RELOAD_SCRIPT env var"
+else
+    fail "fzf change:reload binding missing or altered"
 fi
 echo ""
 

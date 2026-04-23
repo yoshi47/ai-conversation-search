@@ -225,13 +225,20 @@ ai-conversation-search tree <SESSION_ID> --json
 
 **Always use `--json` for structured output.**
 
-### Interactive Session Picker (requires fzf + jq)
+### Interactive Session Picker (requires fzf 0.28+ and jq)
+Typing in the picker runs a **live full-text search against message bodies**
+via SQLite FTS5 (trigram tokenizer, Japanese/CJK friendly). Matching happens
+server-side on every keystroke, so the picker is not limited to titles/summaries.
+
 ```bash
-# Browse recent sessions interactively with fzf preview
+# Browse recent sessions and filter by typing (searches titles + body)
 ai-conversation-search pick
 
-# Search and pick interactively
+# Pre-fill the query at startup
 ai-conversation-search pick "authentication bug"
+
+# Scope to current directory (90-day window, up to 100 sessions)
+ai-conversation-search pick --here
 
 # Filter by project or time range
 ai-conversation-search pick --days 30 --repo myproject
