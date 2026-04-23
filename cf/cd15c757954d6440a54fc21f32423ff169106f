@@ -1,0 +1,31 @@
+CHANGELOG.md
+  f01cc60e4c5b1cb2 7-13
+Cargo.toml
+  f01cc60e4c5b1cb2 3
+.claude-plugin/marketplace.json
+  f01cc60e4c5b1cb2 12
+.claude-plugin/plugin.json
+  f01cc60e4c5b1cb2 3
+bin/ai-conversation-search
+  f01cc60e4c5b1cb2 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.3.2",
+  "base_commit_sha": "cfcd15c757954d6440a54fc21f32423ff169106f",
+  "prompts": {
+    "f01cc60e4c5b1cb2": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "ef8b5e65-efab-48a3-9fd2-4ede42ff8398",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "yoshi47",
+      "messages": [],
+      "total_additions": 31,
+      "total_deletions": 4,
+      "accepted_lines": 31,
+      "overriden_lines": 0
+    }
+  }
+}
