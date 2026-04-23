@@ -609,25 +609,16 @@ fn cmd_search(
     maybe_background_index();
     let mut search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
 
+    if group_by_session {
+        return cmd_search_grouped(&mut search, query, filter, verbose, json_output);
+    }
+
     let search_result = search.search_conversations(query, filter)?;
     let results = search_result.rows;
     let stats = &search_result.stats;
 
     if json_output {
-        let json_results = if group_by_session {
-            let grouped = group_results_by_session(&results);
-            let mut arr = Vec::new();
-            for (representative, count) in &grouped {
-                let mut obj = serde_json::to_value(representative)?;
-                if let Some(map) = obj.as_object_mut() {
-                    map.insert("match_count".to_string(), serde_json::Value::Number((*count).into()));
-                }
-                arr.push(obj);
-            }
-            serde_json::Value::Array(arr)
-        } else {
-            serde_json::to_value(&results)?
-        };
+        let json_results = serde_json::to_value(&results)?;
         let mut localized = localize_timestamps(json_results);
         inject_resume_command(&mut localized);
         println!("{}", serde_json::to_string_pretty(&localized)?);
@@ -653,96 +644,112 @@ fn cmd_search(
         print_unindexed_warning(&search);
     }
 
-    if group_by_session {
-        let grouped = group_results_by_session(&results);
-        println!("\u{1f50d} Found {} matches across {} sessions for '{}':\n",
-            results.len(), grouped.len(), query);
+    println!("\u{1f50d} Found {} matches for '{}':\n", results.len(), query);
 
-        for (result, match_count) in &grouped {
-            let source_str = result.source.as_deref().unwrap_or("claude_code");
-            let label = source_label(source_str);
-            let summary = display_summary(result.conversation_summary.as_deref());
-            let project_dir = result.project_path.as_deref().unwrap_or("");
-            let session_id = &result.session_id;
-            let timestamp = format_timestamp(&result.timestamp, true, false);
+    for result in &results {
+        let icon = if result.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+        let timestamp = format_timestamp(&result.timestamp, true, false);
+        let source_str = result.source.as_deref().unwrap_or("claude_code");
+        let label = source_label(source_str);
 
-            println!("{} {} ({} matches)", label, summary, match_count);
-            println!("   Session: {}", session_id);
-            println!("   Project: {}", project_dir);
-            println!("   Time: {}", timestamp);
+        let project_dir = result.project_path.as_deref().unwrap_or("");
+        let summary = display_summary(result.conversation_summary.as_deref());
+        let session_id = &result.session_id;
+        let message_uuid = &result.message_uuid;
+
+        println!("{} {} {}", icon, label, summary);
+        println!("   Session: {}", session_id);
+        println!("   Project: {}", project_dir);
+        println!("   Time: {}", timestamp);
+        println!("   Message: {}", message_uuid);
+
+        if show_content {
+            if let Some(content) = search.get_full_message_content(message_uuid) {
+                let truncated: String = content.chars().take(300).collect();
+                println!("\n   {}...", truncated);
+            }
+        } else {
             println!("\n   {}", result.context_snippet);
-
-            if source_str != "opencode" && source_str != "codex" {
-                println!("\n   Resume:");
-                println!("     cd {}", project_dir);
-                println!("     {} --resume {}", claude_cmd(), session_id);
-            }
-            println!();
         }
-    } else {
-        println!("\u{1f50d} Found {} matches for '{}':\n", results.len(), query);
 
-        for result in &results {
-            let icon = if result.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
-            let timestamp = format_timestamp(&result.timestamp, true, false);
-            let source_str = result.source.as_deref().unwrap_or("claude_code");
-            let label = source_label(source_str);
-
-            let project_dir = result.project_path.as_deref().unwrap_or("");
-            let summary = display_summary(result.conversation_summary.as_deref());
-            let session_id = &result.session_id;
-            let message_uuid = &result.message_uuid;
-
-            println!("{} {} {}", icon, label, summary);
-            println!("   Session: {}", session_id);
-            println!("   Project: {}", project_dir);
-            println!("   Time: {}", timestamp);
-            println!("   Message: {}", message_uuid);
-
-            if show_content {
-                if let Some(content) = search.get_full_message_content(message_uuid) {
-                    let truncated: String = content.chars().take(300).collect();
-                    println!("\n   {}...", truncated);
-                }
-            } else {
-                println!("\n   {}", result.context_snippet);
-            }
-
-            if source_str == "opencode" {
-                println!("\n   OpenCode session: {}", session_id.strip_prefix("oc:").unwrap_or(session_id));
-            } else if source_str == "codex" {
-                println!("\n   Codex session: {}", session_id.strip_prefix("codex:").unwrap_or(session_id));
-            } else {
-                println!("\n   Resume:");
-                println!("     cd {}", project_dir);
-                println!("     {} --resume {}", claude_cmd(), session_id);
-            }
-            println!();
+        if source_str == "opencode" {
+            println!("\n   OpenCode session: {}", session_id.strip_prefix("oc:").unwrap_or(session_id));
+        } else if source_str == "codex" {
+            println!("\n   Codex session: {}", session_id.strip_prefix("codex:").unwrap_or(session_id));
+        } else {
+            println!("\n   Resume:");
+            println!("     cd {}", project_dir);
+            println!("     {} --resume {}", claude_cmd(), session_id);
         }
+        println!();
     }
 
     Ok(())
 }
 
-/// Group search results by session_id, preserving order of first occurrence.
-fn group_results_by_session(results: &[crate::search::SearchResultRow]) -> Vec<(&crate::search::SearchResultRow, usize)> {
-    let mut seen: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new(); // session_id -> (first_index, count)
-    let mut order: Vec<&str> = Vec::new();
+fn cmd_search_grouped(
+    search: &mut ConversationSearch,
+    query: &str,
+    filter: &SearchFilter<'_>,
+    verbose: bool,
+    json_output: bool,
+) -> Result<()> {
+    let result = search.search_grouped_by_session(query, filter)?;
+    let stats = &result.stats;
 
-    for (i, result) in results.iter().enumerate() {
-        let sid = result.session_id.as_str();
-        seen.entry(sid)
-            .and_modify(|(_, count)| *count += 1)
-            .or_insert_with(|| {
-                order.push(sid);
-                (i, 1)
-            });
+    if json_output {
+        let json_val = serde_json::to_value(&result.rows)?;
+        let mut localized = localize_timestamps(json_val);
+        inject_resume_command(&mut localized);
+        println!("{}", serde_json::to_string_pretty(&localized)?);
+        if verbose {
+            eprintln!("Scanned {} sessions ({} messages), {} matched",
+                stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages);
+            print_unindexed_warning(search);
+        }
+        return Ok(());
     }
 
-    order.iter().map(|sid| {
-        let (idx, count) = seen[sid];
-        (&results[idx], count)
-    }).collect()
+    if result.rows.is_empty() {
+        println!("No results found for: {}", query);
+        eprintln!("Scanned {} sessions ({} messages), 0 matched",
+            stats.sessions_in_scope, stats.total_indexed_messages);
+        print_unindexed_warning(search);
+        return Ok(());
+    }
+
+    if verbose {
+        eprintln!("Scanned {} sessions ({} messages), {} matched",
+            stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages);
+        print_unindexed_warning(search);
+    }
+
+    println!("\u{1f50d} Found {} sessions matching '{}':\n", result.rows.len(), query);
+
+    for grouped in &result.rows {
+        let r = &grouped.representative;
+        let source_str = r.source.as_deref().unwrap_or("claude_code");
+        let label = source_label(source_str);
+        let summary = display_summary(r.conversation_summary.as_deref());
+        let project_dir = r.project_path.as_deref().unwrap_or("");
+        let session_id = &r.session_id;
+        let timestamp = format_timestamp(&r.timestamp, true, false);
+
+        println!("{} {} ({} matches)", label, summary, grouped.match_count);
+        println!("   Session: {}", session_id);
+        println!("   Project: {}", project_dir);
+        println!("   Time: {}", timestamp);
+        println!("\n   {}", r.context_snippet);
+
+        if source_str != "opencode" && source_str != "codex" {
+            println!("\n   Resume:");
+            println!("     cd {}", project_dir);
+            println!("     {} --resume {}", claude_cmd(), session_id);
+        }
+        println!();
+    }
+
+    Ok(())
 }
 
 fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool) -> Result<()> {

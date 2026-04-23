@@ -201,6 +201,21 @@ pub struct SearchResult {
     pub stats: SearchStats,
 }
 
+/// One session's representative row plus its match count.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupedRow {
+    #[serde(flatten)]
+    pub representative: SearchResultRow,
+    pub match_count: i64,
+}
+
+/// Grouped-by-session search result.
+#[derive(Debug, Clone, Serialize)]
+pub struct GroupedSearchResult {
+    pub rows: Vec<GroupedRow>,
+    pub stats: SearchStats,
+}
+
 /// Escape special LIKE characters.
 fn escape_like(value: &str) -> String {
     value
@@ -586,6 +601,166 @@ impl ConversationSearch {
         let matched = rows.len() as i64;
         let stats = self.gather_search_stats(filter, matched)?;
         Ok(SearchResult { rows, stats })
+    }
+
+    /// Search and group results by session, with `limit` applied at the SESSION level
+    /// (not the message level). Returns up to `limit` distinct sessions, each represented
+    /// by its most-recent matching message and the total match count for that session.
+    pub fn search_grouped_by_session(
+        &mut self,
+        query: &str,
+        filter: &SearchFilter<'_>,
+    ) -> Result<GroupedSearchResult> {
+        let days_back = filter.days_back;
+        let since = filter.since;
+        let until = filter.until;
+        let date = filter.date;
+        let limit = filter.limit;
+
+        if days_back.is_some() && (since.is_some() || until.is_some() || date.is_some()) {
+            return Err(AppError::General(
+                "Cannot use --days with --since/--until/--date".to_string(),
+            ));
+        }
+        if limit < 0 {
+            return Err(AppError::General(format!(
+                "limit must be >= 0, got {}",
+                limit
+            )));
+        }
+        let limit_usize = limit as usize;
+
+        let trimmed = query.trim();
+        let terms: Vec<&str> = trimmed.split_whitespace().collect();
+        // Trigram FTS requires >= 3 codepoints per term (unless quoted phrase).
+        let has_short_term = !trimmed.contains('"') && terms.iter().any(|t| t.chars().count() < 3);
+
+        if trimmed.is_empty() || has_short_term {
+            // Empty / short-term path: SQL window function picks the most recent message
+            // per session and counts matches per session, then we LIMIT at session level.
+            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            let mut inner_sql = String::from(
+                "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, \
+                 m.message_type, m.project_path, m.depth, m.is_sidechain, \
+                 SUBSTR(m.full_content, 1, 500) AS context_snippet, \
+                 c.conversation_summary, c.conversation_file, c.source, \
+                 ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.timestamp DESC) AS rn, \
+                 COUNT(*) OVER (PARTITION BY m.session_id) AS match_count \
+                 FROM messages m JOIN conversations c ON m.session_id = c.session_id \
+                 WHERE m.is_meta_conversation = FALSE"
+            );
+
+            if !trimmed.is_empty() {
+                for term in &terms {
+                    inner_sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
+                    params.push(Box::new(format!("%{}%", escape_like(term))));
+                }
+            }
+
+            Self::append_filters(&mut inner_sql, &mut params, filter)?;
+
+            let sql = format!(
+                "WITH ranked AS ({}) SELECT * FROM ranked WHERE rn = 1 \
+                 ORDER BY timestamp DESC LIMIT ?",
+                inner_sql
+            );
+            params.push(Box::new(limit));
+
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = self.query_rows(&sql, &param_refs, |row| {
+                Ok(GroupedRow {
+                    representative: SearchResultRow::from_row(row)?,
+                    match_count: row.get("match_count")?,
+                })
+            })?;
+
+            let matched_total: i64 = rows.iter().map(|g| g.match_count).sum();
+            let stats = self.gather_search_stats(filter, matched_total)?;
+            return Ok(GroupedSearchResult { rows, stats });
+        }
+
+        // FTS path: same trigram two-phase strategy as search_conversations.
+        let fts_query = if !query.contains(" AND ")
+            && !query.contains(" OR ")
+            && !query.contains(" NOT ")
+            && !query.contains('"')
+        {
+            let fts_terms: Vec<&str> = query.split_whitespace().collect();
+            if fts_terms.len() == 1 {
+                format!("\"{}\"", fts_terms[0])
+            } else {
+                fts_terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" AND ")
+            }
+        } else {
+            query.to_string()
+        };
+
+        let rowids = self.query_fts_rowids(&fts_query)?;
+
+        if rowids.is_empty() {
+            let stats = self.gather_search_stats(filter, 0)?;
+            return Ok(GroupedSearchResult { rows: Vec::new(), stats });
+        }
+
+        const BATCH_SIZE: usize = 500;
+        let mut all_results: Vec<SearchResultRow> = Vec::new();
+        for chunk in rowids.chunks(BATCH_SIZE) {
+            let mut batch_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut sql = format!(
+                "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, \
+                 m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, \
+                 c.conversation_summary, c.conversation_file, c.source \
+                 FROM messages m JOIN conversations c ON m.session_id = c.session_id \
+                 WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
+                placeholders
+            );
+            for rowid in chunk {
+                batch_params.push(Box::new(*rowid));
+            }
+            Self::append_filters(&mut sql, &mut batch_params, filter)?;
+            sql.push_str(" ORDER BY m.timestamp DESC");
+            let batch_results = self.execute_search_typed(&sql, &batch_params)?;
+            all_results.extend(batch_results);
+        }
+
+        // `stats.matched_messages` is the count post-filter (matches `search_conversations`
+        // FTS path, not the pre-filter rowid count).
+        let total_matched_messages = all_results.len() as i64;
+
+        // Group by session: representative = most recent matching message; count all matches.
+        all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+
+        let search_terms: Vec<&str> = trimmed.split_whitespace().collect();
+        let mut session_data: HashMap<String, (SearchResultRow, i64)> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for mut row in all_results {
+            let sid = row.session_id.clone();
+            match session_data.entry(sid.clone()) {
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    row.context_snippet = extract_snippet(&row.context_snippet, &search_terms, 200);
+                    order.push(sid);
+                    e.insert((row, 1));
+                }
+                std::collections::hash_map::Entry::Occupied(mut e) => {
+                    e.get_mut().1 += 1;
+                }
+            }
+        }
+        order.truncate(limit_usize);
+        let rows: Vec<GroupedRow> = order
+            .into_iter()
+            .map(|sid| {
+                let (rep, count) = session_data
+                    .remove(&sid)
+                    .expect("BUG: `order` must only contain session_ids inserted into session_data");
+                GroupedRow { representative: rep, match_count: count }
+            })
+            .collect();
+
+        let stats = self.gather_search_stats(filter, total_matched_messages)?;
+        Ok(GroupedSearchResult { rows, stats })
     }
 
     fn append_filters(
@@ -1053,9 +1228,24 @@ mod tests {
         timestamp: &str,
         project_path: &str,
     ) {
+        insert_test_message_full(conn, uuid, session_id, content, msg_type, timestamp, project_path, false, false);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_test_message_full(
+        conn: &Connection,
+        uuid: &str,
+        session_id: &str,
+        content: &str,
+        msg_type: &str,
+        timestamp: &str,
+        project_path: &str,
+        is_meta_conversation: bool,
+        is_sidechain: bool,
+    ) {
         conn.execute(
-            "INSERT INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, NULL, FALSE, 0, ?, ?, ?, 'test.jsonl', ?, FALSE, FALSE)",
-            rusqlite::params![uuid, session_id, timestamp, msg_type, project_path, content],
+            "INSERT INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, NULL, ?, 0, ?, ?, ?, 'test.jsonl', ?, ?, FALSE)",
+            rusqlite::params![uuid, session_id, is_sidechain, timestamp, msg_type, project_path, content, is_meta_conversation],
         )
         .unwrap();
     }
@@ -1285,6 +1475,214 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Cannot use --days"));
+    }
+
+    // ---- search_grouped_by_session tests ----
+
+    /// Empty query: limit applies at SESSION level. 3 sessions exist (10 + 10 + 5
+    /// messages); with limit=2 we should get 2 sessions, not 2 messages from one
+    /// session. match_count is the per-session message total.
+    #[test]
+    fn test_search_grouped_empty_query_limits_sessions() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sessA", "/proj", "session A", "2025-01-15T09:00:00", "2025-01-15T19:00:00", "claude_code");
+        insert_test_conversation(&conn, "sessB", "/proj", "session B", "2025-01-15T09:00:00", "2025-01-15T18:00:00", "claude_code");
+        insert_test_conversation(&conn, "sessC", "/proj", "session C", "2025-01-15T09:00:00", "2025-01-15T17:00:00", "claude_code");
+        for i in 0..10 {
+            insert_test_message(&conn, &format!("a{}", i), "sessA", "content A", "user",
+                &format!("2025-01-15T1{}:00:00", i), "/proj");
+        }
+        for i in 0..10 {
+            insert_test_message(&conn, &format!("b{}", i), "sessB", "content B", "user",
+                &format!("2025-01-14T1{}:00:00", i), "/proj");
+        }
+        for i in 0..5 {
+            insert_test_message(&conn, &format!("c{}", i), "sessC", "content C", "user",
+                &format!("2025-01-13T1{}:00:00", i), "/proj");
+        }
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.search_grouped_by_session(
+            "",
+            &SearchFilter { limit: 2, ..Default::default() },
+        ).unwrap();
+
+        assert_eq!(result.rows.len(), 2, "limit must apply at session level");
+        assert_eq!(result.rows[0].representative.session_id, "sessA");
+        assert_eq!(result.rows[1].representative.session_id, "sessB");
+        assert_eq!(result.rows[0].match_count, 10);
+        assert_eq!(result.rows[1].match_count, 10);
+    }
+
+    /// FTS path also limits at session level. "common" appears in 3 sessions;
+    /// limit=2 returns 2 sessions ordered by their representative timestamp.
+    #[test]
+    fn test_search_grouped_fts_limits_sessions() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sessA", "/proj", "A", "2025-01-15T09:00:00", "2025-01-15T19:00:00", "claude_code");
+        insert_test_conversation(&conn, "sessB", "/proj", "B", "2025-01-15T09:00:00", "2025-01-15T18:00:00", "claude_code");
+        insert_test_conversation(&conn, "sessC", "/proj", "C", "2025-01-15T09:00:00", "2025-01-15T17:00:00", "claude_code");
+        // sessA: 3 matches; sessB: 2 matches; sessC: 1 match
+        for i in 0..3 {
+            insert_test_message(&conn, &format!("a{}", i), "sessA", "common keyword here", "user",
+                &format!("2025-01-15T1{}:00:00", i), "/proj");
+        }
+        for i in 0..2 {
+            insert_test_message(&conn, &format!("b{}", i), "sessB", "common keyword here", "user",
+                &format!("2025-01-14T1{}:00:00", i), "/proj");
+        }
+        insert_test_message(&conn, "c0", "sessC", "common keyword here", "user", "2025-01-13T10:00:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.search_grouped_by_session(
+            "common",
+            &SearchFilter { limit: 2, ..Default::default() },
+        ).unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].representative.session_id, "sessA");
+        assert_eq!(result.rows[0].match_count, 3);
+        assert_eq!(result.rows[1].representative.session_id, "sessB");
+        assert_eq!(result.rows[1].match_count, 2);
+    }
+
+    /// Short query (< 3 codepoints) goes through the LIKE fallback path which
+    /// also uses the window-function session-level grouping.
+    #[test]
+    fn test_search_grouped_short_query_like_path() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sessA", "/proj", "A", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
+        insert_test_conversation(&conn, "sessB", "/proj", "B", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "a1", "sessA", "ok done", "user", "2025-01-15T11:00:00", "/proj");
+        insert_test_message(&conn, "a2", "sessA", "ok again", "user", "2025-01-15T10:30:00", "/proj");
+        insert_test_message(&conn, "b1", "sessB", "ok one", "user", "2025-01-15T10:00:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.search_grouped_by_session(
+            "ok",
+            &SearchFilter { limit: 5, ..Default::default() },
+        ).unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].representative.session_id, "sessA");
+        assert_eq!(result.rows[0].match_count, 2);
+        assert_eq!(result.rows[1].representative.session_id, "sessB");
+        assert_eq!(result.rows[1].match_count, 1);
+    }
+
+    /// Filters (project, source, repo) compose with session-level limit.
+    #[test]
+    fn test_search_grouped_preserves_filters() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sessA", "/proj_a", "A", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
+        insert_test_conversation(&conn, "sessB", "/proj_b", "B", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "opencode");
+        insert_test_message(&conn, "a1", "sessA", "topic alpha", "user", "2025-01-15T11:00:00", "/proj_a");
+        insert_test_message(&conn, "b1", "sessB", "topic beta", "user", "2025-01-15T10:00:00", "/proj_b");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        // FTS path with source filter
+        let result = searcher.search_grouped_by_session(
+            "topic",
+            &SearchFilter { source: Some("opencode"), limit: 10, ..Default::default() },
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].representative.session_id, "sessB");
+
+        // Empty-query window path with project filter
+        let result = searcher.search_grouped_by_session(
+            "",
+            &SearchFilter { project_path: Some("/proj_a"), limit: 10, ..Default::default() },
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].representative.session_id, "sessA");
+    }
+
+    /// Representative is the most-recent matching message per session.
+    #[test]
+    fn test_search_grouped_representative_is_most_recent() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sessA", "/proj", "A", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
+        insert_test_message(&conn, "old", "sessA", "match here", "user", "2025-01-15T09:00:00", "/proj");
+        insert_test_message(&conn, "new", "sessA", "match here too", "user", "2025-01-15T11:00:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.search_grouped_by_session(
+            "match",
+            &SearchFilter { limit: 5, ..Default::default() },
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].representative.message_uuid, "new");
+        assert_eq!(result.rows[0].match_count, 2);
+    }
+
+    /// Meta conversation messages must be excluded on both the window-function path
+    /// (empty/short query) and the FTS path. Regression guard for the
+    /// `is_meta_conversation = FALSE` predicate in both SQL branches.
+    #[test]
+    fn test_search_grouped_excludes_meta_conversation() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "sessA", "/proj", "A", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
+        insert_test_conversation(&conn, "sessM", "/proj", "only-meta", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+
+        // sessA: 1 normal + 1 meta (both contain "keyword").
+        insert_test_message_full(&conn, "a1", "sessA", "keyword alpha", "user",
+            "2025-01-15T11:00:00", "/proj", false, false);
+        insert_test_message_full(&conn, "a_meta", "sessA", "keyword alpha", "user",
+            "2025-01-15T10:30:00", "/proj", true, false);
+
+        // sessM: meta-only — must not appear in results at all.
+        insert_test_message_full(&conn, "m1", "sessM", "keyword alpha", "user",
+            "2025-01-15T10:00:00", "/proj", true, false);
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        // FTS path.
+        let result = searcher.search_grouped_by_session(
+            "keyword",
+            &SearchFilter { limit: 10, ..Default::default() },
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1, "sessM (meta-only) must be excluded");
+        assert_eq!(result.rows[0].representative.session_id, "sessA");
+        assert_eq!(result.rows[0].match_count, 1, "meta message must not inflate match_count");
+
+        // Window-function path (empty query).
+        let result = searcher.search_grouped_by_session(
+            "",
+            &SearchFilter { limit: 10, ..Default::default() },
+        ).unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].representative.session_id, "sessA");
+        assert_eq!(result.rows[0].match_count, 1);
+    }
+
+    /// `--days` and `--since/--until/--date` are mutually exclusive on the grouped
+    /// path too. Pins the validation so a future refactor can't silently drop it.
+    #[test]
+    fn test_search_grouped_days_with_since_errors() {
+        let conn = setup_test_db();
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let filter = SearchFilter {
+            days_back: Some(7),
+            since: Some("2025-01-01"),
+            limit: 10,
+            ..Default::default()
+        };
+        let err = searcher.search_grouped_by_session("anything", &filter).unwrap_err();
+        assert!(err.to_string().contains("Cannot use --days"));
+    }
+
+    /// Negative limit is rejected with a clear error — guards against silent
+    /// "full scan" behavior from `limit as usize` wrap or SQLite's "negative = unlimited"
+    /// interpretation.
+    #[test]
+    fn test_search_grouped_negative_limit_errors() {
+        let conn = setup_test_db();
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let err = searcher.search_grouped_by_session(
+            "anything",
+            &SearchFilter { limit: -1, ..Default::default() },
+        ).unwrap_err();
+        assert!(err.to_string().contains("limit must be >= 0"));
     }
 
     // ---- get_conversation_context tests ----
