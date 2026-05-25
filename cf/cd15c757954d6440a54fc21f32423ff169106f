@@ -1,3 +1,19 @@
+src/cli.rs
+  ai_agent 612-615,621,647-658,660-669,671-672,675-682,684,690-752
+.claude-plugin/marketplace.json
+  ai_agent 12
+bin/ai-conversation-search
+  ai_agent 8
+Cargo.toml
+  ai_agent 3
+.claude-plugin/plugin.json
+  ai_agent 3
+src/search.rs
+  ai_agent 204-218,606-765,1230-1244,1247-1248,1480-1685
+CHANGELOG.md
+  ai_agent 7-13
+Cargo.lock
+  ai_agent 16
 ---
 {
   "schema_version": "authorship/3.0.0",
