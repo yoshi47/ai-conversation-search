@@ -456,6 +456,22 @@ fn cmd_init(days: i64, force: bool, quiet: bool) -> Result<()> {
 fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
     let mut indexer = ConversationIndexer::new(db::DEFAULT_DB_PATH, quiet)?;
 
+    // Self-heal any conversations rows left orphaned by the pre-0.12.1 bug
+    // (message_count > 0 but no messages in DB). Cheap LEFT JOIN; in steady
+    // state returns 0 and stays silent. Err is logged even under --quiet so
+    // a corrupted DB doesn't fail invisibly.
+    match indexer.repair_orphan_conversations() {
+        Ok(0) => {}
+        Ok(n) => {
+            if !quiet {
+                eprintln!("Repaired {} orphan conversation row(s) — will re-index from JSONL", n);
+            }
+        }
+        Err(e) => {
+            eprintln!("Warning: orphan repair failed: {}", e);
+        }
+    }
+
     let days_back = if all { None } else { Some(days) };
     let files = indexer.scan_conversations(days_back);
 

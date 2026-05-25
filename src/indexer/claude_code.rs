@@ -853,40 +853,64 @@ impl ConversationIndexer {
 
     /// Index a single conversation file.
     pub fn index_conversation(&mut self, file_path: &Path) -> Result<()> {
-        // mtime-based skip: avoid re-parsing unchanged files
+        // mtime-based skip: avoid re-parsing unchanged files. If mtime is
+        // unavailable (permission denied, pre-1970 clock, deleted-mid-scan)
+        // we still attempt indexing — file_mtime = None signals "do not write
+        // sync_state", which forces a re-attempt on the next run. Logging the
+        // reason here prevents the previous silent-skip behavior where an
+        // entire project could become permanently unindexable on a transient
+        // stat error.
         let file_mtime = match file_path.metadata().and_then(|m| m.modified()) {
             Ok(t) => match t.duration_since(std::time::UNIX_EPOCH) {
-                Ok(d) => d.as_secs_f64(),
-                Err(_) => return self.do_index_conversation(file_path),
+                Ok(d) => Some(d.as_secs_f64()),
+                Err(e) => {
+                    // Use eprintln (not self.log) so users under --quiet still
+                    // see this — a missing mtime means we lose the ability to
+                    // skip on re-index and silently retry the same file every
+                    // single run. That deserves to surface.
+                    eprintln!(
+                        "Warning: cannot read mtime for {} (clock before UNIX epoch: {}), will re-attempt next run",
+                        file_path.display(),
+                        e
+                    );
+                    None
+                }
             },
-            Err(_) => return Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "Warning: cannot stat {}: {} — will re-attempt next run",
+                    file_path.display(),
+                    e
+                );
+                None
+            }
         };
 
-        if let Ok(existing_mtime) = self.conn.query_row(
-            "SELECT mtime FROM claude_code_sync_state WHERE file_path = ?",
-            [file_path.to_string_lossy().as_ref()],
-            |row| row.get::<_, f64>(0),
-        ) {
-            if (existing_mtime - file_mtime).abs() < 0.001 {
-                return Ok(());
+        if let Some(mtime) = file_mtime {
+            if let Ok(existing_mtime) = self.conn.query_row(
+                "SELECT mtime FROM claude_code_sync_state WHERE file_path = ?",
+                [file_path.to_string_lossy().as_ref()],
+                |row| row.get::<_, f64>(0),
+            ) {
+                if (existing_mtime - mtime).abs() < 0.001 {
+                    return Ok(());
+                }
             }
         }
 
-        let result = self.do_index_conversation(file_path);
-
-        // Only record sync state on success to avoid permanently skipping broken files
-        if result.is_ok() {
-            let _ = self.conn.execute(
-                "INSERT OR REPLACE INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
-                rusqlite::params![file_path.to_string_lossy().as_ref(), file_mtime],
-            );
-        }
-
-        result
+        // do_index_conversation writes sync_state inside its single transaction,
+        // so a failure leaves no orphaned conversation row AND no sync_state row,
+        // guaranteeing the file is retried on the next index run.
+        self.do_index_conversation(file_path, file_mtime)
     }
 
     /// Internal indexing logic for a single conversation file.
-    fn do_index_conversation(&mut self, file_path: &Path) -> Result<()> {
+    ///
+    /// `file_mtime` is recorded in `claude_code_sync_state` on success (inside
+    /// the same transaction as the conversation/messages writes). Pass `None`
+    /// when the mtime is unavailable; the index will still proceed but won't
+    /// be skipped on the next run.
+    fn do_index_conversation(&mut self, file_path: &Path, file_mtime: Option<f64>) -> Result<()> {
         self.log(&format!("Indexing: {}", file_path.display()));
 
         let (conv_meta, mut messages) = self.parse_conversation_file(file_path)?;
@@ -974,9 +998,28 @@ impl ConversationIndexer {
             .or_else(|| conv_meta.as_ref().and_then(|m| m.first_user_message.clone()))
             .unwrap_or_else(|| "Untitled conversation".to_string());
 
+        // Resolve repo_root before opening the write transaction — it shells
+        // out to `git` and writes to `repo_root_cache` via self.conn, which
+        // would conflict with the outer transaction we're about to open.
+        let repo_root =
+            self.resolve_repo_root(&project_path, Some(&file_path.to_string_lossy()));
+
+        // Pick root message (used only on the INSERT path).
+        let root_message_uuid = messages
+            .iter()
+            .find(|m| m.parent_uuid.is_none())
+            .map(|m| m.uuid.clone())
+            .unwrap_or_else(|| messages[0].uuid.clone());
+
+        // -------- single write transaction --------
+        // Conversation upsert, messages insert, and sync_state update all live
+        // in this tx so failure rolls back atomically and we never end up with
+        // an orphan conversations row (was the cause of the message_count > 0
+        // but messages = 0 bug).
+        let tx = self.conn.unchecked_transaction()?;
+
         // Check if already indexed
-        let existing: Option<String> = self
-            .conn
+        let existing: Option<String> = tx
             .query_row(
                 "SELECT indexed_at FROM conversations WHERE session_id = ?",
                 [&session_id],
@@ -993,13 +1036,18 @@ impl ConversationIndexer {
                 indexed_at
             ));
 
-            let mut stmt = self
-                .conn
-                .prepare("SELECT message_uuid FROM messages WHERE session_id = ?")?;
-            let existing_uuids: HashSet<String> = stmt
-                .query_map([&session_id], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
+            // Read the existing UUIDs with full error propagation. Silently
+            // dropping a row here would make that message look "new" on the
+            // next pass and re-insert it, inflating duplicate counts. Worse,
+            // the message could end up attributed to a different session.
+            let existing_uuids: HashSet<String> = {
+                let mut stmt = tx
+                    .prepare("SELECT message_uuid FROM messages WHERE session_id = ?")?;
+                let rows: rusqlite::Result<HashSet<String>> = stmt
+                    .query_map([&session_id], |row| row.get(0))?
+                    .collect();
+                rows?
+            };
 
             let new_messages: Vec<&Message> = messages
                 .iter()
@@ -1008,6 +1056,14 @@ impl ConversationIndexer {
 
             if new_messages.is_empty() {
                 self.log("  No new messages, skipping");
+                // Still record sync_state so we don't re-parse unchanged file.
+                if let Some(mtime) = file_mtime {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
+                        rusqlite::params![file_path.to_string_lossy().as_ref(), mtime],
+                    )?;
+                }
+                tx.commit()?;
                 return Ok(());
             }
 
@@ -1017,12 +1073,15 @@ impl ConversationIndexer {
                 messages.len()
             ));
 
-            // Update conversation metadata (including summary and project_path)
-            self.conn.execute(
-                "UPDATE conversations SET last_message_at = ?, message_count = ?, leaf_message_uuid = ?, conversation_summary = ?, project_path = ?, indexed_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+            // Update conversation metadata. message_count is set to 0 here as a
+            // placeholder; the real value is computed via COUNT(*) after the
+            // message INSERTs below (since INSERT OR IGNORE may skip rows whose
+            // UUIDs already exist under a different session_id — Claude Code
+            // resume sessions re-emit parent messages).
+            tx.execute(
+                "UPDATE conversations SET last_message_at = ?, message_count = 0, leaf_message_uuid = ?, conversation_summary = ?, project_path = ?, indexed_at = CURRENT_TIMESTAMP WHERE session_id = ?",
                 rusqlite::params![
                     messages.last().and_then(|m| m.timestamp.as_ref()),
-                    (existing_uuids.len() + new_messages.len()) as i64,
                     conv_meta.as_ref().and_then(|m| m.leaf_uuid.as_ref()),
                     conversation_summary,
                     project_path,
@@ -1033,27 +1092,20 @@ impl ConversationIndexer {
             is_update = true;
             messages_to_insert = new_messages.into_iter().cloned().collect::<Vec<_>>();
         } else {
-            // New conversation
-            let root_message = messages
-                .iter()
-                .find(|m| m.parent_uuid.is_none())
-                .unwrap_or(&messages[0]);
-            let repo_root =
-                self.resolve_repo_root(&project_path, Some(&file_path.to_string_lossy()));
-
-            self.conn.execute(
-                "INSERT INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            // New conversation. message_count placeholder is 0; corrected after
+            // message INSERTs via COUNT(*) (see comment in the UPDATE branch).
+            tx.execute(
+                "INSERT INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
                 rusqlite::params![
                     session_id,
                     project_path,
                     repo_root,
                     file_path.to_string_lossy(),
-                    root_message.uuid,
+                    root_message_uuid,
                     conv_meta.as_ref().and_then(|m| m.leaf_uuid.as_ref()),
                     conversation_summary,
                     messages[0].timestamp,
                     messages.last().and_then(|m| m.timestamp.as_ref()),
-                    messages.len() as i64,
                 ],
             )?;
 
@@ -1068,30 +1120,75 @@ impl ConversationIndexer {
             .map(|m| m.uuid.clone())
             .collect();
 
-        // Insert messages
-        {
-            let tx = self.conn.unchecked_transaction()?;
-            for message in &messages_to_insert {
-                tx.execute(
-                    "INSERT INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    rusqlite::params![
-                        message.uuid,
-                        session_id,
-                        message.parent_uuid,
-                        message.is_sidechain,
-                        depths.get(&message.uuid).unwrap_or(&0),
-                        message.timestamp,
-                        message.message_type,
-                        project_path,
-                        file_path.to_string_lossy(),
-                        message.content,
-                        message.is_meta_conversation,
-                        tool_noise_uuids.contains(&message.uuid),
-                    ],
-                )?;
-            }
-            tx.commit()?;
+        // Insert messages. INSERT OR IGNORE handles the legitimate case of
+        // Claude Code resume sessions re-emitting parent messages with the
+        // same global message_uuid under a new session_id. Message content is
+        // immutable, so keeping the original row and skipping the duplicate is
+        // correct. Do NOT replace this with plain INSERT — it will fail on
+        // PRIMARY KEY violation and roll the whole transaction back, which is
+        // exactly the bug we're fixing here.
+        for message in &messages_to_insert {
+            tx.execute(
+                "INSERT OR IGNORE INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                rusqlite::params![
+                    message.uuid,
+                    session_id,
+                    message.parent_uuid,
+                    message.is_sidechain,
+                    depths.get(&message.uuid).unwrap_or(&0),
+                    message.timestamp,
+                    message.message_type,
+                    project_path,
+                    file_path.to_string_lossy(),
+                    message.content,
+                    message.is_meta_conversation,
+                    tool_noise_uuids.contains(&message.uuid),
+                ],
+            )?;
         }
+
+        // Recompute message_count from the actual rows in messages. This is
+        // the single source of truth and correctly accounts for OR IGNORE skips.
+        let actual_count: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM messages WHERE session_id = ?",
+            [&session_id],
+            |row| row.get(0),
+        )?;
+
+        // Edge case: a fresh INSERT where every parsed message UUID collided
+        // with an existing row in another session (Claude Code resume where
+        // the sister session was indexed first). The content is already
+        // searchable under the sister session_id; keeping a 0-message conv
+        // row here would be misleading metadata that show up in `list` but
+        // be invisible to content search. Drop it. We still write sync_state
+        // below so we don't re-parse this file on every subsequent index run.
+        let dropped_ghost = !is_update && actual_count == 0;
+        if dropped_ghost {
+            tx.execute(
+                "DELETE FROM conversations WHERE session_id = ?",
+                [&session_id],
+            )?;
+            self.log(&format!(
+                "  All {} messages already attributed to a sister session — dropping empty conversation row",
+                messages_to_insert.len()
+            ));
+        } else {
+            tx.execute(
+                "UPDATE conversations SET message_count = ? WHERE session_id = ?",
+                rusqlite::params![actual_count, &session_id],
+            )?;
+        }
+
+        // Record sync_state inside the same tx so it never gets ahead of the
+        // actual data on disk.
+        if let Some(mtime) = file_mtime {
+            tx.execute(
+                "INSERT OR REPLACE INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
+                rusqlite::params![file_path.to_string_lossy().as_ref(), mtime],
+            )?;
+        }
+
+        tx.commit()?;
 
         if !tool_noise_uuids.is_empty() {
             self.log(&format!(
@@ -1100,13 +1197,74 @@ impl ConversationIndexer {
             ));
         }
 
-        if is_update {
+        if dropped_ghost {
+            // Already logged the drop above; suppress the misleading
+            // "Indexed N messages" footer.
+        } else if is_update {
             self.log(&format!("  Added {} new messages", messages_to_insert.len()));
         } else {
             self.log(&format!("  Indexed {} messages", messages_to_insert.len()));
         }
 
         Ok(())
+    }
+
+    /// Repair conversations rows whose message rows are missing.
+    ///
+    /// Background: a pre-0.12.1 bug could leave `conversations` rows with
+    /// `message_count > 0` but no rows in `messages` (failed message INSERT
+    /// rolled back while the conversations row was already committed). Such
+    /// rows are invisible to content search even though `list` returns them.
+    ///
+    /// This deletes the orphaned conversations rows plus their sync_state
+    /// entries, so the next index run re-parses the JSONL from scratch. Now
+    /// that the indexer is transactional, freshly-indexed conversations cannot
+    /// re-enter this state.
+    ///
+    /// Returns the number of conversations repaired.
+    pub fn repair_orphan_conversations(&mut self) -> Result<usize> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Collect orphan session_ids and their conversation_file paths.
+        // Full error propagation (not filter_map) so a schema drift surfaces
+        // immediately instead of silently under-reporting.
+        let orphans: Vec<(String, Option<String>)> = {
+            let mut stmt = tx.prepare(
+                "SELECT c.session_id, c.conversation_file
+                 FROM conversations c
+                 LEFT JOIN messages m ON m.session_id = c.session_id
+                 WHERE c.message_count > 0
+                 GROUP BY c.session_id
+                 HAVING COUNT(m.message_uuid) = 0",
+            )?;
+            let rows: rusqlite::Result<Vec<_>> = stmt
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })?
+                .collect();
+            rows?
+        };
+
+        if orphans.is_empty() {
+            return Ok(0);
+        }
+
+        for (session_id, conv_file) in &orphans {
+            self.log(&format!("  Repairing orphan session {}", session_id));
+            if let Some(path) = conv_file {
+                tx.execute(
+                    "DELETE FROM claude_code_sync_state WHERE file_path = ?",
+                    [path],
+                )?;
+            }
+            tx.execute(
+                "DELETE FROM conversations WHERE session_id = ?",
+                [session_id],
+            )?;
+        }
+
+        tx.commit()?;
+        Ok(orphans.len())
     }
 
     /// Index all conversations from the last N days.
@@ -1470,5 +1628,437 @@ mod tests {
         assert!(meta.summary.is_none());
         assert!(meta.custom_title.is_none());
         assert_eq!(meta.first_user_message.as_deref(), Some("First question"));
+    }
+
+    /// Write a JSONL file inside `dir` and return its path. Unlike
+    /// `write_temp_jsonl` this keeps the file in a real (named) directory so
+    /// the indexer's project_path derivation has something to work with.
+    fn write_jsonl_in_dir(
+        dir: &std::path::Path,
+        name: &str,
+        lines: &[&str],
+    ) -> std::path::PathBuf {
+        let path = dir.join(format!("{}.jsonl", name));
+        let mut f = std::fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+        f.flush().unwrap();
+        f.sync_all().unwrap();
+        path
+    }
+
+    /// Phase 2-2 / 2-3 regression: Claude Code resume sessions re-emit parent
+    /// messages with the same `message_uuid` under a new `session_id`. Without
+    /// `INSERT OR IGNORE` the second indexing fails on PRIMARY KEY collision
+    /// and (pre-fix) leaves an orphan conversations row. With the fix:
+    ///   - both conversations rows exist
+    ///   - duplicated messages stay attributed to the first session
+    ///   - `message_count` reflects the actual COUNT(*) per session, not the
+    ///     parsed JSONL length
+    ///   - search content (FTS) for the new messages is reachable
+    #[test]
+    fn test_resume_session_with_shared_uuids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
+
+        let proj = dir.path();
+
+        // Session A: 3 messages.
+        let file_a = write_jsonl_in_dir(proj, "sessA", &[
+            r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessA","message":{"role":"user","content":"Initial question about pdf rendering"}}"#,
+            r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessA","message":{"role":"assistant","content":"Reply about pdf"}}"#,
+            r#"{"uuid":"u3","parentUuid":"u2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessA","message":{"role":"user","content":"Follow-up in A"}}"#,
+        ]);
+        indexer.index_conversation(&file_a).unwrap();
+
+        // Session B: a resume of A. It re-emits u1, u2, u3 (same UUIDs) and
+        // appends two new messages u4, u5. The new messages contain the
+        // distinctive token "devbox-needle" so we can verify they're FTS-able.
+        let file_b = write_jsonl_in_dir(proj, "sessB", &[
+            r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"Initial question about pdf rendering"}}"#,
+            r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessB","message":{"role":"assistant","content":"Reply about pdf"}}"#,
+            r#"{"uuid":"u3","parentUuid":"u2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"Follow-up in A"}}"#,
+            r#"{"uuid":"u4","parentUuid":"u3","isSidechain":false,"timestamp":"2025-01-15T11:00:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"devbox-needle question"}}"#,
+            r#"{"uuid":"u5","parentUuid":"u4","isSidechain":false,"timestamp":"2025-01-15T11:01:00Z","type":"assistant","sessionId":"sessB","message":{"role":"assistant","content":"devbox-needle answer"}}"#,
+        ]);
+        indexer.index_conversation(&file_b).unwrap();
+
+        let conn = indexer.connection();
+
+        // Both conversations rows exist.
+        let conv_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(conv_count, 2, "expected 2 conversation rows");
+
+        // Duplicate UUIDs stayed attributed to A.
+        let msgs_under_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'sessA'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let msgs_under_b: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'sessB'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msgs_under_a, 3, "session A keeps its 3 original messages");
+        assert_eq!(msgs_under_b, 2, "session B only owns the new u4, u5 after OR IGNORE");
+
+        // message_count reflects COUNT(*), not parsed JSONL length.
+        let conv_a_count: i64 = conn
+            .query_row(
+                "SELECT message_count FROM conversations WHERE session_id = 'sessA'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let conv_b_count: i64 = conn
+            .query_row(
+                "SELECT message_count FROM conversations WHERE session_id = 'sessB'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conv_a_count, 3);
+        assert_eq!(conv_b_count, 2, "must NOT be 5 — INSERT OR IGNORE skipped u1-u3");
+
+        // FTS finds the new devbox-needle content.
+        let fts_hit: i64 = conn
+            .query_row(
+                // Wrap in double-quotes because FTS5 treats `-` as the column
+                // negation operator otherwise.
+                r#"SELECT COUNT(*) FROM message_content_fts WHERE message_content_fts MATCH '"devbox-needle"'"#,
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(fts_hit >= 2, "FTS should find both u4 and u5 (got {})", fts_hit);
+
+        // Both files have a sync_state entry.
+        let sync_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_sync_state",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sync_count, 2);
+    }
+
+    /// Phase 2-1 regression: after a successful index, the conversations row,
+    /// the messages rows, and the sync_state entry are all in place — and
+    /// `conversations.message_count` equals the actual COUNT(*).
+    /// This is the invariant that guarantees content search can find the
+    /// session; it's broken when transaction atomicity is broken.
+    #[test]
+    fn test_index_creates_consistent_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
+
+        let file = write_jsonl_in_dir(dir.path(), "session1", &[
+            r#"{"uuid":"x1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"hello"}}"#,
+            r#"{"uuid":"x2","parentUuid":"x1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess1","message":{"role":"assistant","content":"world"}}"#,
+        ]);
+        indexer.index_conversation(&file).unwrap();
+
+        let conn = indexer.connection();
+
+        // No orphans: every conv row's message_count matches its COUNT(*).
+        let inconsistent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT c.session_id
+                    FROM conversations c
+                    LEFT JOIN messages m ON m.session_id = c.session_id
+                    GROUP BY c.session_id
+                    HAVING c.message_count != COUNT(m.message_uuid)
+                 )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inconsistent, 0, "post-index DB must have no orphan/skewed rows");
+
+        // sync_state was written inside the same transaction.
+        let sync_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_sync_state WHERE file_path = ?",
+                [file.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sync_count, 1, "sync_state must be recorded on success");
+
+        let conv_count: i64 = conn
+            .query_row(
+                "SELECT message_count FROM conversations WHERE session_id = 'sess1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conv_count, 2);
+    }
+
+    /// Reverse-order indexing must NOT leave an empty `conversations` row
+    /// behind. When session B (a resume of A) is indexed *before* A, all of
+    /// B's UUIDs land in `messages` first. Then when A is indexed, its
+    /// JSONL re-emits those same UUIDs, INSERT OR IGNORE skips them all,
+    /// and `actual_count` is 0. We must drop the fresh conv row instead of
+    /// keeping a ghost that's invisible to content search but shows up in
+    /// `list`. The content for A is still searchable — it lives under B's
+    /// session_id, which is the correct behavior given immutable messages.
+    #[test]
+    fn test_reverse_order_resume_drops_empty_conv_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
+
+        // B (the resume) — index it FIRST.
+        let file_b = write_jsonl_in_dir(dir.path(), "sessB_rev", &[
+            r#"{"uuid":"r1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessB_rev","message":{"role":"user","content":"shared content"}}"#,
+            r#"{"uuid":"r2","parentUuid":"r1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessB_rev","message":{"role":"assistant","content":"shared reply"}}"#,
+            r#"{"uuid":"r3","parentUuid":"r2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessB_rev","message":{"role":"user","content":"shared followup"}}"#,
+        ]);
+        indexer.index_conversation(&file_b).unwrap();
+
+        // A (the original) — same UUIDs, but indexed SECOND.
+        let file_a = write_jsonl_in_dir(dir.path(), "sessA_rev", &[
+            r#"{"uuid":"r1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessA_rev","message":{"role":"user","content":"shared content"}}"#,
+            r#"{"uuid":"r2","parentUuid":"r1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessA_rev","message":{"role":"assistant","content":"shared reply"}}"#,
+            r#"{"uuid":"r3","parentUuid":"r2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessA_rev","message":{"role":"user","content":"shared followup"}}"#,
+        ]);
+        indexer.index_conversation(&file_a).unwrap();
+
+        let conn = indexer.connection();
+
+        // Only B's conv row should exist — A's was dropped because actual_count == 0.
+        let conv_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(conv_count, 1, "ghost A conv row must NOT remain");
+
+        let sessa_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = 'sessA_rev'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessa_exists, 0);
+
+        let sessb_count: i64 = conn
+            .query_row(
+                "SELECT message_count FROM conversations WHERE session_id = 'sessB_rev'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sessb_count, 3);
+
+        // sync_state for A's file IS recorded so we don't re-parse it forever.
+        let sync_a: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_sync_state WHERE file_path = ?",
+                [file_a.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sync_a, 1, "sync_state must be written even when conv row is dropped");
+
+        // Invariant: no orphan / no skewed rows.
+        let inconsistent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT c.session_id FROM conversations c
+                    LEFT JOIN messages m ON m.session_id = c.session_id
+                    GROUP BY c.session_id
+                    HAVING c.message_count != COUNT(m.message_uuid)
+                 )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inconsistent, 0);
+    }
+
+    /// Re-indexing the same file with the same mtime must be a no-op:
+    /// the mtime check at the top of `index_conversation` should short-circuit
+    /// before opening any transaction. Regression guard for the sync_state
+    /// fast-path.
+    #[test]
+    fn test_reindex_same_file_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
+
+        let file = write_jsonl_in_dir(dir.path(), "session1", &[
+            r#"{"uuid":"y1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"hi"}}"#,
+            r#"{"uuid":"y2","parentUuid":"y1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess1","message":{"role":"assistant","content":"hello"}}"#,
+        ]);
+
+        indexer.index_conversation(&file).unwrap();
+        // Snapshot indexed_at to detect whether the second call updated the row.
+        let first_indexed_at: String = indexer
+            .connection()
+            .query_row(
+                "SELECT indexed_at FROM conversations WHERE session_id = 'sess1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        // SQLite CURRENT_TIMESTAMP has 1-second resolution; sleep enough to
+        // make any UPDATE observable.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        // Second index of the same file: mtime unchanged, must be a no-op.
+        indexer.index_conversation(&file).unwrap();
+
+        let conn = indexer.connection();
+        let msg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = 'sess1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 2, "must not duplicate messages on re-index");
+
+        let second_indexed_at: String = conn
+            .query_row(
+                "SELECT indexed_at FROM conversations WHERE session_id = 'sess1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            first_indexed_at, second_indexed_at,
+            "no-op re-index must NOT bump indexed_at (mtime fast-path)"
+        );
+    }
+
+    /// UPDATE path: existing session, file grew with new messages on disk.
+    /// Verifies the "incremental append" branch (existing conv row found,
+    /// new messages diffed via existing_uuids set) and that message_count
+    /// reflects the new total via COUNT(*).
+    #[test]
+    fn test_reindex_file_grew_updates_incrementally() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
+
+        let path = dir.path().join("grow.jsonl");
+
+        // First write: 2 messages.
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, r#"{{"uuid":"g1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"grow","message":{{"role":"user","content":"q1"}}}}"#).unwrap();
+            writeln!(f, r#"{{"uuid":"g2","parentUuid":"g1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"grow","message":{{"role":"assistant","content":"a1"}}}}"#).unwrap();
+            f.sync_all().unwrap();
+        }
+        indexer.index_conversation(&path).unwrap();
+
+        // Wait a beat then append 2 more messages and bump mtime.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            writeln!(f, r#"{{"uuid":"g3","parentUuid":"g2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"grow","message":{{"role":"user","content":"q2"}}}}"#).unwrap();
+            writeln!(f, r#"{{"uuid":"g4","parentUuid":"g3","isSidechain":false,"timestamp":"2025-01-15T10:03:00Z","type":"assistant","sessionId":"grow","message":{{"role":"assistant","content":"a2"}}}}"#).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        indexer.index_conversation(&path).unwrap();
+
+        let conn = indexer.connection();
+        let msg_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = 'grow'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msg_count, 4, "all 4 messages must be present after grow + reindex");
+
+        let conv_count: i64 = conn
+            .query_row(
+                "SELECT message_count FROM conversations WHERE session_id = 'grow'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(conv_count, 4, "message_count must match COUNT(*) post-update");
+
+        // Invariant: no orphans, no skew.
+        let inconsistent: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                    SELECT c.session_id FROM conversations c
+                    LEFT JOIN messages m ON m.session_id = c.session_id
+                    GROUP BY c.session_id
+                    HAVING c.message_count != COUNT(m.message_uuid)
+                 )",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(inconsistent, 0);
+    }
+
+    /// Phase 2-4 regression: `repair_orphan_conversations` cleans up rows left
+    /// behind by the pre-0.12.1 bug (conversations row with message_count > 0
+    /// but no messages) and removes the matching sync_state entry so the file
+    /// will be re-parsed.
+    #[test]
+    fn test_repair_orphan_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db").to_string_lossy().to_string();
+        let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
+
+        // Index one healthy session so we have a non-orphan to leave alone.
+        let healthy = write_jsonl_in_dir(dir.path(), "healthy", &[
+            r#"{"uuid":"h1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"healthy","message":{"role":"user","content":"keep me"}}"#,
+        ]);
+        indexer.index_conversation(&healthy).unwrap();
+
+        // Manually inject orphans that mimic the pre-fix bug.
+        let orphan_file = dir.path().join("orphan1.jsonl").to_string_lossy().to_string();
+        let conn = indexer.connection();
+        conn.execute(
+            "INSERT INTO conversations (session_id, project_path, conversation_file, conversation_summary, first_message_at, last_message_at, message_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params!["orphan1", "/p", &orphan_file, "ghost", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z", 42_i64],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
+            rusqlite::params![&orphan_file, 1234567890.0_f64],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO conversations (session_id, project_path, conversation_file, conversation_summary, first_message_at, last_message_at, message_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params!["orphan2", "/p", "/tmp/nofile.jsonl", "ghost2", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z", 7_i64],
+        ).unwrap();
+
+        // Sanity: 3 conversations now (1 healthy + 2 orphans).
+        let pre: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0)).unwrap();
+        assert_eq!(pre, 3);
+
+        let repaired = indexer.repair_orphan_conversations().unwrap();
+        assert_eq!(repaired, 2);
+
+        let conn = indexer.connection();
+        let post: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0)).unwrap();
+        assert_eq!(post, 1, "only the healthy row should remain");
+
+        // sync_state for the orphan file should be gone (so re-index will re-parse).
+        let sync_orphan: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_sync_state WHERE file_path = ?",
+                [&orphan_file],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sync_orphan, 0);
+
+        // Calling repair again is a no-op.
+        assert_eq!(indexer.repair_orphan_conversations().unwrap(), 0);
     }
 }

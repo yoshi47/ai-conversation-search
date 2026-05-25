@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.1] - 2026-05-25
+
+### Fixed
+
+- 会話インデックスのアトミック性を修正: 単一トランザクション化により `conversations.message_count > 0` なのに `messages` テーブルにレコードがない孤立行が発生するバグを解消
+- Claude Code の resume セッションが同一 `message_uuid` を再エミットした際の PRIMARY KEY 衝突を `INSERT OR IGNORE` で安全に処理（衝突によりトランザクション全体がロールバックする問題を回避）
+- `index` 実行時に既存 DB の孤立 conversation 行を自動修復（`repair_orphan_conversations`）。次回 index で JSONL から再構築される
+- ファイル mtime 取得失敗時に永久スキップせず次回再試行するよう変更（理由をログ出力）
+- `message_count` をパース時の JSONL 行数ではなく実 INSERT 後の `COUNT(*)` から再計算
+
 ## [0.12.0] - 2026-04-23
 
 ### Added
