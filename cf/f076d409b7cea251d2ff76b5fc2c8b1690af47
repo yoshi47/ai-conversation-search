@@ -1,0 +1,55 @@
+.claude-plugin/plugin.json
+  s_103a554060dc25::t_d896e66efee193 3
+Cargo.toml
+  s_103a554060dc25::t_d896e66efee193 3
+src/cli.rs
+  s_103a554060dc25::t_5edd841f30fa48 459-460,463-470,472-474
+  s_103a554060dc25::t_7994fa490636bc 461-462,471
+CHANGELOG.md
+  s_b4a77cb7e1dabd::t_bc828325c8fdc8 7-16
+src/indexer/claude_code.rs
+  s_103a554060dc25::t_cebe83954c453e 1892-2007
+  s_103a554060dc25::t_48c14fee7f0917 1157-1180
+  s_103a554060dc25::t_431e51aaaa047a 1212-1224,1226-1228,1247-1252,1254-1269
+  s_103a554060dc25::t_6d66d09d62932e 856,865,889-897,901-904
+  s_103a554060dc25::t_72813a7bc9574c 867-872,875,880-881,884
+  s_103a554060dc25::t_7ae49036dbc343 1225
+  s_103a554060dc25::t_cbebeb8b5a5426 1810-1891
+  s_103a554060dc25::t_983208afb7d539 1229-1246,1253
+  s_103a554060dc25::t_b3828af4ee7395 1200-1203
+  s_103a554060dc25::t_94dc6b90855fc8 908-913
+  s_103a554060dc25::t_b0d7338a0faa26 1039-1042,1046,1049
+  s_103a554060dc25::t_1ae5c1ef2e8736 1047-1048
+  s_103a554060dc25::t_c4167932129062 1001-1020,1022,1043-1045,1050,1059-1066,1076-1082,1095-1098,1104,1123-1147,1150-1156,1181-1191
+  s_103a554060dc25::t_bd2ff3bae8e5e8 1632-1734,1738-1809,2008-2063
+  s_103a554060dc25::t_c724957c237e1e 857-862,866,873-874,876-877,879,882-883,885-886
+  s_103a554060dc25::t_f62a1f237dd954 1735-1737
+.claude-plugin/marketplace.json
+  s_103a554060dc25::t_d896e66efee193 12
+bin/ai-conversation-search
+  s_103a554060dc25::t_d896e66efee193 8
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.0",
+  "base_commit_sha": "cff076d409b7cea251d2ff76b5fc2c8b1690af47",
+  "prompts": {},
+  "sessions": {
+    "s_103a554060dc25": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "bcc52cfa-6e05-47d0-81e3-86b115a576ef",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>"
+    },
+    "s_b4a77cb7e1dabd": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "61b7a5c7-570c-493b-96ea-6e7e4ffcbdec",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>"
+    }
+  }
+}
