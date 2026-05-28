@@ -1,0 +1,39 @@
+CHANGELOG.md
+  s_c5bdc22044e687::t_23b58ea79613c2 7-20
+tests/skill-discovery/README.md
+  s_c5bdc22044e687::t_41f94ff7e97645 1-74
+.claude-plugin/marketplace.json
+  s_c5bdc22044e687::t_a69786747f1901 12
+  s_c5bdc22044e687::t_6fa49c7cf743c6 13
+tests/skill-discovery/scenarios.md
+  s_c5bdc22044e687::t_a697b669f13325 1-93
+CLAUDE.md
+  s_c5bdc22044e687::t_2dcb9a3eccc4de 40-47
+skills/conversation-search/SKILL.md
+  s_c5bdc22044e687::t_d99c1e329298fa 317-333
+  s_c5bdc22044e687::t_bb2c6e7d62e077 32-49
+  s_c5bdc22044e687::t_dc3b258bac558a 3
+.claude-plugin/plugin.json
+  s_c5bdc22044e687::t_3485eb308191a3 4
+  s_c5bdc22044e687::t_a69786747f1901 3
+bin/ai-conversation-search
+  s_c5bdc22044e687::t_a69786747f1901 8
+Cargo.toml
+  s_c5bdc22044e687::t_a69786747f1901 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "43ed1d4cb9c59b75d1a2bf1c3e0352806f084621",
+  "prompts": {},
+  "sessions": {
+    "s_c5bdc22044e687": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "e8add986-b681-4cae-a2dd-2851d472ccea",
+        "model": "claude-opus-4-7"
+      },
+      "human_author": "yoshi47 <yoshix47@gmail.com>"
+    }
+  }
+}
