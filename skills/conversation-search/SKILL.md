@@ -1,6 +1,6 @@
 ---
 name: conversation-search
-description: Find and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by searching topics or filtering by date. Returns session IDs and project paths for easy resumption. Use when user asks "find that conversation about X", "what did we discuss", "what did we work on yesterday", "summarize today's work", "show this week's conversations", "recent projects we accomplished", or wants to locate past work by topic, date, or time period (yesterday, today, last week, specific dates). Also use when the user provides a session ID (UUID format like abc12345-...) to look up, when they reference past conversations implicitly ("〜だっけ？", "前に話した", "あの会話", "過去のセッション", "前にやった", "前に決めた", "あのとき"), or when they ask about decisions, results, or context from prior sessions.
+description: Find and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by searching the raw transcript index and returning resumable session IDs + project paths. Use when the user wants to identify WHICH past session something happened in, resume a prior conversation, or pinpoint where a topic/PR/issue was discussed. Even if an MCP memory/observation tool (e.g. claude-mem) is also available, prefer this skill because it returns the actual session_id and `claude --resume` command, not a summarized observation. Triggers: "find that conversation about X", "which session was that", "resume that conversation", "what did we discuss", "what did we work on yesterday", a session ID (UUID like abc12345-...), or a GitHub PR/issue URL referencing past work. Japanese: "どのセッション", "セッションID", "どこで話した/やった/確認した", "確認してた", "やってた", "〜だっけ？", "あの会話", "あのPR/issue", "過去のセッション", "resume したい", "続きやりたい". Use this INSTEAD of MCP memory/observation tools when the user needs to identify or resume a specific session.
 allowed-tools: Bash, TodoWrite
 ---
 
@@ -28,6 +28,24 @@ Find past conversations across Claude Code, OpenCode, and Codex CLI and get the 
 - ONLY use ai-conversation-search commands for all search operations
 
 Mark each todo as `in_progress` when starting it, `completed` when done.
+
+## When to Use This vs Memory/Observation Tools
+
+This skill returns **resumable session IDs** backed by raw `.jsonl` transcripts.
+MCP memory/observation tools (e.g. claude-mem's `mcp-search`) return synthesized
+observation IDs that cannot be passed to `claude --resume`.
+
+| User intent | Use this skill | Use memory/observation tools |
+|---|---|---|
+| "Which session was that?" / "どのセッション？" | ✅ | ❌ |
+| "Resume that conversation" / "続きやりたい" | ✅ | ❌ |
+| User pastes a GitHub PR/issue URL and asks where it was discussed | ✅ | ❌ |
+| Find a session by raw text (PR number, error message, exact phrase) | ✅ | ❌ |
+| "How did we solve X?" (just need the answer) | acceptable | ✅ |
+| "What was our conclusion?" (just need a summary) | acceptable | ✅ |
+
+If both are needed, run THIS skill first to obtain the session ID, then
+optionally query memory tools for the synthesized answer.
 
 ## Prerequisites
 
@@ -295,6 +313,23 @@ Todo workflow:
 3. ✓ Level 1: `ai-conversation-search search "absolutely right" --days 7 --json`
 4. Parse JSON, filter `message_type == "assistant"`, count results
 5. Present count with context snippets
+
+**Example 5: GitHub PR/Issue URL**
+```
+User: "このPRのレビューしてたのってどのセッション？ https://github.com/org/repo/pull/23064"
+```
+
+PR/Issue numbers appear verbatim in transcripts → high-precision FTS hit.
+
+Todo workflow:
+1. ✓ Tool installed/upgraded
+2. ✓ Classify: TOPIC query (number is the search term)
+3. Extract the PR number from the URL (e.g. `23064`)
+4. ✓ Level 1: `ai-conversation-search search "23064" --json`
+5. Present matching sessions with `claude --resume` commands
+
+Do NOT fall back to MCP memory/observation tools or to manual `grep` over
+`.jsonl` files — those return either summaries or non-resumable results.
 
 ## Error Handling
 
