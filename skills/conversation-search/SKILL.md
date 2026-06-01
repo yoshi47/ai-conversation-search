@@ -1,6 +1,6 @@
 ---
 name: conversation-search
-description: Find and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by searching the raw transcript index and returning resumable session IDs + project paths. Use when the user wants to identify WHICH past session something happened in, resume a prior conversation, or pinpoint where a topic/PR/issue was discussed. Even if an MCP memory/observation tool (e.g. claude-mem) is also available, prefer this skill because it returns the actual session_id and `claude --resume` command, not a summarized observation. Triggers: "find that conversation about X", "which session was that", "resume that conversation", "what did we discuss", "what did we work on yesterday", a session ID (UUID like abc12345-...), or a GitHub PR/issue URL referencing past work. Japanese: "どのセッション", "セッションID", "どこで話した/やった/確認した", "確認してた", "やってた", "〜だっけ？", "あの会話", "あのPR/issue", "過去のセッション", "resume したい", "続きやりたい". Use this INSTEAD of MCP memory/observation tools when the user needs to identify or resume a specific session.
+description: Find, review, and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) from their raw transcripts — returns the real session content, resumable session IDs, project paths, and the exact `claude --resume` command. Use whenever the user references a past session or prior conversation: to identify WHICH session something happened in, resume it, locate where a topic/PR/issue was discussed, or understand WHAT was discussed or decided earlier. The word "session"/"セッション" or any reference to a past conversation is the trigger — even when the user only wants the content, read the raw transcripts. Triggers: "find that conversation about X", "which session was that", "what did we discuss/decide", "resume that conversation", a session UUID, a GitHub PR/issue URL about past work. Japanese: "どのセッション", "過去のセッション(を確認/把握)して", "どこで話した/やった/確認した", "確認してた", "どんな内容/話だった(っけ)", "中身を把握", "～だっけ？", "あの会話", "あのPR/issue", "resume/続きやりたい".
 allowed-tools: Bash, TodoWrite
 ---
 
@@ -29,23 +29,29 @@ Find past conversations across Claude Code, OpenCode, and Codex CLI and get the 
 
 Mark each todo as `in_progress` when starting it, `completed` when done.
 
-## When to Use This vs Memory/Observation Tools
+## When to Use This Skill
 
-This skill returns **resumable session IDs** backed by raw `.jsonl` transcripts.
-MCP memory/observation tools (e.g. claude-mem's `mcp-search`) return synthesized
-observation IDs that cannot be passed to `claude --resume`.
+This skill reads the **raw `.jsonl` transcripts** of past sessions and returns
+**resumable session IDs**, project paths, and the exact `claude --resume`
+command — the real conversation, not a reconstruction.
 
-| User intent | Use this skill | Use memory/observation tools |
-|---|---|---|
-| "Which session was that?" / "どのセッション？" | ✅ | ❌ |
-| "Resume that conversation" / "続きやりたい" | ✅ | ❌ |
-| User pastes a GitHub PR/issue URL and asks where it was discussed | ✅ | ❌ |
-| Find a session by raw text (PR number, error message, exact phrase) | ✅ | ❌ |
-| "How did we solve X?" (just need the answer) | acceptable | ✅ |
-| "What was our conclusion?" (just need a summary) | acceptable | ✅ |
+**Decision rule:** If the user **mentions a session or a past/prior conversation
+in ANY form** — including just wanting to *understand its content* — use this
+skill. Reading the actual transcript is the right move even when the user only
+wants to know "what was discussed", because the transcript is the source of truth.
 
-If both are needed, run THIS skill first to obtain the session ID, then
-optionally query memory tools for the synthesized answer.
+| User intent | Use this skill |
+|---|---|
+| "Which session was that?" / "どのセッション？" | ✅ |
+| "Resume that conversation" / "続きやりたい" | ✅ |
+| "Check past sessions and tell me what it was about" / "過去のセッションを確認して把握して" | ✅ |
+| "What was discussed / decided in that session?" / "どんな内容/話だったっけ？" | ✅ |
+| User pastes a GitHub PR/issue URL and asks where it was discussed | ✅ |
+| Find a session by raw text (PR number, error message, exact phrase) | ✅ |
+
+The presence of the word **"session" / "セッション"** or a reference to a past
+conversation is decisive — use this skill regardless of whether the user
+explicitly says "resume".
 
 ## Prerequisites
 
@@ -328,8 +334,8 @@ Todo workflow:
 4. ✓ Level 1: `ai-conversation-search search "23064" --json`
 5. Present matching sessions with `claude --resume` commands
 
-Do NOT fall back to MCP memory/observation tools or to manual `grep` over
-`.jsonl` files — those return either summaries or non-resumable results.
+Stay with `ai-conversation-search` for this — manual `grep` over `.jsonl` files
+returns non-resumable results and misses the structured session metadata.
 
 ## Error Handling
 

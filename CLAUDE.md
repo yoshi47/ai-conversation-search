@@ -41,9 +41,8 @@ This builds binaries for macOS (arm64/x86_64) and Linux (x86_64) and uploads the
 
 Before pushing a release tag, run at least one scenario from
 `tests/skill-discovery/scenarios.md` in a fresh Claude Code session to verify
-that the `conversation-search` skill is selected over competing memory /
-observation MCP tools (e.g. claude-mem). See `tests/skill-discovery/README.md`
-for the full procedure.
+that the `conversation-search` skill is selected for those prompts.
+See `tests/skill-discovery/README.md` for the full procedure.
 
 # Testing
 

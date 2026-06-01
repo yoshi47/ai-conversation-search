@@ -8,10 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- `conversation-search` スキルの frontmatter description を強化（claude-mem 等の memory/observation 系 MCP ツールとの差別化文言を追加、「どのセッション」「セッションID」「どこで話した/やった/確認した」「続きやりたい」など実発話パターンの日本語トリガーと GitHub PR/issue URL トリガーを追記。1024 chars 上限内に収まるよう調整）
+- `conversation-search` スキルの frontmatter description を強化（「どのセッション」「セッションID」「どこで話した/やった/確認した」「続きやりたい」など実発話パターンの日本語トリガーと GitHub PR/issue URL トリガーを追記。1024 chars 上限内に収まるよう調整）
 - SKILL.md 本文に "When to Use This vs Memory/Observation Tools" セクションを追加し、resumable session ID が必要なケースと要約で十分なケースの使い分けを明示
 - SKILL.md の Examples に "Example 5: GitHub PR/Issue URL" を追加（PR/Issue 番号を `.jsonl` FTS に直接ぶつけるパターン）
-- `.claude-plugin/plugin.json` / `.claude-plugin/marketplace.json` の description を OpenCode/Codex 対応の文言に統一し、memory/observation ツールとの使い分けを明示
+- `.claude-plugin/plugin.json` / `.claude-plugin/marketplace.json` の description を OpenCode/Codex 対応の文言に統一
 
 ### Added
 

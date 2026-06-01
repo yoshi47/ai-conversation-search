@@ -1,7 +1,7 @@
 {
   "name": "conversation-search",
   "version": "0.12.2",
-  "description": "Find and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by searching raw transcripts. Returns resumable session IDs + project paths. Use instead of memory/observation tools when you need the actual session to resume, not a summary.",
+  "description": "Find, review, and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by reading their raw transcripts. Returns the real session content, resumable session IDs, project paths, and the exact resume command. Use whenever a past session or prior conversation is mentioned — to find which session it was, resume it, or understand what was discussed or decided.",
   "author": {
     "name": "yoshi47",
     "url": "https://github.com/yoshi47"
