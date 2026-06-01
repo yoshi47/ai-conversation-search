@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.3] - 2026-06-01
+
+### Changed
+
+- `conversation-search` スキルの frontmatter description を、スキル自身が何をするかだけで語る自己記述に書き直し（「過去のセッションを確認/把握して」「どんな内容/話だった(っけ)」「中身を把握」など内容把握目的の日本語トリガーを追記）。「セッション」という語が明示されたら resume 目的でなくてもこのスキルを使う、という判断基準を明確化
+- SKILL.md 本文の "When to Use" セクションを、生トランスクリプトを読むことの価値を中心とした記述に整理（判断テーブルを ✅ のみに簡素化）
+- `.claude-plugin/plugin.json` / `.claude-plugin/marketplace.json` の description を同方針で更新
+- `tests/skill-discovery/` のシナリオを、`conversation-search` が選択されるか・実トランスクリプトを読むかという観点に整理し、Scenario 5（内容把握目的で「過去のセッションを確認」）を追加
+
 ## [0.12.2] - 2026-05-28
 
 ### Changed
