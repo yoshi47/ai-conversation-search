@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.12.4] - 2026-06-11
+
+### Fixed
+
+- 日本語など multibyte コンテンツの検索スニペット抽出で char boundary panic が発生する問題を修正（`extract_snippet`/`find_term` を Unicode case-insensitive かつ char-boundary 安全な実装に書き直し）
+- `tree <session-id>` が孤児 conversation 行（v0.12.1 以前のバグ等で conversations 行はあるが messages が未登録）に対して空のツリーを返していた問題: raw JSONL トランスクリプトからツリーを構築するフォールバックを追加。malformed 行のスキップ数や記録メッセージ数との差分も warning で明示し、ファイル破損とセッション不一致を区別したエラーを返す
+- raw フォールバックと `repair_orphan_conversations` を claude_code source に限定（Codex/OpenCode の rollout ファイルを Claude Code スキーマで誤パースしたり、修復不能な行を削除したりしない）
+
+### Added
+
+- `status` に orphan conversation rows のカウントを追加（1件以上なら `index --all` での修復を stderr で案内）
+- `tree` の出力（JSON 含む）に `warning` フィールドを追加（raw フォールバック発動時の通知用）
+
+### Changed
+
+- README / SKILL.md: 手動インストールしたバイナリ（`~/.local/bin` / `~/.cargo/bin`）がプラグインラッパーを shadow して stale になる version drift の注意書きを追加
+- CI: release workflow の actions を Node 24 メジャー（checkout@v6, upload-artifact@v7, download-artifact@v8）へ bump
+
 ## [0.12.3] - 2026-06-01
 
 ### Changed
