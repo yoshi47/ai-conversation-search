@@ -567,13 +567,24 @@ impl ConversationIndexer {
         None
     }
 
-    /// Parse a conversation JSONL file.
-    pub fn parse_conversation_file(
-        &self,
+    /// Parse a conversation JSONL file without requiring a DB/indexer.
+    ///
+    /// Malformed lines are skipped without logging; the number of skipped
+    /// lines is returned so callers can surface partial reads. Use
+    /// `parse_conversation_file` when per-line diagnostics are needed.
+    pub(crate) fn parse_conversation_file_raw(
         file_path: &Path,
-    ) -> Result<(Option<ConversationMeta>, Vec<Message>)> {
+    ) -> Result<(Option<ConversationMeta>, Vec<Message>, usize)> {
+        Self::parse_conversation_file_with_logger(file_path, None)
+    }
+
+    fn parse_conversation_file_with_logger(
+        file_path: &Path,
+        log_fn: Option<&dyn Fn(&str)>,
+    ) -> Result<(Option<ConversationMeta>, Vec<Message>, usize)> {
         let content = std::fs::read_to_string(file_path)?;
         let mut messages = Vec::new();
+        let mut skipped_lines = 0usize;
         let mut summary_from_jsonl: Option<String> = None;
         let mut leaf_uuid_from_jsonl: Option<String> = None;
         let mut custom_title_found: Option<String> = None;
@@ -588,12 +599,15 @@ impl ConversationIndexer {
             let entry: JsonlEntry = match serde_json::from_str(line) {
                 Ok(e) => e,
                 Err(e) => {
-                    self.log(&format!(
-                        "Error parsing line {} in {}: {}",
-                        line_num + 1,
-                        file_path.display(),
-                        e
-                    ));
+                    skipped_lines += 1;
+                    if let Some(log) = log_fn {
+                        log(&format!(
+                            "Error parsing line {} in {}: {}",
+                            line_num + 1,
+                            file_path.display(),
+                            e
+                        ));
+                    }
                     continue;
                 }
             };
@@ -700,11 +714,25 @@ impl ConversationIndexer {
             None
         };
 
+        Ok((conv_meta, messages, skipped_lines))
+    }
+
+    /// Parse a conversation JSONL file.
+    pub fn parse_conversation_file(
+        &self,
+        file_path: &Path,
+    ) -> Result<(Option<ConversationMeta>, Vec<Message>)> {
+        let log = |msg: &str| self.log(msg);
+        let (conv_meta, messages, _skipped_lines) =
+            Self::parse_conversation_file_with_logger(file_path, Some(&log))?;
         Ok((conv_meta, messages))
     }
 
     /// Calculate depth of each message from root using BFS.
-    fn calculate_depth(messages: &[Message]) -> HashMap<String, i32> {
+    ///
+    /// Messages not reachable from a true root (`parent_uuid == None`) are
+    /// omitted from the result; callers must choose a fallback depth for them.
+    pub(crate) fn calculate_depth(messages: &[Message]) -> HashMap<String, i32> {
         let mut depths = HashMap::new();
         let children: HashMap<&str, Vec<&str>> = {
             let mut map: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -1234,6 +1262,7 @@ impl ConversationIndexer {
                  FROM conversations c
                  LEFT JOIN messages m ON m.session_id = c.session_id
                  WHERE c.message_count > 0
+                   AND COALESCE(c.source, 'claude_code') = 'claude_code'
                  GROUP BY c.session_id
                  HAVING COUNT(m.message_uuid) = 0",
             )?;
@@ -1350,6 +1379,28 @@ mod tests {
         assert_eq!(messages[2].uuid, "uuid3");
         assert_eq!(messages[2].message_type, "user");
         assert_eq!(messages[2].content, "How are you?");
+    }
+
+    #[test]
+    fn test_parse_conversation_file_logs_malformed_json_lines() {
+        let file = write_temp_jsonl(&[
+            r#"{"uuid":"uuid1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"Hello world"}}"#,
+            r#"{"uuid":"broken""#,
+            r#"{"uuid":"uuid2","parentUuid":"uuid1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess1","message":{"role":"assistant","content":"Hi"}}"#,
+        ]);
+        let logs = std::cell::RefCell::new(Vec::new());
+        let log = |msg: &str| logs.borrow_mut().push(msg.to_string());
+
+        let (_, messages, skipped_lines) =
+            ConversationIndexer::parse_conversation_file_with_logger(file.path(), Some(&log))
+                .unwrap();
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(skipped_lines, 1);
+        let logs = logs.borrow();
+        assert_eq!(logs.len(), 1);
+        assert!(logs[0].contains("Error parsing line 2"));
+        assert!(logs[0].contains(file.path().to_string_lossy().as_ref()));
     }
 
     #[test]

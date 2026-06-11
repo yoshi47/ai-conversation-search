@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::date_utils::build_date_filter;
 use crate::db;
 use crate::error::{AppError, Result};
+use crate::indexer::{ConversationIndexer, Message};
 
 /// Common filter parameters for search and list operations.
 pub struct SearchFilter<'a> {
@@ -166,6 +167,8 @@ pub struct ConversationTree {
     pub tree: Vec<TreeNode>,
     pub total_messages: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
 
@@ -227,16 +230,13 @@ fn escape_like(value: &str) -> String {
 /// Extract a snippet around the first occurrence of any search term in content.
 /// Returns a window of `max_len` chars centered on the match, with `**` highlighting.
 fn extract_snippet(content: &str, search_terms: &[&str], max_len: usize) -> String {
-    let content_lower = content.to_lowercase();
-
     // Find the earliest match position
     let mut best_pos: Option<(usize, usize)> = None; // (byte_start, byte_len)
     for term in search_terms {
-        let term_lower = term.to_lowercase();
-        if let Some(byte_idx) = content_lower.find(&term_lower) {
+        if let Some((byte_start, byte_end)) = find_term(content, term) {
             match best_pos {
-                None => best_pos = Some((byte_idx, term.len())),
-                Some((prev, _)) if byte_idx < prev => best_pos = Some((byte_idx, term.len())),
+                None => best_pos = Some((byte_start, byte_end - byte_start)),
+                Some((prev, _)) if byte_start < prev => best_pos = Some((byte_start, byte_end - byte_start)),
                 _ => {}
             }
         }
@@ -258,18 +258,16 @@ fn extract_snippet(content: &str, search_terms: &[&str], max_len: usize) -> Stri
     // Add highlight markers for all terms
     let mut result = snippet;
     for term in search_terms {
-        let term_lower = term.to_lowercase();
         let mut highlighted = String::new();
         let mut remaining = result.as_str();
         while !remaining.is_empty() {
-            let remaining_lower = remaining.to_lowercase();
-            if let Some(idx) = remaining_lower.find(&term_lower) {
-                highlighted.push_str(&remaining[..idx]);
-                let matched = &remaining[idx..idx + term_lower.len()];
+            if let Some((start, end)) = find_term(remaining, term) {
+                highlighted.push_str(&remaining[..start]);
+                let matched = &remaining[start..end];
                 highlighted.push_str("**");
                 highlighted.push_str(matched);
                 highlighted.push_str("**");
-                remaining = &remaining[idx + term_lower.len()..];
+                remaining = &remaining[end..];
             } else {
                 highlighted.push_str(remaining);
                 break;
@@ -281,6 +279,42 @@ fn extract_snippet(content: &str, search_terms: &[&str], max_len: usize) -> Stri
     let prefix = if window_start > 0 { "..." } else { "" };
     let suffix = if window_start + max_len < content.chars().count() { "..." } else { "" };
     format!("{}{}{}", prefix, result, suffix)
+}
+
+fn find_term(haystack: &str, needle: &str) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+
+    let needle_lower = needle.to_lowercase();
+    let mut haystack_lower = String::with_capacity(haystack.len());
+    let mut original_ranges = Vec::with_capacity(haystack.len());
+
+    for (start, ch) in haystack.char_indices() {
+        let end = start + ch.len_utf8();
+        for lower_ch in ch.to_lowercase() {
+            let mut buf = [0; 4];
+            let lower_str = lower_ch.encode_utf8(&mut buf);
+            haystack_lower.push_str(lower_str);
+            for _ in 0..lower_str.len() {
+                original_ranges.push((start, end));
+            }
+        }
+    }
+
+    if let Some(lower_start) = haystack_lower.find(&needle_lower) {
+        let lower_end = lower_start + needle_lower.len();
+        let original_start = original_ranges[lower_start].0;
+        let original_end = original_ranges[lower_end - 1].1;
+        return Some((original_start, original_end));
+    }
+
+    None
+}
+
+fn summary_from_content(content: &str) -> String {
+    let first_line = content.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
+    first_line.chars().take(120).collect()
 }
 
 /// Convert UTC ISO timestamp to local time for display.
@@ -329,6 +363,7 @@ pub struct RepoCount {
 pub struct IndexStatus {
     pub total_conversations: i64,
     pub total_messages: i64,
+    pub orphan_conversations: i64,
     pub earliest_conversation: Option<String>,
     pub latest_conversation: Option<String>,
     pub by_source: Vec<SourceCount>,
@@ -376,6 +411,20 @@ impl ConversationSearch {
 
         let total_messages: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM messages", [], |r| r.get(0),
+        )?;
+
+        let orphan_conversations: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM (
+                SELECT c.session_id
+                FROM conversations c
+                LEFT JOIN messages m ON m.session_id = c.session_id
+                WHERE c.message_count > 0
+                  AND COALESCE(c.source, 'claude_code') = 'claude_code'
+                GROUP BY c.session_id
+                HAVING COUNT(m.message_uuid) = 0
+            )",
+            [],
+            |r| r.get(0),
         )?;
 
         let earliest_conversation: Option<String> = self.conn.query_row(
@@ -439,6 +488,7 @@ impl ConversationSearch {
         Ok(IndexStatus {
             total_conversations,
             total_messages,
+            orphan_conversations,
             earliest_conversation,
             latest_conversation,
             by_source,
@@ -947,18 +997,149 @@ impl ConversationSearch {
                 conversation: None,
                 tree: Vec::new(),
                 total_messages: 0,
+                warning: None,
                 error: Some(format!("Conversation {} not found", session_id)),
             });
+        }
+
+        let conversation = conv.into_iter().next();
+        if messages.is_empty() {
+            return Self::get_conversation_tree_from_raw(session_id, conversation);
         }
 
         let tree = Self::build_tree(&messages);
 
         Ok(ConversationTree {
-            conversation: conv.into_iter().next(),
+            conversation,
             tree,
             total_messages: messages.len(),
+            warning: None,
             error: None,
         })
+    }
+
+    fn get_conversation_tree_from_raw(
+        session_id: &str,
+        conversation: Option<ConversationRow>,
+    ) -> Result<ConversationTree> {
+        let Some(conv) = conversation else {
+            return Ok(ConversationTree {
+                conversation: None,
+                tree: Vec::new(),
+                total_messages: 0,
+                warning: None,
+                error: Some(format!("Conversation {} not found", session_id)),
+            });
+        };
+
+        let source = conv.source.as_deref().unwrap_or("claude_code").to_string();
+        if source != "claude_code" {
+            return Ok(ConversationTree {
+                conversation: Some(conv),
+                tree: Vec::new(),
+                total_messages: 0,
+                warning: None,
+                error: Some(format!(
+                    "Indexed messages are missing for this {} conversation; raw transcript fallback is only supported for Claude Code sessions",
+                    source
+                )),
+            });
+        }
+
+        let Some(conversation_file) = conv.conversation_file.clone() else {
+            return Ok(Self::raw_tree_error(
+                conv,
+                "Indexed messages are missing and no raw transcript path is recorded",
+            ));
+        };
+
+        let path = std::path::Path::new(&conversation_file);
+        let (_, raw_messages, skipped_lines) =
+            match ConversationIndexer::parse_conversation_file_raw(path) {
+                Ok(parsed) => parsed,
+                Err(e) => {
+                    return Ok(Self::raw_tree_error(
+                        conv,
+                        &format!(
+                            "Indexed messages are missing and raw transcript could not be read at {}: {}",
+                            conversation_file, e
+                        ),
+                    ));
+                }
+            };
+
+        let total_raw = raw_messages.len();
+        let messages: Vec<Message> = raw_messages
+            .into_iter()
+            .filter(|m| match m.session_id.as_deref() {
+                Some(raw_session_id) => raw_session_id == session_id,
+                None => true,
+            })
+            .collect();
+
+        if messages.is_empty() {
+            let reason = if total_raw == 0 && skipped_lines > 0 {
+                format!(
+                    "Indexed messages are missing and none of the {} non-empty line(s) in raw transcript at {} could be parsed; the file may be corrupt",
+                    skipped_lines, conversation_file
+                )
+            } else {
+                format!(
+                    "Indexed messages are missing and raw transcript at {} contains no messages for session {} ({} message(s) in the file belong to other sessions)",
+                    conversation_file, session_id, total_raw
+                )
+            };
+            return Ok(Self::raw_tree_error(conv, &reason));
+        }
+
+        let tree =
+            Self::build_tree_from_raw_messages(&messages, conv.project_path.as_deref(), session_id);
+
+        let mut warning = if conv.message_count == 0 {
+            // Resume handling can legitimately attribute all of a session's
+            // messages to a sibling session; re-indexing will not change that.
+            "Messages for this session are indexed under a sibling session; loaded tree from raw transcript.".to_string()
+        } else {
+            "Indexed messages are missing; loaded tree from raw transcript. Run ai-conversation-search index --all to repair the DB.".to_string()
+        };
+        if conv.message_count > 0 && (messages.len() as i64) < conv.message_count {
+            warning.push_str(&format!(
+                " Showing {} of {} recorded message(s).",
+                messages.len(),
+                conv.message_count
+            ));
+        }
+        if skipped_lines > 0 {
+            warning.push_str(&format!(
+                " {} malformed line(s) were skipped; the transcript may be partially unreadable.",
+                skipped_lines
+            ));
+        }
+
+        Ok(ConversationTree {
+            conversation: Some(conv),
+            tree,
+            total_messages: messages.len(),
+            warning: Some(warning),
+            error: None,
+        })
+    }
+
+    fn raw_tree_error(conversation: ConversationRow, reason: &str) -> ConversationTree {
+        // Re-indexing only helps when the index claims messages it doesn't have;
+        // for message_count == 0 rows the state is reproduced by design.
+        let error = if conversation.message_count > 0 {
+            format!("{}. Run ai-conversation-search index --all to repair the DB.", reason)
+        } else {
+            format!("{}.", reason)
+        };
+        ConversationTree {
+            conversation: Some(conversation),
+            tree: Vec::new(),
+            total_messages: 0,
+            warning: None,
+            error: Some(error),
+        }
     }
 
     fn build_tree(messages: &[MessageRow]) -> Vec<TreeNode> {
@@ -1007,6 +1188,70 @@ impl ConversationSearch {
         }
 
         roots.iter().map(|uuid| build_node(uuid, &msg_map, &children_map)).collect()
+    }
+
+    fn build_tree_from_raw_messages(
+        messages: &[Message],
+        project_path: Option<&str>,
+        fallback_session_id: &str,
+    ) -> Vec<TreeNode> {
+        let depths = ConversationIndexer::calculate_depth(messages);
+        let mut msg_map: HashMap<String, &Message> = HashMap::new();
+        for msg in messages {
+            msg_map.insert(msg.uuid.clone(), msg);
+        }
+
+        let mut roots = Vec::new();
+        let mut children_map: HashMap<String, Vec<String>> = HashMap::new();
+
+        for msg in messages {
+            if let Some(ref parent_uuid) = msg.parent_uuid {
+                if msg_map.contains_key(parent_uuid) {
+                    children_map.entry(parent_uuid.clone()).or_default().push(msg.uuid.clone());
+                    continue;
+                }
+            }
+            roots.push(msg.uuid.clone());
+        }
+
+        fn build_node(
+            uuid: &str,
+            msg_map: &HashMap<String, &Message>,
+            children_map: &HashMap<String, Vec<String>>,
+            depths: &HashMap<String, i32>,
+            project_path: Option<&str>,
+            fallback_session_id: &str,
+        ) -> TreeNode {
+            let msg = msg_map.get(uuid).expect("build_node called with uuid not in msg_map");
+            let children = if let Some(kids) = children_map.get(uuid) {
+                kids.iter()
+                    .map(|k| build_node(k, msg_map, children_map, depths, project_path, fallback_session_id))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            TreeNode {
+                message_uuid: msg.uuid.clone(),
+                session_id: msg
+                    .session_id
+                    .clone()
+                    .unwrap_or_else(|| fallback_session_id.to_string()),
+                parent_uuid: msg.parent_uuid.clone(),
+                is_sidechain: msg.is_sidechain,
+                depth: i64::from(*depths.get(&msg.uuid).unwrap_or(&0)),
+                timestamp: msg.timestamp.clone().unwrap_or_default(),
+                message_type: msg.message_type.clone(),
+                project_path: project_path.map(str::to_string),
+                summary: Some(summary_from_content(&msg.content)),
+                full_content: msg.content.clone(),
+                children,
+            }
+        }
+
+        roots
+            .iter()
+            .map(|uuid| build_node(uuid, &msg_map, &children_map, &depths, project_path, fallback_session_id))
+            .collect()
     }
 
     pub fn list_recent_conversations(
@@ -1206,6 +1451,7 @@ impl ConversationSearch {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     fn default_filter() -> SearchFilter<'static> {
         SearchFilter { limit: 10, ..Default::default() }
@@ -1279,6 +1525,30 @@ mod tests {
         conn.execute(
             "INSERT INTO conversations (session_id, project_path, conversation_file, root_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, source, repo_root) VALUES (?, ?, 'test.jsonl', 'root', ?, ?, ?, 1, ?, ?)",
             rusqlite::params![session_id, project_path, summary, first_at, last_at, source, repo_root],
+        )
+        .unwrap();
+    }
+
+    fn write_test_jsonl(lines: &[&str]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for line in lines {
+            writeln!(file, "{}", line).unwrap();
+        }
+        file.flush().unwrap();
+        file
+    }
+
+    /// Insert a conversations row with no matching messages rows.
+    fn insert_orphan_conversation(
+        conn: &Connection,
+        session_id: &str,
+        conversation_file: Option<&str>,
+        message_count: i64,
+        source: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO conversations (session_id, project_path, conversation_file, root_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, source) VALUES (?, '/proj', ?, 'root1', 'orphan', '2025-01-15T10:00:00', '2025-01-15T10:01:00', ?, ?)",
+            rusqlite::params![session_id, conversation_file, message_count, source],
         )
         .unwrap();
     }
@@ -1758,6 +2028,213 @@ mod tests {
         assert_eq!(result.tree[0].children[0].children.len(), 1);
     }
 
+    #[test]
+    fn test_tree_falls_back_to_raw_transcript_for_orphan_conversation() {
+        let conn = setup_test_db();
+        let file = write_test_jsonl(&[
+            r#"{"uuid":"root1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess-orphan","message":{"role":"user","content":"raw root message"}}"#,
+            r#"{"uuid":"child1","parentUuid":"root1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess-orphan","message":{"role":"assistant","content":"raw child message"}}"#,
+        ]);
+        insert_orphan_conversation(
+            &conn,
+            "sess-orphan",
+            Some(file.path().to_string_lossy().as_ref()),
+            2,
+            "claude_code",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-orphan").unwrap();
+
+        assert!(result.error.is_none());
+        let warning = result.warning.as_deref().unwrap_or("");
+        assert!(warning.contains("raw transcript"), "warning: {}", warning);
+        assert!(warning.contains("index --all"), "warning: {}", warning);
+        assert!(!warning.contains("Showing"), "complete tree should have no discrepancy note: {}", warning);
+        assert_eq!(result.total_messages, 2);
+        assert_eq!(result.tree.len(), 1);
+        assert_eq!(result.tree[0].message_uuid, "root1");
+        assert_eq!(result.tree[0].children[0].message_uuid, "child1");
+    }
+
+    #[test]
+    fn test_tree_orphan_without_transcript_returns_actionable_error() {
+        let conn = setup_test_db();
+        insert_orphan_conversation(
+            &conn,
+            "sess-missing",
+            Some("/tmp/does-not-exist-ai-conversation-search.jsonl"),
+            2,
+            "claude_code",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-missing").unwrap();
+
+        assert!(result.tree.is_empty());
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("could not be read"), "error: {}", error);
+        assert!(error.contains("index --all"), "error: {}", error);
+    }
+
+    #[test]
+    fn test_tree_orphan_without_recorded_path_returns_error() {
+        let conn = setup_test_db();
+        insert_orphan_conversation(&conn, "sess-nopath", None, 2, "claude_code");
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-nopath").unwrap();
+
+        assert!(result.tree.is_empty());
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("no raw transcript path is recorded"), "error: {}", error);
+        assert!(error.contains("index --all"), "error: {}", error);
+    }
+
+    #[test]
+    fn test_tree_raw_fallback_filters_other_session_messages() {
+        let conn = setup_test_db();
+        // Resume scenario: the file re-emits the parent under the old sessionId.
+        let file = write_test_jsonl(&[
+            r#"{"uuid":"root1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess-old","message":{"role":"user","content":"old session root"}}"#,
+            r#"{"uuid":"child1","parentUuid":"root1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess-new","message":{"role":"assistant","content":"new session reply"}}"#,
+        ]);
+        insert_orphan_conversation(
+            &conn,
+            "sess-new",
+            Some(file.path().to_string_lossy().as_ref()),
+            2,
+            "claude_code",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-new").unwrap();
+
+        assert!(result.error.is_none());
+        // Other-session message is excluded; its child is promoted to root.
+        assert_eq!(result.total_messages, 1);
+        assert_eq!(result.tree.len(), 1);
+        assert_eq!(result.tree[0].message_uuid, "child1");
+        let warning = result.warning.as_deref().unwrap_or("");
+        assert!(warning.contains("Showing 1 of 2"), "warning: {}", warning);
+    }
+
+    #[test]
+    fn test_tree_raw_fallback_stamps_missing_session_id() {
+        let conn = setup_test_db();
+        let file = write_test_jsonl(&[
+            r#"{"uuid":"root1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","message":{"role":"user","content":"no sessionId field"}}"#,
+        ]);
+        insert_orphan_conversation(
+            &conn,
+            "sess-stamp",
+            Some(file.path().to_string_lossy().as_ref()),
+            1,
+            "claude_code",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-stamp").unwrap();
+
+        assert!(result.error.is_none());
+        assert_eq!(result.tree.len(), 1);
+        assert_eq!(result.tree[0].session_id, "sess-stamp");
+    }
+
+    #[test]
+    fn test_tree_raw_fallback_corrupt_transcript_reports_parse_failure() {
+        let conn = setup_test_db();
+        let file = write_test_jsonl(&[r#"{"uuid":"broken"#, "not json at all"]);
+        insert_orphan_conversation(
+            &conn,
+            "sess-corrupt",
+            Some(file.path().to_string_lossy().as_ref()),
+            2,
+            "claude_code",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-corrupt").unwrap();
+
+        assert!(result.tree.is_empty());
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("could be parsed"), "error: {}", error);
+        assert!(error.contains("corrupt"), "error: {}", error);
+    }
+
+    #[test]
+    fn test_tree_raw_fallback_wrong_session_only_reports_other_sessions() {
+        let conn = setup_test_db();
+        let file = write_test_jsonl(&[
+            r#"{"uuid":"root1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess-other","message":{"role":"user","content":"belongs elsewhere"}}"#,
+        ]);
+        insert_orphan_conversation(
+            &conn,
+            "sess-wanted",
+            Some(file.path().to_string_lossy().as_ref()),
+            1,
+            "claude_code",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-wanted").unwrap();
+
+        assert!(result.tree.is_empty());
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("no messages for session sess-wanted"), "error: {}", error);
+        assert!(error.contains("belong to other sessions"), "error: {}", error);
+    }
+
+    #[test]
+    fn test_tree_orphan_non_claude_source_skips_raw_fallback() {
+        let conn = setup_test_db();
+        // Even with a Claude-Code-formatted file on disk, a codex row must not
+        // be parsed with the Claude Code schema.
+        let file = write_test_jsonl(&[
+            r#"{"uuid":"root1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess-codex","message":{"role":"user","content":"hello"}}"#,
+        ]);
+        insert_orphan_conversation(
+            &conn,
+            "sess-codex",
+            Some(file.path().to_string_lossy().as_ref()),
+            1,
+            "codex",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-codex").unwrap();
+
+        assert!(result.tree.is_empty());
+        let error = result.error.as_deref().unwrap_or("");
+        assert!(error.contains("only supported for Claude Code sessions"), "error: {}", error);
+        assert!(!error.contains("index --all"), "no repair advice for non-claude rows: {}", error);
+    }
+
+    #[test]
+    fn test_tree_sibling_session_zero_count_omits_repair_advice() {
+        let conn = setup_test_db();
+        let file = write_test_jsonl(&[
+            r#"{"uuid":"root1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess-sibling","message":{"role":"user","content":"attributed elsewhere"}}"#,
+        ]);
+        // message_count = 0: the indexer attributed this session's messages to
+        // a sibling session; re-indexing reproduces the same state.
+        insert_orphan_conversation(
+            &conn,
+            "sess-sibling",
+            Some(file.path().to_string_lossy().as_ref()),
+            0,
+            "claude_code",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-sibling").unwrap();
+
+        assert!(result.error.is_none());
+        let warning = result.warning.as_deref().unwrap_or("");
+        assert!(warning.contains("sibling session"), "warning: {}", warning);
+        assert!(!warning.contains("index --all"), "repair advice is wrong here: {}", warning);
+    }
+
     // ---- list_recent_conversations tests ----
 
     #[test]
@@ -1941,5 +2418,35 @@ mod tests {
         // Snippet should contain highlighted search terms
         assert!(snippet.contains("**brown**"), "snippet should highlight 'brown': {}", snippet);
         assert!(snippet.contains("**fox**"), "snippet should highlight 'fox': {}", snippet);
+    }
+
+    #[test]
+    fn test_extract_snippet_japanese_no_char_boundary_panic() {
+        let content = "claude codeのsessionをcodexで引き継ぎたいときはどうしたらいい？";
+        let snippet = extract_snippet(content, &["どう"], 20);
+        assert!(snippet.contains("どう"), "snippet should contain Japanese match: {}", snippet);
+    }
+
+    #[test]
+    fn test_extract_snippet_unicode_case_insensitive() {
+        let snippet = extract_snippet("Try Café search", &["café"], 40);
+        assert!(snippet.contains("**Café**"), "snippet should highlight Unicode case match: {}", snippet);
+    }
+
+    #[test]
+    fn test_status_counts_orphan_conversations() {
+        let conn = setup_test_db();
+        insert_test_conversation(&conn, "healthy", "/proj", "healthy", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_message(&conn, "healthy-msg", "healthy", "hello", "user", "2025-01-15T10:00:00", "/proj");
+        insert_orphan_conversation(&conn, "orphan", Some("missing.jsonl"), 5, "claude_code");
+        // Not orphans: legitimately-empty row (sibling-session attribution) and
+        // a non-claude row outside the repair path's scope.
+        insert_orphan_conversation(&conn, "empty-by-design", Some("missing.jsonl"), 0, "claude_code");
+        insert_orphan_conversation(&conn, "codex-orphan", Some("rollout.jsonl"), 3, "codex");
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let status = searcher.get_index_status(2).unwrap();
+
+        assert_eq!(status.orphan_conversations, 1);
     }
 }

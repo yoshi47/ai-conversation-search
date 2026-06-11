@@ -535,6 +535,13 @@ fn cmd_status(json_output: bool) -> Result<()> {
     }
 
     println!("\nMessages: {} total", status.total_messages);
+    println!("Orphan conversation rows: {}", status.orphan_conversations);
+    if status.orphan_conversations > 0 {
+        eprintln!(
+            "  \u{26a0} {} conversation row(s) have metadata but no indexed messages. Run 'ai-conversation-search index --all' to repair them.",
+            status.orphan_conversations
+        );
+    }
 
     if let (Some(ref earliest), Some(ref latest)) = (&status.earliest_conversation, &status.latest_conversation) {
         let earliest_local = format_timestamp(earliest, true, false);
@@ -874,6 +881,10 @@ fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
     if let Some(ref err) = tree.error {
         println!("Error: {}", err);
         return Ok(());
+    }
+
+    if let Some(ref warning) = tree.warning {
+        eprintln!("Warning: {}", warning);
     }
 
     print_tree_nodes(&tree.tree, 0);

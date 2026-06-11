@@ -38,6 +38,11 @@ Then follow the installation instructions shown by Claude to install the CLI too
 
 ### Manual Installation
 
+Manual installs place a standalone binary on your PATH (`~/.local/bin` for the
+download below, `~/.cargo/bin` for `cargo install`). That binary does not
+auto-upgrade when the Claude Code plugin wrapper is updated, so re-run the
+install step after releases if `ai-conversation-search --version` is stale.
+
 #### 1. Install CLI Tool
 
 ```bash
@@ -57,6 +62,9 @@ curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/do
 
 # Make sure ~/.local/bin is in your PATH
 export PATH="$HOME/.local/bin:$PATH"
+
+# Verify the active PATH binary
+ai-conversation-search --version
 ```
 
 Or build from source:
