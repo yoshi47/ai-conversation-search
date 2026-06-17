@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.0] - 2026-06-17
+
+### Added
+
+- `hook` subcommand: lightweight trigger for background indexing, designed for use as a Claude Code Stop hook (exits in <50ms when index is fresh)
+- `setup-hooks` subcommand: idempotently adds a Stop hook to `~/.claude/settings.json` so the search index updates automatically after every conversation turn
+- Fast path in wrapper script: `hook` subcommand skips binary download and DB init checks
+
 ## [0.12.4] - 2026-06-11
 
 ### Fixed

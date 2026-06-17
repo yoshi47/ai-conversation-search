@@ -258,6 +258,45 @@ ai-conversation-search index --all
 
 ---
 
+### ai-conversation-search hook
+
+Trigger background indexing if the TTL-based debounce has expired. Designed to be called from a Claude Code Stop hook.
+
+```bash
+ai-conversation-search hook
+```
+
+**Behavior:**
+- Checks stamp file TTL (default: 300s, configurable via `CONVERSATION_SEARCH_INDEX_TTL`)
+- If fresh: exits immediately (< 1ms, two stat() calls)
+- If stale: spawns background `index --days 1` and exits immediately
+- Always exits 0 — never fails or blocks the caller
+
+---
+
+### ai-conversation-search setup-hooks
+
+Add a Claude Code Stop hook that triggers automatic background indexing.
+
+```bash
+ai-conversation-search setup-hooks [--settings-file PATH]
+```
+
+**Options:**
+- `--settings-file PATH`: Override settings.json path (default: `~/.claude/settings.json`)
+
+**What it does:**
+- Adds a Stop hook entry to Claude Code settings.json
+- Idempotent: safe to run multiple times
+- Uses atomic write (mktemp + mv) to prevent corruption
+
+**Example:**
+```bash
+ai-conversation-search setup-hooks
+```
+
+---
+
 ## Database Schema
 
 **Location:** `~/.conversation-search/index.db`

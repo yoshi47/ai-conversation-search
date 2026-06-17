@@ -1,6 +1,6 @@
 {
   "name": "conversation-search",
-  "version": "0.12.4",
+  "version": "0.13.0",
   "description": "Find, review, and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) by reading their raw transcripts. Returns the real session content, resumable session IDs, project paths, and the exact resume command. Use whenever a past session or prior conversation is mentioned — to find which session it was, resume it, or understand what was discussed or decided.",
   "author": {
     "name": "yoshi47",

@@ -5,7 +5,7 @@
 
 set -e
 
-ACS_WRAPPER_VERSION="0.12.4"
+ACS_WRAPPER_VERSION="0.13.0"
 VERSION="${ACS_VERSION:-$ACS_WRAPPER_VERSION}"
 CACHE_DIR="${HOME}/.conversation-search/bin"
 BINARY="${CACHE_DIR}/ai-conversation-search-${VERSION}"
@@ -22,6 +22,70 @@ detect_target() {
         *) echo "Unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;;
     esac
 }
+
+# Fast path: hook subcommand skips download/init checks.
+if [ "$1" = "hook" ]; then
+    if [ -x "$BINARY" ]; then
+        exec "$BINARY" hook
+    fi
+    exit 0
+fi
+
+# --- setup-hooks subcommand (add Stop hook to Claude Code settings.json) ---
+if [ "$1" = "setup-hooks" ]; then
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "Error: jq is required. Install: brew install jq" >&2
+        exit 1
+    fi
+
+    SETTINGS_FILE="${HOME}/.claude/settings.json"
+    shift
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --settings-file) SETTINGS_FILE="$2"; shift 2 ;;
+            *) echo "Unknown option: $1" >&2; exit 1 ;;
+        esac
+    done
+
+    if [ ! -f "$SETTINGS_FILE" ]; then
+        echo "Error: $SETTINGS_FILE not found. Is Claude Code installed?" >&2
+        exit 1
+    fi
+
+    HOOK_CMD="ai-conversation-search hook"
+
+    EXISTING=$(jq -r '
+        .hooks.Stop // [] | .[] | .hooks // [] | .[] |
+        select(.command == "ai-conversation-search hook") | .command
+    ' "$SETTINGS_FILE" 2>/dev/null || true)
+
+    if [ -n "$EXISTING" ]; then
+        echo "Hook already configured in $SETTINGS_FILE" >&2
+        exit 0
+    fi
+
+    TMPFILE=$(mktemp)
+    trap 'rm -f "$TMPFILE"' EXIT
+
+    jq --arg cmd "$HOOK_CMD" '
+        .hooks //= {} |
+        .hooks.Stop //= [] |
+        .hooks.Stop += [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": $cmd,
+                "timeout": 10
+            }]
+        }]
+    ' "$SETTINGS_FILE" > "$TMPFILE" && mv "$TMPFILE" "$SETTINGS_FILE"
+
+    trap - EXIT
+    echo "Added Stop hook to $SETTINGS_FILE" >&2
+    echo "  Command: $HOOK_CMD" >&2
+    echo "  The search index will now update automatically after each conversation turn." >&2
+    exit 0
+fi
 
 if [ ! -x "$BINARY" ]; then
     TARGET=$(detect_target)

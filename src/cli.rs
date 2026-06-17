@@ -207,6 +207,8 @@ pub enum Commands {
         /// Message UUID
         uuid: String,
     },
+    /// Trigger background indexing (for use as a Claude Code hook)
+    Hook,
 }
 
 fn index_other_sources(days_back: Option<i64>, quiet: bool) {
@@ -387,6 +389,7 @@ pub fn run(cli: Cli) -> Result<()> {
         }
         Some(Commands::Tree { session_id, json }) => cmd_tree(&session_id, json),
         Some(Commands::Resume { uuid }) => cmd_resume(&uuid),
+        Some(Commands::Hook) => cmd_hook(),
     }
 }
 
@@ -923,6 +926,11 @@ fn cmd_resume(uuid: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn cmd_hook() -> Result<()> {
+    maybe_background_index();
     Ok(())
 }
 

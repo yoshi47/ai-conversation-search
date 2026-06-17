@@ -17,6 +17,17 @@ Verify everything is working:
 ai-conversation-search search "test" --json
 ```
 
+## Enable Automatic Indexing (Recommended)
+
+Keep your search index always up-to-date by installing a Claude Code Stop hook:
+
+```bash
+ai-conversation-search setup-hooks
+```
+
+This adds a lightweight hook that triggers background indexing after each conversation turn.
+The hook exits in under 50ms and never blocks your session.
+
 ## You're Ready!
 
 The **conversation-search** skill is now active. Try asking Claude:
