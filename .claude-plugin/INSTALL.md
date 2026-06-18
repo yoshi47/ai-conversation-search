@@ -45,6 +45,10 @@ cargo install --git https://github.com/yoshi47/ai-conversation-search
 ai-conversation-search init
 ```
 
+> **Note:** `cargo install` installs only the core Rust binary. Interactive
+> features (`pick`, `setup-hooks`) require the plugin wrapper script. Use the
+> plugin install method above for the full experience.
+
 ## Troubleshooting
 
 **Tool not found:**

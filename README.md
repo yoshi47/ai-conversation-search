@@ -38,36 +38,27 @@ Then follow the installation instructions shown by Claude to install the CLI too
 
 ### Manual Installation
 
-Manual installs place a standalone binary on your PATH (`~/.local/bin` for the
-download below, `~/.cargo/bin` for `cargo install`). That binary does not
-auto-upgrade when the Claude Code plugin wrapper is updated, so re-run the
-install step after releases if `ai-conversation-search --version` is stale.
-
 #### 1. Install CLI Tool
 
+Download the wrapper script, which automatically manages the platform-specific
+binary (download, cache, and version tracking):
+
 ```bash
-# Download pre-built binary (macOS/Linux)
-ARCH=$(uname -m)
-OS=$(uname -s)
-case "${OS}-${ARCH}" in
-    Darwin-arm64) TARGET="aarch64-apple-darwin" ;;
-    Darwin-x86_64) TARGET="x86_64-apple-darwin" ;;
-    Linux-x86_64) TARGET="x86_64-unknown-linux-gnu" ;;
-    Linux-aarch64) TARGET="aarch64-unknown-linux-gnu" ;;
-    *) echo "Unsupported platform: ${OS}-${ARCH}"; exit 1 ;;
-esac
 mkdir -p ~/.local/bin
-curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-${TARGET}" \
+curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-wrapper" \
     -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
 
 # Make sure ~/.local/bin is in your PATH
 export PATH="$HOME/.local/bin:$PATH"
 
-# Verify the active PATH binary
+# First run downloads the Rust binary automatically
 ai-conversation-search --version
 ```
 
-Or build from source:
+The wrapper also provides interactive features (`pick`, `setup-hooks`) that are
+not available in the standalone binary.
+
+Or build from source (core CLI only — `pick` and `setup-hooks` require the wrapper):
 ```bash
 cargo install --git https://github.com/yoshi47/ai-conversation-search
 ```
@@ -201,6 +192,28 @@ ai-conversation-search list --since 2025-11-10 --until today [--json]
 View conversation tree structure
 ```bash
 ai-conversation-search tree SESSION_ID [--json]
+```
+
+### `ai-conversation-search pick` *(wrapper only)*
+Interactive session picker using fzf with live full-text search
+```bash
+ai-conversation-search pick [QUERY] [--days N] [--repo NAME] [--here] [--source SOURCE]
+
+# Browse recent sessions interactively
+ai-conversation-search pick
+
+# Filter to current repository
+ai-conversation-search pick --here
+
+# Pick and resume in one step
+eval "$(ai-conversation-search pick)"
+```
+Requires `fzf` (0.28+) and `jq`. Only available via the wrapper script (plugin install or manual wrapper download).
+
+### `ai-conversation-search setup-hooks` *(wrapper only)*
+Install a Claude Code Stop hook for automatic background indexing
+```bash
+ai-conversation-search setup-hooks
 ```
 
 ## Supported Sources
