@@ -4,7 +4,8 @@ use std::sync::LazyLock;
 static CMD_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
     vec![
         Regex::new(r"ai-conversation-search\s+(search|list|index|tree|context|resume)").unwrap(),
-        Regex::new(r"ai-conversation-search\s+--\w+\s+(search|list|index|tree|context|resume)").unwrap(),
+        Regex::new(r"ai-conversation-search\s+--\w+\s+(search|list|index|tree|context|resume)")
+            .unwrap(),
         Regex::new(r"ai-conversation-search\s+(--help|--version|-h|-v)").unwrap(),
         Regex::new(r"uv\s+tool\s+upgrade\s+ai-conversation-search").unwrap(),
         Regex::new(r"pip\s+install\s+--upgrade\s+ai-conversation-search").unwrap(),

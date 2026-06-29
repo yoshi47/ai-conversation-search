@@ -33,19 +33,13 @@ pub struct OpenCodeIndexer {
 }
 
 impl OpenCodeIndexer {
-    pub fn new(
-        search_db_path: Option<&str>,
-        opencode_db_path: Option<&str>,
-        quiet: bool,
-    ) -> Self {
+    pub fn new(search_db_path: Option<&str>, opencode_db_path: Option<&str>, quiet: bool) -> Self {
         let oc_path = opencode_db_path
             .map(|s| s.to_string())
             .unwrap_or_else(get_opencode_db_path);
 
         Self {
-            search_db_path: search_db_path
-                .unwrap_or(db::DEFAULT_DB_PATH)
-                .to_string(),
+            search_db_path: search_db_path.unwrap_or(db::DEFAULT_DB_PATH).to_string(),
             opencode_db_path: db::expand_path(&oc_path),
             quiet,
         }
@@ -99,7 +93,10 @@ impl OpenCodeIndexer {
                     }
                 }
                 Some("tool") => {
-                    let tool_name = data.get("tool").and_then(|t| t.as_str()).unwrap_or("unknown");
+                    let tool_name = data
+                        .get("tool")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("unknown");
                     text_parts.push(format!("[Tool: {}]", tool_name));
                     if let Some(state) = data.get("state").and_then(|s| s.as_object()) {
                         if let Some(input) = state.get("input").and_then(|i| i.as_object()) {
@@ -186,8 +183,16 @@ impl OpenCodeIndexer {
              ORDER BY s.time_updated DESC",
         )?;
 
-        let sessions: Vec<(String, String, Option<String>, Option<String>, i64, i64, Option<String>)> =
-            stmt.query_map([cutoff_ms], |row| {
+        let sessions: Vec<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            i64,
+            Option<String>,
+        )> = stmt
+            .query_map([cutoff_ms], |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,
@@ -206,7 +211,10 @@ impl OpenCodeIndexer {
             return Ok(0);
         }
 
-        self.log(&format!("Found {} OpenCode sessions to index", sessions.len()));
+        self.log(&format!(
+            "Found {} OpenCode sessions to index",
+            sessions.len()
+        ));
 
         let mut max_time_updated = cutoff_ms;
         let mut indexed_count: usize = 0;

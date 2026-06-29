@@ -2,11 +2,11 @@ use clap::{Parser, Subcommand};
 
 use crate::db;
 use crate::error::Result;
-use crate::indexer::ConversationIndexer;
 use crate::indexer::codex::CodexIndexer;
-use crate::indexer::opencode::{OpenCodeIndexer, get_opencode_db_path};
 use crate::indexer::count_conversation_files_on_disk;
-use crate::search::{ConversationSearch, SearchFilter, TreeNode, format_timestamp};
+use crate::indexer::opencode::{get_opencode_db_path, OpenCodeIndexer};
+use crate::indexer::ConversationIndexer;
+use crate::search::{format_timestamp, ConversationSearch, SearchFilter, TreeNode};
 
 /// Source display labels
 const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")];
@@ -37,7 +37,12 @@ fn localize_timestamps(val: serde_json::Value) -> serde_json::Value {
             serde_json::Value::Array(arr.into_iter().map(localize_timestamps).collect())
         }
         serde_json::Value::Object(map) => {
-            let timestamp_keys = ["timestamp", "first_message_at", "last_message_at", "indexed_at"];
+            let timestamp_keys = [
+                "timestamp",
+                "first_message_at",
+                "last_message_at",
+                "indexed_at",
+            ];
             let new_map: serde_json::Map<String, serde_json::Value> = map
                 .into_iter()
                 .map(|(k, v)| {
@@ -46,7 +51,8 @@ fn localize_timestamps(val: serde_json::Value) -> serde_json::Value {
                             if s.ends_with('Z') {
                                 let cleaned = s.replace('Z', "+00:00");
                                 if let Ok(dt) = DateTime::parse_from_rfc3339(&cleaned) {
-                                    let local: DateTime<chrono::Local> = dt.with_timezone(&chrono::Local);
+                                    let local: DateTime<chrono::Local> =
+                                        dt.with_timezone(&chrono::Local);
                                     return (k, serde_json::Value::String(local.to_rfc3339()));
                                 }
                             }
@@ -70,7 +76,10 @@ fn localize_timestamps(val: serde_json::Value) -> serde_json::Value {
 }
 
 #[derive(Parser)]
-#[command(name = "ai-conversation-search", about = "Find and resume Claude Code conversations using semantic search")]
+#[command(
+    name = "ai-conversation-search",
+    about = "Find and resume Claude Code conversations using semantic search"
+)]
 #[command(version)]
 pub struct Cli {
     #[command(subcommand)]
@@ -250,7 +259,9 @@ fn touch_stamp_at(stamp_path: &std::path::Path) {
 fn is_stamp_stale(stamp_path: &std::path::Path, ttl_secs: u64) -> bool {
     match std::fs::metadata(stamp_path) {
         Ok(meta) => match meta.modified() {
-            Ok(mtime) => mtime.elapsed().unwrap_or_default() >= std::time::Duration::from_secs(ttl_secs),
+            Ok(mtime) => {
+                mtime.elapsed().unwrap_or_default() >= std::time::Duration::from_secs(ttl_secs)
+            }
             Err(_) => true,
         },
         Err(_) => true,
@@ -314,16 +325,8 @@ pub fn run(cli: Cli) -> Result<()> {
             Cli::command().print_help().ok();
             std::process::exit(1);
         }
-        Some(Commands::Init {
-            days,
-            force,
-            quiet,
-        }) => cmd_init(days, force, quiet),
-        Some(Commands::Index {
-            days,
-            all,
-            quiet,
-        }) => cmd_index(days, all, quiet),
+        Some(Commands::Init { days, force, quiet }) => cmd_init(days, force, quiet),
+        Some(Commands::Index { days, all, quiet }) => cmd_index(days, all, quiet),
         Some(Commands::Status { json }) => cmd_status(json),
         Some(Commands::Search {
             query,
@@ -357,7 +360,14 @@ pub fn run(cli: Cli) -> Result<()> {
                 repo: repo.as_deref(),
                 source: source.as_deref(),
             };
-            cmd_search(&effective_query, &filter, content, verbose, group_by_session, json)
+            cmd_search(
+                &effective_query,
+                &filter,
+                content,
+                verbose,
+                group_by_session,
+                json,
+            )
         }
         Some(Commands::Context {
             uuid,
@@ -432,7 +442,15 @@ fn cmd_init(days: i64, force: bool, quiet: bool) -> Result<()> {
         let total = files.len();
         for (i, conv_file) in files.into_iter().enumerate() {
             if !quiet {
-                eprint!("  [{}/{}] {}\r", i + 1, total, conv_file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+                eprint!(
+                    "  [{}/{}] {}\r",
+                    i + 1,
+                    total,
+                    conv_file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                );
             }
             if let Err(e) = indexer.index_conversation(&conv_file) {
                 eprintln!("\n  Error indexing {}: {}", conv_file.display(), e);
@@ -467,7 +485,10 @@ fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
         Ok(0) => {}
         Ok(n) => {
             if !quiet {
-                eprintln!("Repaired {} orphan conversation row(s) — will re-index from JSONL", n);
+                eprintln!(
+                    "Repaired {} orphan conversation row(s) — will re-index from JSONL",
+                    n
+                );
             }
         }
         Err(e) => {
@@ -489,7 +510,15 @@ fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
         let total = files.len();
         for (i, conv_file) in files.into_iter().enumerate() {
             if !quiet {
-                eprint!("[{}/{}] {}\r", i + 1, total, conv_file.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+                eprint!(
+                    "[{}/{}] {}\r",
+                    i + 1,
+                    total,
+                    conv_file
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default()
+                );
             }
             if let Err(e) = indexer.index_conversation(&conv_file) {
                 if !quiet {
@@ -530,7 +559,14 @@ fn cmd_status(json_output: bool) -> Result<()> {
     let db_path = db::expand_path(db::DEFAULT_DB_PATH);
     let size_mb = status.db_size_bytes as f64 / (1024.0 * 1024.0);
     println!("Database: {} ({:.1} MB)", db_path.display(), size_mb);
-    println!("FTS health: {}", if status.fts_healthy { "OK" } else { "CORRUPTED" });
+    println!(
+        "FTS health: {}",
+        if status.fts_healthy {
+            "OK"
+        } else {
+            "CORRUPTED"
+        }
+    );
 
     println!("\nSessions: {} total", status.total_conversations);
     for sc in &status.by_source {
@@ -546,7 +582,9 @@ fn cmd_status(json_output: bool) -> Result<()> {
         );
     }
 
-    if let (Some(ref earliest), Some(ref latest)) = (&status.earliest_conversation, &status.latest_conversation) {
+    if let (Some(ref earliest), Some(ref latest)) =
+        (&status.earliest_conversation, &status.latest_conversation)
+    {
         let earliest_local = format_timestamp(earliest, true, false);
         let latest_local = format_timestamp(latest, true, false);
         println!("Coverage: {} ~ {}", earliest_local, latest_local);
@@ -561,7 +599,10 @@ fn cmd_status(json_output: bool) -> Result<()> {
         }
     }
 
-    println!("\nIndexed files: {} / {} on disk", status.indexed_files, status.files_on_disk);
+    println!(
+        "\nIndexed files: {} / {} on disk",
+        status.indexed_files, status.files_on_disk
+    );
     let unindexed = status.files_on_disk as i64 - status.indexed_files;
     if unindexed > 0 {
         eprintln!("  \u{26a0} {} files not indexed. Run 'ai-conversation-search index --all' to include them.", unindexed);
@@ -596,17 +637,27 @@ fn inject_resume_command(val: &mut serde_json::Value) {
         serde_json::Value::Object(map) => {
             // Only inject into objects that have session_id (i.e., result rows)
             if map.contains_key("session_id") {
-                let source = map.get("source")
+                let source = map
+                    .get("source")
                     .and_then(|v| v.as_str())
                     .unwrap_or("claude_code")
                     .to_string();
-                let session_id = map.get("session_id").and_then(|v| v.as_str()).map(String::from);
-                let project_path = map.get("project_path").and_then(|v| v.as_str()).map(String::from);
+                let session_id = map
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let project_path = map
+                    .get("project_path")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
 
                 let resume = match (session_id, project_path) {
                     (Some(sid), Some(pp)) => match source.as_str() {
                         "opencode" | "codex" => serde_json::Value::Null,
-                        _ => serde_json::Value::String(format!("cd {} && {} --resume {}", pp, cmd, sid)),
+                        _ => serde_json::Value::String(format!(
+                            "cd {} && {} --resume {}",
+                            pp, cmd, sid
+                        )),
                     },
                     _ => serde_json::Value::Null,
                 };
@@ -649,8 +700,10 @@ fn cmd_search(
         inject_resume_command(&mut localized);
         println!("{}", serde_json::to_string_pretty(&localized)?);
         if verbose {
-            eprintln!("Scanned {} sessions ({} messages), {} matched",
-                stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages);
+            eprintln!(
+                "Scanned {} sessions ({} messages), {} matched",
+                stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages
+            );
             print_unindexed_warning(&search);
         }
         return Ok(());
@@ -658,22 +711,34 @@ fn cmd_search(
 
     if results.is_empty() {
         println!("No results found for: {}", query);
-        eprintln!("Scanned {} sessions ({} messages), 0 matched",
-            stats.sessions_in_scope, stats.total_indexed_messages);
+        eprintln!(
+            "Scanned {} sessions ({} messages), 0 matched",
+            stats.sessions_in_scope, stats.total_indexed_messages
+        );
         print_unindexed_warning(&search);
         return Ok(());
     }
 
     if verbose {
-        eprintln!("Scanned {} sessions ({} messages), {} matched",
-            stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages);
+        eprintln!(
+            "Scanned {} sessions ({} messages), {} matched",
+            stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages
+        );
         print_unindexed_warning(&search);
     }
 
-    println!("\u{1f50d} Found {} matches for '{}':\n", results.len(), query);
+    println!(
+        "\u{1f50d} Found {} matches for '{}':\n",
+        results.len(),
+        query
+    );
 
     for result in &results {
-        let icon = if result.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+        let icon = if result.message_type == "user" {
+            "\u{1f464}"
+        } else {
+            "\u{1f916}"
+        };
         let timestamp = format_timestamp(&result.timestamp, true, false);
         let source_str = result.source.as_deref().unwrap_or("claude_code");
         let label = source_label(source_str);
@@ -699,9 +764,15 @@ fn cmd_search(
         }
 
         if source_str == "opencode" {
-            println!("\n   OpenCode session: {}", session_id.strip_prefix("oc:").unwrap_or(session_id));
+            println!(
+                "\n   OpenCode session: {}",
+                session_id.strip_prefix("oc:").unwrap_or(session_id)
+            );
         } else if source_str == "codex" {
-            println!("\n   Codex session: {}", session_id.strip_prefix("codex:").unwrap_or(session_id));
+            println!(
+                "\n   Codex session: {}",
+                session_id.strip_prefix("codex:").unwrap_or(session_id)
+            );
         } else {
             println!("\n   Resume:");
             println!("     cd {}", project_dir);
@@ -729,8 +800,10 @@ fn cmd_search_grouped(
         inject_resume_command(&mut localized);
         println!("{}", serde_json::to_string_pretty(&localized)?);
         if verbose {
-            eprintln!("Scanned {} sessions ({} messages), {} matched",
-                stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages);
+            eprintln!(
+                "Scanned {} sessions ({} messages), {} matched",
+                stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages
+            );
             print_unindexed_warning(search);
         }
         return Ok(());
@@ -738,19 +811,27 @@ fn cmd_search_grouped(
 
     if result.rows.is_empty() {
         println!("No results found for: {}", query);
-        eprintln!("Scanned {} sessions ({} messages), 0 matched",
-            stats.sessions_in_scope, stats.total_indexed_messages);
+        eprintln!(
+            "Scanned {} sessions ({} messages), 0 matched",
+            stats.sessions_in_scope, stats.total_indexed_messages
+        );
         print_unindexed_warning(search);
         return Ok(());
     }
 
     if verbose {
-        eprintln!("Scanned {} sessions ({} messages), {} matched",
-            stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages);
+        eprintln!(
+            "Scanned {} sessions ({} messages), {} matched",
+            stats.sessions_in_scope, stats.total_indexed_messages, stats.matched_messages
+        );
         print_unindexed_warning(search);
     }
 
-    println!("\u{1f50d} Found {} sessions matching '{}':\n", result.rows.len(), query);
+    println!(
+        "\u{1f50d} Found {} sessions matching '{}':\n",
+        result.rows.len(),
+        query
+    );
 
     for grouped in &result.rows {
         let r = &grouped.representative;
@@ -801,7 +882,11 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool) ->
     if !result.ancestors.is_empty() {
         println!("\u{1f4dc} Parent messages:");
         for msg in &result.ancestors {
-            let icon = if msg.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+            let icon = if msg.message_type == "user" {
+                "\u{1f464}"
+            } else {
+                "\u{1f916}"
+            };
             let summary = msg.summary.as_deref().unwrap_or("No summary");
             println!("  {} {}", icon, summary);
         }
@@ -811,7 +896,11 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool) ->
     // Show target
     if let Some(ref msg) = result.message {
         println!("\u{1f3af} Target message:");
-        let icon = if msg.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+        let icon = if msg.message_type == "user" {
+            "\u{1f464}"
+        } else {
+            "\u{1f916}"
+        };
         if show_content {
             println!("  {} {}", icon, msg.full_content);
         } else {
@@ -824,10 +913,7 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool) ->
     Ok(())
 }
 
-fn cmd_list(
-    filter: &SearchFilter<'_>,
-    json_output: bool,
-) -> Result<()> {
+fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
     maybe_background_index();
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
     let convs = search.list_recent_conversations(filter)?;
@@ -897,7 +983,11 @@ fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
 
 fn print_tree_nodes(nodes: &[TreeNode], indent: usize) {
     for node in nodes {
-        let icon = if node.message_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+        let icon = if node.message_type == "user" {
+            "\u{1f464}"
+        } else {
+            "\u{1f916}"
+        };
         let summary = node.summary.as_deref().unwrap_or("");
         let truncated: String = summary.chars().take(80).collect();
         let prefix = "  ".repeat(indent);
