@@ -12,32 +12,60 @@ enum MigrationKind {
 
 /// Migration definition: (version, description, kind).
 const MIGRATIONS: &[(i64, &str, MigrationKind)] = &[
-    (1, "add is_meta_conversation column",
-     MigrationKind::Sql("ALTER TABLE messages ADD COLUMN is_meta_conversation BOOLEAN DEFAULT FALSE")),
-    (2, "add repo_root column to conversations",
-     MigrationKind::Sql("ALTER TABLE conversations ADD COLUMN repo_root TEXT")),
-    (3, "create repo_root_cache table",
-     MigrationKind::Sql(
-         "CREATE TABLE IF NOT EXISTS repo_root_cache (
+    (
+        1,
+        "add is_meta_conversation column",
+        MigrationKind::Sql(
+            "ALTER TABLE messages ADD COLUMN is_meta_conversation BOOLEAN DEFAULT FALSE",
+        ),
+    ),
+    (
+        2,
+        "add repo_root column to conversations",
+        MigrationKind::Sql("ALTER TABLE conversations ADD COLUMN repo_root TEXT"),
+    ),
+    (
+        3,
+        "create repo_root_cache table",
+        MigrationKind::Sql(
+            "CREATE TABLE IF NOT EXISTS repo_root_cache (
               project_path TEXT PRIMARY KEY,
               repo_root TEXT,
               resolved_at TEXT DEFAULT CURRENT_TIMESTAMP
-          )")),
-    (4, "create index on repo_root",
-     MigrationKind::Sql("CREATE INDEX IF NOT EXISTS idx_conv_repo_root ON conversations(repo_root)")),
-    (5, "add source column to conversations",
-     MigrationKind::Sql("ALTER TABLE conversations ADD COLUMN source TEXT DEFAULT 'claude_code'")),
-    (6, "create index on source",
-     MigrationKind::Sql("CREATE INDEX IF NOT EXISTS idx_conv_source ON conversations(source)")),
-    (7, "create claude_code_sync_state table",
-     MigrationKind::Sql(
-         "CREATE TABLE IF NOT EXISTS claude_code_sync_state (
+          )",
+        ),
+    ),
+    (
+        4,
+        "create index on repo_root",
+        MigrationKind::Sql(
+            "CREATE INDEX IF NOT EXISTS idx_conv_repo_root ON conversations(repo_root)",
+        ),
+    ),
+    (
+        5,
+        "add source column to conversations",
+        MigrationKind::Sql(
+            "ALTER TABLE conversations ADD COLUMN source TEXT DEFAULT 'claude_code'",
+        ),
+    ),
+    (
+        6,
+        "create index on source",
+        MigrationKind::Sql("CREATE INDEX IF NOT EXISTS idx_conv_source ON conversations(source)"),
+    ),
+    (
+        7,
+        "create claude_code_sync_state table",
+        MigrationKind::Sql(
+            "CREATE TABLE IF NOT EXISTS claude_code_sync_state (
               file_path TEXT PRIMARY KEY,
               mtime REAL NOT NULL,
               indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
-          )")),
-    (8, "migrate FTS to trigram tokenizer",
-     MigrationKind::Custom),
+          )",
+        ),
+    ),
+    (8, "migrate FTS to trigram tokenizer", MigrationKind::Custom),
 ];
 
 /// Initialize the database schema and run migrations.
@@ -116,11 +144,7 @@ fn record_migration(conn: &Connection, version: i64) -> Result<()> {
 /// detect which migrations have already been applied and record them.
 fn bootstrap_existing_db(conn: &Connection) -> Result<()> {
     // If any versions already recorded, bootstrap is done
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM schema_version",
-        [],
-        |row| row.get(0),
-    )?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM schema_version", [], |row| row.get(0))?;
     if count > 0 {
         return Ok(());
     }
@@ -240,7 +264,9 @@ fn parse_create_table(sql: &str) -> Option<String> {
     } else {
         after
     };
-    let table = after.split(|c: char| c.is_whitespace() || c == '(').next()?;
+    let table = after
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()?;
     Some(table.to_string())
 }
 
@@ -302,7 +328,7 @@ fn migrate_fts_to_trigram(conn: &Connection) -> Result<()> {
             content='messages',
             content_rowid='rowid',
             tokenize='trigram case_sensitive 0'
-        );"
+        );",
     )?;
 
     tx.execute_batch(
@@ -319,7 +345,7 @@ fn migrate_fts_to_trigram(conn: &Connection) -> Result<()> {
             DELETE FROM message_content_fts WHERE rowid = old.rowid;
             INSERT INTO message_content_fts(rowid, message_uuid, full_content)
             VALUES (new.rowid, new.message_uuid, new.full_content);
-        END;"
+        END;",
     )?;
 
     tx.execute(
@@ -443,8 +469,9 @@ mod tests {
                 content='messages',
                 content_rowid='rowid',
                 tokenize='unicode61'
-            );"
-        ).unwrap();
+            );",
+        )
+        .unwrap();
 
         // Missing: is_meta_conversation, repo_root, repo_root_cache table,
         //          idx_conv_repo_root, source, idx_conv_source, claude_code_sync_state,
@@ -500,7 +527,8 @@ mod tests {
             assert!(
                 window[0] < window[1],
                 "Migration versions must be strictly increasing: {} >= {}",
-                window[0], window[1]
+                window[0],
+                window[1]
             );
         }
     }
@@ -510,12 +538,16 @@ mod tests {
         let result = parse_alter_add_column(
             "ALTER TABLE messages ADD COLUMN is_meta_conversation BOOLEAN DEFAULT FALSE",
         );
-        assert_eq!(result, Some(("messages".to_string(), "is_meta_conversation".to_string())));
-
-        let result = parse_alter_add_column(
-            "ALTER TABLE conversations ADD COLUMN repo_root TEXT",
+        assert_eq!(
+            result,
+            Some(("messages".to_string(), "is_meta_conversation".to_string()))
         );
-        assert_eq!(result, Some(("conversations".to_string(), "repo_root".to_string())));
+
+        let result = parse_alter_add_column("ALTER TABLE conversations ADD COLUMN repo_root TEXT");
+        assert_eq!(
+            result,
+            Some(("conversations".to_string(), "repo_root".to_string()))
+        );
 
         // Not an ALTER TABLE
         assert_eq!(parse_alter_add_column("CREATE TABLE foo (id INT)"), None);

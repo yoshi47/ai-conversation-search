@@ -12,7 +12,12 @@ pub fn resolve_repo_root(filesystem_path: &str) -> Option<String> {
     }
 
     let output = Command::new("git")
-        .args(["-C", &path.to_string_lossy(), "rev-parse", "--git-common-dir"])
+        .args([
+            "-C",
+            &path.to_string_lossy(),
+            "rev-parse",
+            "--git-common-dir",
+        ])
         .output()
         .ok()?;
 

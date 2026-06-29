@@ -17,21 +17,13 @@ pub struct CodexIndexer {
 }
 
 impl CodexIndexer {
-    pub fn new(
-        search_db_path: Option<&str>,
-        sessions_dir: Option<&str>,
-        quiet: bool,
-    ) -> Self {
+    pub fn new(search_db_path: Option<&str>, sessions_dir: Option<&str>, quiet: bool) -> Self {
         Self {
-            search_db_path: search_db_path
-                .unwrap_or(db::DEFAULT_DB_PATH)
-                .to_string(),
+            search_db_path: search_db_path.unwrap_or(db::DEFAULT_DB_PATH).to_string(),
             sessions_dir: db::expand_path(sessions_dir.unwrap_or(DEFAULT_CODEX_SESSIONS)),
             quiet,
-            uuid_re: Regex::new(
-                r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
-            )
-            .unwrap(),
+            uuid_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+                .unwrap(),
         }
     }
 
@@ -188,7 +180,10 @@ impl CodexIndexer {
             return Ok(0);
         }
 
-        let payload = first.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+        let payload = first
+            .get("payload")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let session_uuid = payload
             .get("id")
             .and_then(|v| v.as_str())
@@ -226,7 +221,10 @@ impl CodexIndexer {
             };
 
             let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let event_payload = event.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+            let event_payload = event
+                .get("payload")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
             let timestamp = event
                 .get("timestamp")
                 .and_then(|t| t.as_str())
@@ -235,7 +233,10 @@ impl CodexIndexer {
 
             match event_type {
                 "event_msg" => {
-                    let msg_type = event_payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let msg_type = event_payload
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
                     match msg_type {
                         "user_message" => {
                             let text = event_payload
@@ -255,7 +256,11 @@ impl CodexIndexer {
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("");
                             if !text.trim().is_empty() {
-                                messages.push(("assistant".to_string(), timestamp, text.to_string()));
+                                messages.push((
+                                    "assistant".to_string(),
+                                    timestamp,
+                                    text.to_string(),
+                                ));
                             }
                         }
                         "agent_reasoning" => {
@@ -275,7 +280,10 @@ impl CodexIndexer {
                     }
                 }
                 "response_item" => {
-                    let item_type = event_payload.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                    let item_type = event_payload
+                        .get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
                     match item_type {
                         "function_call" => {
                             let name = event_payload
@@ -284,8 +292,12 @@ impl CodexIndexer {
                                 .unwrap_or("unknown");
                             let mut tool_text = format!("[Tool: {}]", name);
 
-                            if let Some(args_str) = event_payload.get("arguments").and_then(|a| a.as_str()) {
-                                if let Ok(args) = serde_json::from_str::<serde_json::Value>(args_str) {
+                            if let Some(args_str) =
+                                event_payload.get("arguments").and_then(|a| a.as_str())
+                            {
+                                if let Ok(args) =
+                                    serde_json::from_str::<serde_json::Value>(args_str)
+                                {
                                     if let Some(cmd) = args.get("command") {
                                         let cmd_str = if let Some(s) = cmd.as_str() {
                                             s.to_string()
@@ -318,9 +330,7 @@ impl CodexIndexer {
                                     obj.get("output")
                                         .and_then(|o| o.as_str())
                                         .map(|s| s.chars().take(500).collect::<String>())
-                                        .unwrap_or_else(|| {
-                                            output_str.chars().take(500).collect()
-                                        })
+                                        .unwrap_or_else(|| output_str.chars().take(500).collect())
                                 } else {
                                     output_str.chars().take(500).collect()
                                 }
@@ -337,16 +347,29 @@ impl CodexIndexer {
                             }
                         }
                         "message" => {
-                            let role = event_payload.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                            let role = event_payload
+                                .get("role")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("");
                             if role == "user" || role == "developer" {
                                 continue;
                             }
-                            if let Some(content_parts) = event_payload.get("content").and_then(|c| c.as_array()) {
+                            if let Some(content_parts) =
+                                event_payload.get("content").and_then(|c| c.as_array())
+                            {
                                 for part in content_parts {
-                                    if part.get("type").and_then(|t| t.as_str()) == Some("output_text") {
-                                        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+                                    if part.get("type").and_then(|t| t.as_str())
+                                        == Some("output_text")
+                                    {
+                                        if let Some(text) =
+                                            part.get("text").and_then(|t| t.as_str())
+                                        {
                                             if !text.trim().is_empty() {
-                                                messages.push(("assistant".to_string(), timestamp.clone(), text.to_string()));
+                                                messages.push((
+                                                    "assistant".to_string(),
+                                                    timestamp.clone(),
+                                                    text.to_string(),
+                                                ));
                                             }
                                         }
                                     }
@@ -418,7 +441,10 @@ impl CodexIndexer {
             return Ok(0);
         }
 
-        let title = title_parts.first().map(|s| s.as_str()).unwrap_or("Untitled");
+        let title = title_parts
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("Untitled");
         let session_timestamp = payload
             .get("timestamp")
             .and_then(|t| t.as_str())
@@ -457,7 +483,8 @@ mod tests {
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute_batch(include_str!("../../data/schema.sql")).unwrap();
+        conn.execute_batch(include_str!("../../data/schema.sql"))
+            .unwrap();
         crate::schema::init_schema(&conn).unwrap();
         conn
     }
@@ -467,10 +494,8 @@ mod tests {
             search_db_path: String::new(),
             sessions_dir: sessions_dir.to_path_buf(),
             quiet: true,
-            uuid_re: Regex::new(
-                r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
-            )
-            .unwrap(),
+            uuid_re: Regex::new(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})")
+                .unwrap(),
         }
     }
 
@@ -655,8 +680,14 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(tool_content.contains("[Tool: shell]"), "tool content should contain tool name");
-        assert!(tool_content.contains("ls -la"), "tool content should contain command");
+        assert!(
+            tool_content.contains("[Tool: shell]"),
+            "tool content should contain tool name"
+        );
+        assert!(
+            tool_content.contains("ls -la"),
+            "tool content should contain command"
+        );
     }
 
     #[test]
@@ -701,7 +732,8 @@ mod tests {
         let indexer = create_indexer(Path::new("/nonexistent"));
 
         // Standard UUID in filename
-        let uuid = indexer.extract_uuid_from_filename("session-abcdef01-2345-6789-abcd-ef0123456789.jsonl");
+        let uuid = indexer
+            .extract_uuid_from_filename("session-abcdef01-2345-6789-abcd-ef0123456789.jsonl");
         assert_eq!(uuid, "abcdef01-2345-6789-abcd-ef0123456789");
 
         // No UUID -> fallback to file stem

@@ -236,7 +236,9 @@ fn extract_snippet(content: &str, search_terms: &[&str], max_len: usize) -> Stri
         if let Some((byte_start, byte_end)) = find_term(content, term) {
             match best_pos {
                 None => best_pos = Some((byte_start, byte_end - byte_start)),
-                Some((prev, _)) if byte_start < prev => best_pos = Some((byte_start, byte_end - byte_start)),
+                Some((prev, _)) if byte_start < prev => {
+                    best_pos = Some((byte_start, byte_end - byte_start))
+                }
                 _ => {}
             }
         }
@@ -277,7 +279,11 @@ fn extract_snippet(content: &str, search_terms: &[&str], max_len: usize) -> Stri
     }
 
     let prefix = if window_start > 0 { "..." } else { "" };
-    let suffix = if window_start + max_len < content.chars().count() { "..." } else { "" };
+    let suffix = if window_start + max_len < content.chars().count() {
+        "..."
+    } else {
+        ""
+    };
     format!("{}{}{}", prefix, result, suffix)
 }
 
@@ -313,7 +319,10 @@ fn find_term(haystack: &str, needle: &str) -> Option<(usize, usize)> {
 }
 
 fn summary_from_content(content: &str) -> String {
-    let first_line = content.lines().find(|line| !line.trim().is_empty()).unwrap_or("");
+    let first_line = content
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("");
     first_line.chars().take(120).collect()
 }
 
@@ -324,9 +333,13 @@ pub fn format_timestamp(iso_timestamp: &str, include_date: bool, include_seconds
         Ok(dt) => dt.with_timezone(&Utc),
         Err(_) => {
             // Try parsing without timezone
-            if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(iso_timestamp, "%Y-%m-%dT%H:%M:%S%.f") {
+            if let Ok(naive) =
+                chrono::NaiveDateTime::parse_from_str(iso_timestamp, "%Y-%m-%dT%H:%M:%S%.f")
+            {
                 naive.and_utc()
-            } else if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(iso_timestamp, "%Y-%m-%dT%H:%M:%S") {
+            } else if let Ok(naive) =
+                chrono::NaiveDateTime::parse_from_str(iso_timestamp, "%Y-%m-%dT%H:%M:%S")
+            {
                 naive.and_utc()
             } else {
                 return iso_timestamp.to_string();
@@ -399,19 +412,21 @@ impl ConversationSearch {
     }
 
     pub fn count_indexed_files(&self) -> Result<i64> {
-        Ok(self.conn.query_row(
-            "SELECT COUNT(*) FROM claude_code_sync_state", [], |r| r.get(0),
-        )?)
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM claude_code_sync_state", [], |r| {
+                r.get(0)
+            })?)
     }
 
     pub fn get_index_status(&self, files_on_disk: usize) -> Result<IndexStatus> {
-        let total_conversations: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conversations", [], |r| r.get(0),
-        )?;
+        let total_conversations: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
 
-        let total_messages: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM messages", [], |r| r.get(0),
-        )?;
+        let total_messages: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))?;
 
         let orphan_conversations: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM (
@@ -427,13 +442,17 @@ impl ConversationSearch {
             |r| r.get(0),
         )?;
 
-        let earliest_conversation: Option<String> = self.conn.query_row(
-            "SELECT MIN(first_message_at) FROM conversations", [], |r| r.get(0),
-        )?;
+        let earliest_conversation: Option<String> =
+            self.conn
+                .query_row("SELECT MIN(first_message_at) FROM conversations", [], |r| {
+                    r.get(0)
+                })?;
 
-        let latest_conversation: Option<String> = self.conn.query_row(
-            "SELECT MAX(last_message_at) FROM conversations", [], |r| r.get(0),
-        )?;
+        let latest_conversation: Option<String> =
+            self.conn
+                .query_row("SELECT MAX(last_message_at) FROM conversations", [], |r| {
+                    r.get(0)
+                })?;
 
         let mut by_source = Vec::new();
         {
@@ -441,7 +460,10 @@ impl ConversationSearch {
                 "SELECT COALESCE(source, 'claude_code'), COUNT(*) FROM conversations GROUP BY source ORDER BY COUNT(*) DESC"
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok(SourceCount { source: row.get(0)?, count: row.get(1)? })
+                Ok(SourceCount {
+                    source: row.get(0)?,
+                    count: row.get(1)?,
+                })
             })?;
             for row in rows.flatten() {
                 by_source.push(row);
@@ -454,16 +476,21 @@ impl ConversationSearch {
                 "SELECT repo_root, COUNT(*) as cnt FROM conversations WHERE repo_root IS NOT NULL GROUP BY repo_root ORDER BY cnt DESC LIMIT 20"
             )?;
             let rows = stmt.query_map([], |row| {
-                Ok(RepoCount { repo_root: row.get(0)?, count: row.get(1)? })
+                Ok(RepoCount {
+                    repo_root: row.get(0)?,
+                    count: row.get(1)?,
+                })
             })?;
             for row in rows.flatten() {
                 by_repo.push(row);
             }
         }
 
-        let indexed_files: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM claude_code_sync_state", [], |r| r.get(0),
-        )?;
+        let indexed_files: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM claude_code_sync_state", [], |r| {
+                    r.get(0)
+                })?;
 
         let db_path = db::expand_path(&self.db_path);
         let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -502,12 +529,14 @@ impl ConversationSearch {
 
     /// Gather search statistics (total indexed and in-scope counts).
     fn gather_search_stats(&self, filter: &SearchFilter<'_>, matched: i64) -> Result<SearchStats> {
-        let total_indexed_sessions: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM conversations", [], |r| r.get(0),
-        )?;
+        let total_indexed_sessions: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
 
         let total_indexed_messages: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM messages WHERE is_meta_conversation = FALSE", [], |r| r.get(0),
+            "SELECT COUNT(*) FROM messages WHERE is_meta_conversation = FALSE",
+            [],
+            |r| r.get(0),
         )?;
 
         // Count sessions in scope (after filters)
@@ -516,10 +545,12 @@ impl ConversationSearch {
         );
         let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
         Self::append_filters(&mut sql, &mut params, filter)?;
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
 
-        let sessions_in_scope: i64 = self.conn.prepare(&sql)
-            .and_then(|mut stmt| stmt.query_row(rusqlite::params_from_iter(&param_refs), |r| r.get(0)))?;
+        let sessions_in_scope: i64 = self.conn.prepare(&sql).and_then(|mut stmt| {
+            stmt.query_row(rusqlite::params_from_iter(&param_refs), |r| r.get(0))
+        })?;
 
         Ok(SearchStats {
             total_indexed_sessions,
@@ -591,7 +622,11 @@ impl ConversationSearch {
                 if terms.len() == 1 {
                     format!("\"{}\"", terms[0])
                 } else {
-                    terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" AND ")
+                    terms
+                        .iter()
+                        .map(|t| format!("\"{}\"", t))
+                        .collect::<Vec<_>>()
+                        .join(" AND ")
                 }
             } else {
                 query.to_string()
@@ -606,7 +641,10 @@ impl ConversationSearch {
 
             if rowids.is_empty() {
                 let stats = self.gather_search_stats(filter, 0)?;
-                return Ok(SearchResult { rows: Vec::new(), stats });
+                return Ok(SearchResult {
+                    rows: Vec::new(),
+                    stats,
+                });
             }
 
             // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
@@ -644,7 +682,10 @@ impl ConversationSearch {
             }
             let matched = all_results.len() as i64;
             let stats = self.gather_search_stats(filter, matched)?;
-            return Ok(SearchResult { rows: all_results, stats });
+            return Ok(SearchResult {
+                rows: all_results,
+                stats,
+            });
         };
 
         let rows = self.execute_search_typed(&sql, &params)?;
@@ -697,7 +738,7 @@ impl ConversationSearch {
                  ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.timestamp DESC) AS rn, \
                  COUNT(*) OVER (PARTITION BY m.session_id) AS match_count \
                  FROM messages m JOIN conversations c ON m.session_id = c.session_id \
-                 WHERE m.is_meta_conversation = FALSE"
+                 WHERE m.is_meta_conversation = FALSE",
             );
 
             if !trimmed.is_empty() {
@@ -740,7 +781,11 @@ impl ConversationSearch {
             if fts_terms.len() == 1 {
                 format!("\"{}\"", fts_terms[0])
             } else {
-                fts_terms.iter().map(|t| format!("\"{}\"", t)).collect::<Vec<_>>().join(" AND ")
+                fts_terms
+                    .iter()
+                    .map(|t| format!("\"{}\"", t))
+                    .collect::<Vec<_>>()
+                    .join(" AND ")
             }
         } else {
             query.to_string()
@@ -750,7 +795,10 @@ impl ConversationSearch {
 
         if rowids.is_empty() {
             let stats = self.gather_search_stats(filter, 0)?;
-            return Ok(GroupedSearchResult { rows: Vec::new(), stats });
+            return Ok(GroupedSearchResult {
+                rows: Vec::new(),
+                stats,
+            });
         }
 
         const BATCH_SIZE: usize = 500;
@@ -802,10 +850,13 @@ impl ConversationSearch {
         let rows: Vec<GroupedRow> = order
             .into_iter()
             .map(|sid| {
-                let (rep, count) = session_data
-                    .remove(&sid)
-                    .expect("BUG: `order` must only contain session_ids inserted into session_data");
-                GroupedRow { representative: rep, match_count: count }
+                let (rep, count) = session_data.remove(&sid).expect(
+                    "BUG: `order` must only contain session_ids inserted into session_data",
+                );
+                GroupedRow {
+                    representative: rep,
+                    match_count: count,
+                }
             })
             .collect();
 
@@ -858,9 +909,9 @@ impl ConversationSearch {
     }
 
     fn query_fts_rowids(&self, fts_query: &str) -> Result<Vec<i64>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT rowid FROM message_content_fts WHERE full_content MATCH ?"
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT rowid FROM message_content_fts WHERE full_content MATCH ?")?;
         let rowids = stmt
             .query_map(rusqlite::params![fts_query], |row| row.get(0))?
             .collect::<std::result::Result<Vec<i64>, _>>()?;
@@ -872,7 +923,8 @@ impl ConversationSearch {
         sql: &str,
         params: &[Box<dyn rusqlite::types::ToSql>],
     ) -> Result<Vec<SearchResultRow>> {
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
 
         match self.query_rows(sql, &param_refs, SearchResultRow::from_row) {
             Ok(results) => Ok(results),
@@ -976,10 +1028,7 @@ impl ConversationSearch {
         })
     }
 
-    pub fn get_conversation_tree(
-        &self,
-        session_id: &str,
-    ) -> Result<ConversationTree> {
+    pub fn get_conversation_tree(&self, session_id: &str) -> Result<ConversationTree> {
         let messages = self.query_rows(
             "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
             &[&session_id as &dyn rusqlite::types::ToSql],
@@ -1129,7 +1178,10 @@ impl ConversationSearch {
         // Re-indexing only helps when the index claims messages it doesn't have;
         // for message_count == 0 rows the state is reproduced by design.
         let error = if conversation.message_count > 0 {
-            format!("{}. Run ai-conversation-search index --all to repair the DB.", reason)
+            format!(
+                "{}. Run ai-conversation-search index --all to repair the DB.",
+                reason
+            )
         } else {
             format!("{}.", reason)
         };
@@ -1154,7 +1206,10 @@ impl ConversationSearch {
         for msg in messages {
             if let Some(ref parent_uuid) = msg.parent_uuid {
                 if msg_map.contains_key(parent_uuid) {
-                    children_map.entry(parent_uuid.clone()).or_default().push(msg.message_uuid.clone());
+                    children_map
+                        .entry(parent_uuid.clone())
+                        .or_default()
+                        .push(msg.message_uuid.clone());
                     continue;
                 }
             }
@@ -1166,9 +1221,13 @@ impl ConversationSearch {
             msg_map: &HashMap<String, &MessageRow>,
             children_map: &HashMap<String, Vec<String>>,
         ) -> TreeNode {
-            let msg = msg_map.get(uuid).expect("build_node called with uuid not in msg_map");
+            let msg = msg_map
+                .get(uuid)
+                .expect("build_node called with uuid not in msg_map");
             let children = if let Some(kids) = children_map.get(uuid) {
-                kids.iter().map(|k| build_node(k, msg_map, children_map)).collect()
+                kids.iter()
+                    .map(|k| build_node(k, msg_map, children_map))
+                    .collect()
             } else {
                 Vec::new()
             };
@@ -1187,7 +1246,10 @@ impl ConversationSearch {
             }
         }
 
-        roots.iter().map(|uuid| build_node(uuid, &msg_map, &children_map)).collect()
+        roots
+            .iter()
+            .map(|uuid| build_node(uuid, &msg_map, &children_map))
+            .collect()
     }
 
     fn build_tree_from_raw_messages(
@@ -1207,7 +1269,10 @@ impl ConversationSearch {
         for msg in messages {
             if let Some(ref parent_uuid) = msg.parent_uuid {
                 if msg_map.contains_key(parent_uuid) {
-                    children_map.entry(parent_uuid.clone()).or_default().push(msg.uuid.clone());
+                    children_map
+                        .entry(parent_uuid.clone())
+                        .or_default()
+                        .push(msg.uuid.clone());
                     continue;
                 }
             }
@@ -1222,10 +1287,21 @@ impl ConversationSearch {
             project_path: Option<&str>,
             fallback_session_id: &str,
         ) -> TreeNode {
-            let msg = msg_map.get(uuid).expect("build_node called with uuid not in msg_map");
+            let msg = msg_map
+                .get(uuid)
+                .expect("build_node called with uuid not in msg_map");
             let children = if let Some(kids) = children_map.get(uuid) {
                 kids.iter()
-                    .map(|k| build_node(k, msg_map, children_map, depths, project_path, fallback_session_id))
+                    .map(|k| {
+                        build_node(
+                            k,
+                            msg_map,
+                            children_map,
+                            depths,
+                            project_path,
+                            fallback_session_id,
+                        )
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -1250,7 +1326,16 @@ impl ConversationSearch {
 
         roots
             .iter()
-            .map(|uuid| build_node(uuid, &msg_map, &children_map, &depths, project_path, fallback_session_id))
+            .map(|uuid| {
+                build_node(
+                    uuid,
+                    &msg_map,
+                    &children_map,
+                    &depths,
+                    project_path,
+                    fallback_session_id,
+                )
+            })
             .collect()
     }
 
@@ -1267,11 +1352,12 @@ impl ConversationSearch {
         let repo = filter.repo;
         let source = filter.source;
 
-        let effective_days = if days_back.is_none() && since.is_none() && until.is_none() && date.is_none() {
-            Some(7i64)
-        } else {
-            days_back
-        };
+        let effective_days =
+            if days_back.is_none() && since.is_none() && until.is_none() && date.is_none() {
+                Some(7i64)
+            } else {
+                days_back
+            };
 
         if effective_days.is_some() && (since.is_some() || until.is_some() || date.is_some()) {
             return Err(AppError::General(
@@ -1315,7 +1401,8 @@ impl ConversationSearch {
         sql.push_str(" ORDER BY last_message_at DESC LIMIT ?");
         params.push(Box::new(limit));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         self.query_rows(&sql, &param_refs, ConversationRow::from_row)
     }
 
@@ -1360,15 +1447,22 @@ impl ConversationSearch {
         sql.push_str(" ORDER BY last_message_at DESC LIMIT ?");
         params.push(Box::new(max_conversations));
 
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
         let conversations = self.query_rows(&sql, &param_refs, ConversationRow::from_row)?;
 
         if conversations.is_empty() {
-            return Ok(format!("No conversations found in the last {} day(s).", days_back));
+            return Ok(format!(
+                "No conversations found in the last {} day(s).",
+                days_back
+            ));
         }
 
         let day_word = if days_back == 1 { "" } else { "s" };
-        let mut lines = vec![format!("# Conversations (last {} day{})\n", days_back, day_word)];
+        let mut lines = vec![format!(
+            "# Conversations (last {} day{})\n",
+            days_back, day_word
+        )];
 
         for conv in &conversations {
             let session_id = &conv.session_id;
@@ -1381,13 +1475,19 @@ impl ConversationSearch {
             let session_short = &session_id[..std::cmp::min(8, session_id.len())];
 
             lines.push(format!("## [{}] {}", session_short, summary));
-            lines.push(format!("**{} msgs** | {} | {}\n", msg_count, project, date_str));
+            lines.push(format!(
+                "**{} msgs** | {} | {}\n",
+                msg_count, project, date_str
+            ));
 
             // Fetch messages
             let msg_sql = "SELECT message_uuid, timestamp, message_type, summary, is_sidechain, project_path, is_tool_noise FROM messages WHERE session_id = ? AND is_tool_noise = FALSE AND is_meta_conversation = FALSE ORDER BY timestamp DESC LIMIT ?";
             let mut msg_results = self.query_rows(
                 msg_sql,
-                &[session_id as &dyn rusqlite::types::ToSql, &max_messages_per_conv as &dyn rusqlite::types::ToSql],
+                &[
+                    session_id as &dyn rusqlite::types::ToSql,
+                    &max_messages_per_conv as &dyn rusqlite::types::ToSql,
+                ],
                 |row| {
                     Ok((
                         row.get::<_, String>("message_uuid")?,
@@ -1413,11 +1513,18 @@ impl ConversationSearch {
                 }
 
                 let msg_time = format_timestamp(timestamp, false, false);
-                let icon = if msg_type == "user" { "\u{1f464}" } else { "\u{1f916}" };
+                let icon = if msg_type == "user" {
+                    "\u{1f464}"
+                } else {
+                    "\u{1f916}"
+                };
                 let branch = if *is_sidechain { "\u{1f33f} " } else { "" };
                 let uuid_short = &uuid[..8.min(uuid.len())];
 
-                lines.push(format!("{} {} `{}` {}{}", icon, msg_time, uuid_short, branch, msg_summary));
+                lines.push(format!(
+                    "{} {} `{}` {}{}",
+                    icon, msg_time, uuid_short, branch, msg_summary
+                ));
             }
 
             lines.push(String::new());
@@ -1454,13 +1561,17 @@ mod tests {
     use std::io::Write;
 
     fn default_filter() -> SearchFilter<'static> {
-        SearchFilter { limit: 10, ..Default::default() }
+        SearchFilter {
+            limit: 10,
+            ..Default::default()
+        }
     }
 
     fn setup_test_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
-        conn.execute_batch(include_str!("../data/schema.sql")).unwrap();
+        conn.execute_batch(include_str!("../data/schema.sql"))
+            .unwrap();
         crate::schema::init_schema(&conn).unwrap();
         conn
     }
@@ -1474,7 +1585,17 @@ mod tests {
         timestamp: &str,
         project_path: &str,
     ) {
-        insert_test_message_full(conn, uuid, session_id, content, msg_type, timestamp, project_path, false, false);
+        insert_test_message_full(
+            conn,
+            uuid,
+            session_id,
+            content,
+            msg_type,
+            timestamp,
+            project_path,
+            false,
+            false,
+        );
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1608,13 +1729,39 @@ mod tests {
     #[test]
     fn test_search_empty_query() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "hello world", "user", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess1", "goodbye world", "assistant", "2025-01-15T11:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "hello world",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess1",
+            "goodbye world",
+            "assistant",
+            "2025-01-15T11:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("", &default_filter()).unwrap().rows;
+            .search_conversations("", &default_filter())
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 2);
         // Should be ordered by timestamp DESC
@@ -1624,13 +1771,39 @@ mod tests {
     #[test]
     fn test_search_fts_match() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "the quick brown fox jumps over the lazy dog", "user", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess1", "rust programming language is great", "assistant", "2025-01-15T11:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "the quick brown fox jumps over the lazy dog",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess1",
+            "rust programming language is great",
+            "assistant",
+            "2025-01-15T11:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("fox", &default_filter()).unwrap().rows;
+            .search_conversations("fox", &default_filter())
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1639,12 +1812,30 @@ mod tests {
     #[test]
     fn test_search_no_results() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "hello world", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "hello world",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("xyzzyzzy", &default_filter()).unwrap().rows;
+            .search_conversations("xyzzyzzy", &default_filter())
+            .unwrap()
+            .rows;
 
         assert!(results.is_empty());
     }
@@ -1652,17 +1843,57 @@ mod tests {
     #[test]
     fn test_search_days_back_filter() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2020-01-01T00:00:00", "2020-01-01T01:00:00", "claude_code");
-        insert_test_message(&conn, "old_msg", "sess1", "very old message content", "user", "2020-01-01T00:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2020-01-01T00:00:00",
+            "2020-01-01T01:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "old_msg",
+            "sess1",
+            "very old message content",
+            "user",
+            "2020-01-01T00:00:00",
+            "/proj",
+        );
 
-        insert_test_conversation(&conn, "sess2", "/proj", "summary2", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
+        insert_test_conversation(
+            &conn,
+            "sess2",
+            "/proj",
+            "summary2",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
         // Use a timestamp that's definitely recent
         let recent_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        insert_test_message(&conn, "new_msg", "sess2", "brand new message content", "user", &recent_ts, "/proj");
+        insert_test_message(
+            &conn,
+            "new_msg",
+            "sess2",
+            "brand new message content",
+            "user",
+            &recent_ts,
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message content", &SearchFilter { days_back: Some(1), ..default_filter() }).unwrap().rows;
+            .search_conversations(
+                "message content",
+                &SearchFilter {
+                    days_back: Some(1),
+                    ..default_filter()
+                },
+            )
+            .unwrap()
+            .rows;
 
         // Only the recent message should be returned
         assert_eq!(results.len(), 1);
@@ -1672,14 +1903,54 @@ mod tests {
     #[test]
     fn test_search_project_filter() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj_a", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_conversation(&conn, "sess2", "/proj_b", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "hello from project a", "user", "2025-01-15T10:00:00", "/proj_a");
-        insert_test_message(&conn, "msg2", "sess2", "hello from project b", "user", "2025-01-15T10:00:00", "/proj_b");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj_a",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sess2",
+            "/proj_b",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "hello from project a",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj_a",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess2",
+            "hello from project b",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj_b",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("hello", &SearchFilter { project_path: Some("/proj_a"), ..default_filter() }).unwrap().rows;
+            .search_conversations(
+                "hello",
+                &SearchFilter {
+                    project_path: Some("/proj_a"),
+                    ..default_filter()
+                },
+            )
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].project_path.as_deref(), Some("/proj_a"));
@@ -1688,14 +1959,54 @@ mod tests {
     #[test]
     fn test_search_source_filter() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_conversation(&conn, "sess2", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "opencode");
-        insert_test_message(&conn, "msg1", "sess1", "message from claude", "user", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess2", "message from opencode", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sess2",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "opencode",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "message from claude",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess2",
+            "message from opencode",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message", &SearchFilter { source: Some("opencode"), ..default_filter() }).unwrap().rows;
+            .search_conversations(
+                "message",
+                &SearchFilter {
+                    source: Some("opencode"),
+                    ..default_filter()
+                },
+            )
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source.as_deref(), Some("opencode"));
@@ -1704,14 +2015,56 @@ mod tests {
     #[test]
     fn test_search_repo_filter() {
         let conn = setup_test_db();
-        insert_test_conversation_with_repo(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code", "/home/user/my-repo");
-        insert_test_conversation_with_repo(&conn, "sess2", "/proj2", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code", "/home/user/other-repo");
-        insert_test_message(&conn, "msg1", "sess1", "code in my repo", "user", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess2", "code in other repo", "user", "2025-01-15T10:00:00", "/proj2");
+        insert_test_conversation_with_repo(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+            "/home/user/my-repo",
+        );
+        insert_test_conversation_with_repo(
+            &conn,
+            "sess2",
+            "/proj2",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+            "/home/user/other-repo",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "code in my repo",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess2",
+            "code in other repo",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj2",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("code", &SearchFilter { repo: Some("my-repo"), ..default_filter() }).unwrap().rows;
+            .search_conversations(
+                "code",
+                &SearchFilter {
+                    repo: Some("my-repo"),
+                    ..default_filter()
+                },
+            )
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1720,13 +2073,45 @@ mod tests {
     #[test]
     fn test_search_date_filter() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-14T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "message on jan 15", "user", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess1", "message on jan 14", "user", "2025-01-14T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-14T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "message on jan 15",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess1",
+            "message on jan 14",
+            "user",
+            "2025-01-14T10:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("message", &SearchFilter { date: Some("2025-01-15"), ..default_filter() }).unwrap().rows;
+            .search_conversations(
+                "message",
+                &SearchFilter {
+                    date: Some("2025-01-15"),
+                    ..default_filter()
+                },
+            )
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -1739,7 +2124,11 @@ mod tests {
 
         let result = searcher.search_conversations(
             "test",
-            &SearchFilter { days_back: Some(7), since: Some("2025-01-01"), ..default_filter() },
+            &SearchFilter {
+                days_back: Some(7),
+                since: Some("2025-01-01"),
+                ..default_filter()
+            },
         );
 
         assert!(result.is_err());
@@ -1755,27 +2144,77 @@ mod tests {
     #[test]
     fn test_search_grouped_empty_query_limits_sessions() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sessA", "/proj", "session A", "2025-01-15T09:00:00", "2025-01-15T19:00:00", "claude_code");
-        insert_test_conversation(&conn, "sessB", "/proj", "session B", "2025-01-15T09:00:00", "2025-01-15T18:00:00", "claude_code");
-        insert_test_conversation(&conn, "sessC", "/proj", "session C", "2025-01-15T09:00:00", "2025-01-15T17:00:00", "claude_code");
+        insert_test_conversation(
+            &conn,
+            "sessA",
+            "/proj",
+            "session A",
+            "2025-01-15T09:00:00",
+            "2025-01-15T19:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sessB",
+            "/proj",
+            "session B",
+            "2025-01-15T09:00:00",
+            "2025-01-15T18:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sessC",
+            "/proj",
+            "session C",
+            "2025-01-15T09:00:00",
+            "2025-01-15T17:00:00",
+            "claude_code",
+        );
         for i in 0..10 {
-            insert_test_message(&conn, &format!("a{}", i), "sessA", "content A", "user",
-                &format!("2025-01-15T1{}:00:00", i), "/proj");
+            insert_test_message(
+                &conn,
+                &format!("a{}", i),
+                "sessA",
+                "content A",
+                "user",
+                &format!("2025-01-15T1{}:00:00", i),
+                "/proj",
+            );
         }
         for i in 0..10 {
-            insert_test_message(&conn, &format!("b{}", i), "sessB", "content B", "user",
-                &format!("2025-01-14T1{}:00:00", i), "/proj");
+            insert_test_message(
+                &conn,
+                &format!("b{}", i),
+                "sessB",
+                "content B",
+                "user",
+                &format!("2025-01-14T1{}:00:00", i),
+                "/proj",
+            );
         }
         for i in 0..5 {
-            insert_test_message(&conn, &format!("c{}", i), "sessC", "content C", "user",
-                &format!("2025-01-13T1{}:00:00", i), "/proj");
+            insert_test_message(
+                &conn,
+                &format!("c{}", i),
+                "sessC",
+                "content C",
+                "user",
+                &format!("2025-01-13T1{}:00:00", i),
+                "/proj",
+            );
         }
 
         let mut searcher = ConversationSearch::from_connection(conn);
-        let result = searcher.search_grouped_by_session(
-            "",
-            &SearchFilter { limit: 2, ..Default::default() },
-        ).unwrap();
+        let result = searcher
+            .search_grouped_by_session(
+                "",
+                &SearchFilter {
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         assert_eq!(result.rows.len(), 2, "limit must apply at session level");
         assert_eq!(result.rows[0].representative.session_id, "sessA");
@@ -1789,25 +2228,76 @@ mod tests {
     #[test]
     fn test_search_grouped_fts_limits_sessions() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sessA", "/proj", "A", "2025-01-15T09:00:00", "2025-01-15T19:00:00", "claude_code");
-        insert_test_conversation(&conn, "sessB", "/proj", "B", "2025-01-15T09:00:00", "2025-01-15T18:00:00", "claude_code");
-        insert_test_conversation(&conn, "sessC", "/proj", "C", "2025-01-15T09:00:00", "2025-01-15T17:00:00", "claude_code");
+        insert_test_conversation(
+            &conn,
+            "sessA",
+            "/proj",
+            "A",
+            "2025-01-15T09:00:00",
+            "2025-01-15T19:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sessB",
+            "/proj",
+            "B",
+            "2025-01-15T09:00:00",
+            "2025-01-15T18:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sessC",
+            "/proj",
+            "C",
+            "2025-01-15T09:00:00",
+            "2025-01-15T17:00:00",
+            "claude_code",
+        );
         // sessA: 3 matches; sessB: 2 matches; sessC: 1 match
         for i in 0..3 {
-            insert_test_message(&conn, &format!("a{}", i), "sessA", "common keyword here", "user",
-                &format!("2025-01-15T1{}:00:00", i), "/proj");
+            insert_test_message(
+                &conn,
+                &format!("a{}", i),
+                "sessA",
+                "common keyword here",
+                "user",
+                &format!("2025-01-15T1{}:00:00", i),
+                "/proj",
+            );
         }
         for i in 0..2 {
-            insert_test_message(&conn, &format!("b{}", i), "sessB", "common keyword here", "user",
-                &format!("2025-01-14T1{}:00:00", i), "/proj");
+            insert_test_message(
+                &conn,
+                &format!("b{}", i),
+                "sessB",
+                "common keyword here",
+                "user",
+                &format!("2025-01-14T1{}:00:00", i),
+                "/proj",
+            );
         }
-        insert_test_message(&conn, "c0", "sessC", "common keyword here", "user", "2025-01-13T10:00:00", "/proj");
+        insert_test_message(
+            &conn,
+            "c0",
+            "sessC",
+            "common keyword here",
+            "user",
+            "2025-01-13T10:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
-        let result = searcher.search_grouped_by_session(
-            "common",
-            &SearchFilter { limit: 2, ..Default::default() },
-        ).unwrap();
+        let result = searcher
+            .search_grouped_by_session(
+                "common",
+                &SearchFilter {
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0].representative.session_id, "sessA");
@@ -1821,17 +2311,62 @@ mod tests {
     #[test]
     fn test_search_grouped_short_query_like_path() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sessA", "/proj", "A", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
-        insert_test_conversation(&conn, "sessB", "/proj", "B", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "a1", "sessA", "ok done", "user", "2025-01-15T11:00:00", "/proj");
-        insert_test_message(&conn, "a2", "sessA", "ok again", "user", "2025-01-15T10:30:00", "/proj");
-        insert_test_message(&conn, "b1", "sessB", "ok one", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sessA",
+            "/proj",
+            "A",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sessB",
+            "/proj",
+            "B",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "a1",
+            "sessA",
+            "ok done",
+            "user",
+            "2025-01-15T11:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "a2",
+            "sessA",
+            "ok again",
+            "user",
+            "2025-01-15T10:30:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "b1",
+            "sessB",
+            "ok one",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
-        let result = searcher.search_grouped_by_session(
-            "ok",
-            &SearchFilter { limit: 5, ..Default::default() },
-        ).unwrap();
+        let result = searcher
+            .search_grouped_by_session(
+                "ok",
+                &SearchFilter {
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         assert_eq!(result.rows.len(), 2);
         assert_eq!(result.rows[0].representative.session_id, "sessA");
@@ -1844,25 +2379,69 @@ mod tests {
     #[test]
     fn test_search_grouped_preserves_filters() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sessA", "/proj_a", "A", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
-        insert_test_conversation(&conn, "sessB", "/proj_b", "B", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "opencode");
-        insert_test_message(&conn, "a1", "sessA", "topic alpha", "user", "2025-01-15T11:00:00", "/proj_a");
-        insert_test_message(&conn, "b1", "sessB", "topic beta", "user", "2025-01-15T10:00:00", "/proj_b");
+        insert_test_conversation(
+            &conn,
+            "sessA",
+            "/proj_a",
+            "A",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sessB",
+            "/proj_b",
+            "B",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "opencode",
+        );
+        insert_test_message(
+            &conn,
+            "a1",
+            "sessA",
+            "topic alpha",
+            "user",
+            "2025-01-15T11:00:00",
+            "/proj_a",
+        );
+        insert_test_message(
+            &conn,
+            "b1",
+            "sessB",
+            "topic beta",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj_b",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         // FTS path with source filter
-        let result = searcher.search_grouped_by_session(
-            "topic",
-            &SearchFilter { source: Some("opencode"), limit: 10, ..Default::default() },
-        ).unwrap();
+        let result = searcher
+            .search_grouped_by_session(
+                "topic",
+                &SearchFilter {
+                    source: Some("opencode"),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].representative.session_id, "sessB");
 
         // Empty-query window path with project filter
-        let result = searcher.search_grouped_by_session(
-            "",
-            &SearchFilter { project_path: Some("/proj_a"), limit: 10, ..Default::default() },
-        ).unwrap();
+        let result = searcher
+            .search_grouped_by_session(
+                "",
+                &SearchFilter {
+                    project_path: Some("/proj_a"),
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].representative.session_id, "sessA");
     }
@@ -1871,15 +2450,44 @@ mod tests {
     #[test]
     fn test_search_grouped_representative_is_most_recent() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sessA", "/proj", "A", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
-        insert_test_message(&conn, "old", "sessA", "match here", "user", "2025-01-15T09:00:00", "/proj");
-        insert_test_message(&conn, "new", "sessA", "match here too", "user", "2025-01-15T11:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sessA",
+            "/proj",
+            "A",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "old",
+            "sessA",
+            "match here",
+            "user",
+            "2025-01-15T09:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "new",
+            "sessA",
+            "match here too",
+            "user",
+            "2025-01-15T11:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
-        let result = searcher.search_grouped_by_session(
-            "match",
-            &SearchFilter { limit: 5, ..Default::default() },
-        ).unwrap();
+        let result = searcher
+            .search_grouped_by_session(
+                "match",
+                &SearchFilter {
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].representative.message_uuid, "new");
         assert_eq!(result.rows[0].match_count, 2);
@@ -1891,35 +2499,91 @@ mod tests {
     #[test]
     fn test_search_grouped_excludes_meta_conversation() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sessA", "/proj", "A", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
-        insert_test_conversation(&conn, "sessM", "/proj", "only-meta", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
+        insert_test_conversation(
+            &conn,
+            "sessA",
+            "/proj",
+            "A",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sessM",
+            "/proj",
+            "only-meta",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
 
         // sessA: 1 normal + 1 meta (both contain "keyword").
-        insert_test_message_full(&conn, "a1", "sessA", "keyword alpha", "user",
-            "2025-01-15T11:00:00", "/proj", false, false);
-        insert_test_message_full(&conn, "a_meta", "sessA", "keyword alpha", "user",
-            "2025-01-15T10:30:00", "/proj", true, false);
+        insert_test_message_full(
+            &conn,
+            "a1",
+            "sessA",
+            "keyword alpha",
+            "user",
+            "2025-01-15T11:00:00",
+            "/proj",
+            false,
+            false,
+        );
+        insert_test_message_full(
+            &conn,
+            "a_meta",
+            "sessA",
+            "keyword alpha",
+            "user",
+            "2025-01-15T10:30:00",
+            "/proj",
+            true,
+            false,
+        );
 
         // sessM: meta-only — must not appear in results at all.
-        insert_test_message_full(&conn, "m1", "sessM", "keyword alpha", "user",
-            "2025-01-15T10:00:00", "/proj", true, false);
+        insert_test_message_full(
+            &conn,
+            "m1",
+            "sessM",
+            "keyword alpha",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+            true,
+            false,
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
 
         // FTS path.
-        let result = searcher.search_grouped_by_session(
-            "keyword",
-            &SearchFilter { limit: 10, ..Default::default() },
-        ).unwrap();
+        let result = searcher
+            .search_grouped_by_session(
+                "keyword",
+                &SearchFilter {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(result.rows.len(), 1, "sessM (meta-only) must be excluded");
         assert_eq!(result.rows[0].representative.session_id, "sessA");
-        assert_eq!(result.rows[0].match_count, 1, "meta message must not inflate match_count");
+        assert_eq!(
+            result.rows[0].match_count, 1,
+            "meta message must not inflate match_count"
+        );
 
         // Window-function path (empty query).
-        let result = searcher.search_grouped_by_session(
-            "",
-            &SearchFilter { limit: 10, ..Default::default() },
-        ).unwrap();
+        let result = searcher
+            .search_grouped_by_session(
+                "",
+                &SearchFilter {
+                    limit: 10,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].representative.session_id, "sessA");
         assert_eq!(result.rows[0].match_count, 1);
@@ -1937,7 +2601,9 @@ mod tests {
             limit: 10,
             ..Default::default()
         };
-        let err = searcher.search_grouped_by_session("anything", &filter).unwrap_err();
+        let err = searcher
+            .search_grouped_by_session("anything", &filter)
+            .unwrap_err();
         assert!(err.to_string().contains("Cannot use --days"));
     }
 
@@ -1948,10 +2614,15 @@ mod tests {
     fn test_search_grouped_negative_limit_errors() {
         let conn = setup_test_db();
         let mut searcher = ConversationSearch::from_connection(conn);
-        let err = searcher.search_grouped_by_session(
-            "anything",
-            &SearchFilter { limit: -1, ..Default::default() },
-        ).unwrap_err();
+        let err = searcher
+            .search_grouped_by_session(
+                "anything",
+                &SearchFilter {
+                    limit: -1,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
         assert!(err.to_string().contains("limit must be >= 0"));
     }
 
@@ -1960,10 +2631,26 @@ mod tests {
     #[test]
     fn test_get_conversation_context() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
 
         // Insert parent message
-        insert_test_message(&conn, "parent1", "sess1", "parent message", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_message(
+            &conn,
+            "parent1",
+            "sess1",
+            "parent message",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         // Insert child message with parent_uuid set
         conn.execute(
@@ -1986,7 +2673,9 @@ mod tests {
         let conn = setup_test_db();
         let searcher = ConversationSearch::from_connection(conn);
 
-        let result = searcher.get_conversation_context("nonexistent-uuid", 5).unwrap();
+        let result = searcher
+            .get_conversation_context("nonexistent-uuid", 5)
+            .unwrap();
 
         assert!(result.error.is_some());
         assert!(result.error.unwrap().contains("not found"));
@@ -1997,10 +2686,26 @@ mod tests {
     #[test]
     fn test_get_conversation_tree() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "tree test", "2025-01-15T09:00:00", "2025-01-15T11:00:00", "claude_code");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "tree test",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
 
         // Insert root message
-        insert_test_message(&conn, "root1", "sess1", "root message", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_message(
+            &conn,
+            "root1",
+            "sess1",
+            "root message",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         // Insert child with parent_uuid
         conn.execute(
@@ -2050,7 +2755,11 @@ mod tests {
         let warning = result.warning.as_deref().unwrap_or("");
         assert!(warning.contains("raw transcript"), "warning: {}", warning);
         assert!(warning.contains("index --all"), "warning: {}", warning);
-        assert!(!warning.contains("Showing"), "complete tree should have no discrepancy note: {}", warning);
+        assert!(
+            !warning.contains("Showing"),
+            "complete tree should have no discrepancy note: {}",
+            warning
+        );
         assert_eq!(result.total_messages, 2);
         assert_eq!(result.tree.len(), 1);
         assert_eq!(result.tree[0].message_uuid, "root1");
@@ -2087,7 +2796,11 @@ mod tests {
 
         assert!(result.tree.is_empty());
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("no raw transcript path is recorded"), "error: {}", error);
+        assert!(
+            error.contains("no raw transcript path is recorded"),
+            "error: {}",
+            error
+        );
         assert!(error.contains("index --all"), "error: {}", error);
     }
 
@@ -2181,8 +2894,16 @@ mod tests {
 
         assert!(result.tree.is_empty());
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("no messages for session sess-wanted"), "error: {}", error);
-        assert!(error.contains("belong to other sessions"), "error: {}", error);
+        assert!(
+            error.contains("no messages for session sess-wanted"),
+            "error: {}",
+            error
+        );
+        assert!(
+            error.contains("belong to other sessions"),
+            "error: {}",
+            error
+        );
     }
 
     #[test]
@@ -2206,8 +2927,16 @@ mod tests {
 
         assert!(result.tree.is_empty());
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("only supported for Claude Code sessions"), "error: {}", error);
-        assert!(!error.contains("index --all"), "no repair advice for non-claude rows: {}", error);
+        assert!(
+            error.contains("only supported for Claude Code sessions"),
+            "error: {}",
+            error
+        );
+        assert!(
+            !error.contains("index --all"),
+            "no repair advice for non-claude rows: {}",
+            error
+        );
     }
 
     #[test]
@@ -2232,7 +2961,11 @@ mod tests {
         assert!(result.error.is_none());
         let warning = result.warning.as_deref().unwrap_or("");
         assert!(warning.contains("sibling session"), "warning: {}", warning);
-        assert!(!warning.contains("index --all"), "repair advice is wrong here: {}", warning);
+        assert!(
+            !warning.contains("index --all"),
+            "repair advice is wrong here: {}",
+            warning
+        );
     }
 
     // ---- list_recent_conversations tests ----
@@ -2241,27 +2974,54 @@ mod tests {
     fn test_list_recent_conversations() {
         let conn = setup_test_db();
         let recent_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-        insert_test_conversation(&conn, "sess1", "/proj_a", "summary a", &recent_ts, &recent_ts, "claude_code");
-        insert_test_conversation(&conn, "sess2", "/proj_b", "summary b", &recent_ts, &recent_ts, "opencode");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj_a",
+            "summary a",
+            &recent_ts,
+            &recent_ts,
+            "claude_code",
+        );
+        insert_test_conversation(
+            &conn,
+            "sess2",
+            "/proj_b",
+            "summary b",
+            &recent_ts,
+            &recent_ts,
+            "opencode",
+        );
 
         let searcher = ConversationSearch::from_connection(conn);
 
         // List all recent
         let results = searcher
-            .list_recent_conversations(&SearchFilter { days_back: Some(1), ..default_filter() })
+            .list_recent_conversations(&SearchFilter {
+                days_back: Some(1),
+                ..default_filter()
+            })
             .unwrap();
         assert_eq!(results.len(), 2);
 
         // Filter by project
         let results = searcher
-            .list_recent_conversations(&SearchFilter { days_back: Some(1), project_path: Some("/proj_a"), ..default_filter() })
+            .list_recent_conversations(&SearchFilter {
+                days_back: Some(1),
+                project_path: Some("/proj_a"),
+                ..default_filter()
+            })
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].project_path.as_deref(), Some("/proj_a"));
 
         // Filter by source
         let results = searcher
-            .list_recent_conversations(&SearchFilter { days_back: Some(1), source: Some("opencode"), ..default_filter() })
+            .list_recent_conversations(&SearchFilter {
+                days_back: Some(1),
+                source: Some("opencode"),
+                ..default_filter()
+            })
             .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].source.as_deref(), Some("opencode"));
@@ -2272,19 +3032,39 @@ mod tests {
     #[test]
     fn test_query_sanitization() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "rustacean programming language", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "rustacean programming language",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
 
         // Single term — trigram substring match
         let results = searcher
-            .search_conversations("rustac", &default_filter()).unwrap().rows;
+            .search_conversations("rustac", &default_filter())
+            .unwrap()
+            .rows;
         assert_eq!(results.len(), 1); // "rustac" is a substring of "rustacean"
 
         // Multi terms — AND join, each as substring match
         let results = searcher
-            .search_conversations("rustac programm", &default_filter()).unwrap().rows;
+            .search_conversations("rustac programm", &default_filter())
+            .unwrap()
+            .rows;
         assert_eq!(results.len(), 1); // both substrings found
     }
 
@@ -2293,13 +3073,39 @@ mod tests {
     #[test]
     fn test_search_japanese_single_term() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "認証機能の実装を行いました", "assistant", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess1", "hello world in english", "user", "2025-01-15T10:01:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "認証機能の実装を行いました",
+            "assistant",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess1",
+            "hello world in english",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("認証", &default_filter()).unwrap().rows;
+            .search_conversations("認証", &default_filter())
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -2308,14 +3114,40 @@ mod tests {
     #[test]
     fn test_search_japanese_multi_term() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "認証機能の実装を行いました", "assistant", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess1", "認証だけのメッセージ", "user", "2025-01-15T10:01:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "認証機能の実装を行いました",
+            "assistant",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess1",
+            "認証だけのメッセージ",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         // Both terms must match (AND join)
         let results = searcher
-            .search_conversations("認証 実装", &default_filter()).unwrap().rows;
+            .search_conversations("認証 実装", &default_filter())
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1"); // Only msg1 contains both 認証 and 実装
@@ -2324,38 +3156,86 @@ mod tests {
     #[test]
     fn test_search_mixed_cjk_english() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "OAuth認証の実装をRustで行いました", "assistant", "2025-01-15T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "OAuth認証の実装をRustで行いました",
+            "assistant",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
 
         // English term in mixed content
         let results = searcher
-            .search_conversations("OAuth", &default_filter()).unwrap().rows;
+            .search_conversations("OAuth", &default_filter())
+            .unwrap()
+            .rows;
         assert_eq!(results.len(), 1);
 
         // Japanese term in mixed content
         let results = searcher
-            .search_conversations("認証", &default_filter()).unwrap().rows;
+            .search_conversations("認証", &default_filter())
+            .unwrap()
+            .rows;
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn test_search_short_query_like_fallback() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "型の定義を変更しました", "assistant", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess1", "英語のメッセージ", "user", "2025-01-15T10:01:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "型の定義を変更しました",
+            "assistant",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess1",
+            "英語のメッセージ",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         // 1-byte short query (e.g. "ab") should use LIKE fallback
         let results = searcher
-            .search_conversations("ab", &default_filter()).unwrap().rows;
+            .search_conversations("ab", &default_filter())
+            .unwrap()
+            .rows;
         assert!(results.is_empty()); // no match, but should not error
 
         // CJK 2-char query "型の" (6 bytes) should use LIKE fallback
         let results = searcher
-            .search_conversations("型の", &default_filter()).unwrap().rows;
+            .search_conversations("型の", &default_filter())
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -2367,8 +3247,24 @@ mod tests {
         // CJK 2-char terms (e.g. "認証") = 2 codepoints < 3, so FTS won't match.
         // LIKE fallback is required.
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "認証機能の実装を行いました", "assistant", "2025-01-15T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "認証機能の実装を行いました",
+            "assistant",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         // Direct FTS MATCH with CJK 2-char term should NOT match
         let result: Option<String> = conn
@@ -2378,26 +3274,57 @@ mod tests {
                 |row| row.get(0),
             )
             .ok();
-        assert_eq!(result, None, "CJK 2-char term should NOT match via FTS trigram (2 codepoints < 3)");
+        assert_eq!(
+            result, None,
+            "CJK 2-char term should NOT match via FTS trigram (2 codepoints < 3)"
+        );
 
         // But search_conversations should still find it via LIKE fallback
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("認証", &default_filter()).unwrap().rows;
+            .search_conversations("認証", &default_filter())
+            .unwrap()
+            .rows;
         assert_eq!(results.len(), 1);
     }
 
     #[test]
     fn test_search_multi_term_and_join() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "rustacean programming language", "user", "2025-01-15T10:00:00", "/proj");
-        insert_test_message(&conn, "msg2", "sess1", "rustacean is a term for rust users", "user", "2025-01-15T10:01:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "rustacean programming language",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "msg2",
+            "sess1",
+            "rustacean is a term for rust users",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         // "rustac programm" should match msg1 (contains both substrings) but not msg2
         let results = searcher
-            .search_conversations("rustac programm", &default_filter()).unwrap().rows;
+            .search_conversations("rustac programm", &default_filter())
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
@@ -2406,42 +3333,98 @@ mod tests {
     #[test]
     fn test_search_snippet_trigram() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "sess1", "/proj", "summary", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "msg1", "sess1", "the quick brown fox jumps over the lazy dog", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "the quick brown fox jumps over the lazy dog",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let results = searcher
-            .search_conversations("brown fox", &default_filter()).unwrap().rows;
+            .search_conversations("brown fox", &default_filter())
+            .unwrap()
+            .rows;
 
         assert_eq!(results.len(), 1);
         let snippet = &results[0].context_snippet;
         // Snippet should contain highlighted search terms
-        assert!(snippet.contains("**brown**"), "snippet should highlight 'brown': {}", snippet);
-        assert!(snippet.contains("**fox**"), "snippet should highlight 'fox': {}", snippet);
+        assert!(
+            snippet.contains("**brown**"),
+            "snippet should highlight 'brown': {}",
+            snippet
+        );
+        assert!(
+            snippet.contains("**fox**"),
+            "snippet should highlight 'fox': {}",
+            snippet
+        );
     }
 
     #[test]
     fn test_extract_snippet_japanese_no_char_boundary_panic() {
         let content = "claude codeのsessionをcodexで引き継ぎたいときはどうしたらいい？";
         let snippet = extract_snippet(content, &["どう"], 20);
-        assert!(snippet.contains("どう"), "snippet should contain Japanese match: {}", snippet);
+        assert!(
+            snippet.contains("どう"),
+            "snippet should contain Japanese match: {}",
+            snippet
+        );
     }
 
     #[test]
     fn test_extract_snippet_unicode_case_insensitive() {
         let snippet = extract_snippet("Try Café search", &["café"], 40);
-        assert!(snippet.contains("**Café**"), "snippet should highlight Unicode case match: {}", snippet);
+        assert!(
+            snippet.contains("**Café**"),
+            "snippet should highlight Unicode case match: {}",
+            snippet
+        );
     }
 
     #[test]
     fn test_status_counts_orphan_conversations() {
         let conn = setup_test_db();
-        insert_test_conversation(&conn, "healthy", "/proj", "healthy", "2025-01-15T09:00:00", "2025-01-15T10:00:00", "claude_code");
-        insert_test_message(&conn, "healthy-msg", "healthy", "hello", "user", "2025-01-15T10:00:00", "/proj");
+        insert_test_conversation(
+            &conn,
+            "healthy",
+            "/proj",
+            "healthy",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "healthy-msg",
+            "healthy",
+            "hello",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
         insert_orphan_conversation(&conn, "orphan", Some("missing.jsonl"), 5, "claude_code");
         // Not orphans: legitimately-empty row (sibling-session attribution) and
         // a non-claude row outside the repair path's scope.
-        insert_orphan_conversation(&conn, "empty-by-design", Some("missing.jsonl"), 0, "claude_code");
+        insert_orphan_conversation(
+            &conn,
+            "empty-by-design",
+            Some("missing.jsonl"),
+            0,
+            "claude_code",
+        );
         insert_orphan_conversation(&conn, "codex-orphan", Some("rollout.jsonl"), 3, "codex");
 
         let searcher = ConversationSearch::from_connection(conn);

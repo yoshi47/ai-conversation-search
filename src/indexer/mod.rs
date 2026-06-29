@@ -4,8 +4,8 @@ pub mod opencode;
 
 use rusqlite::Connection;
 
-pub use claude_code::ConversationIndexer;
 pub use claude_code::count_conversation_files_on_disk;
+pub use claude_code::ConversationIndexer;
 
 /// Resolve repo root with DB-backed cache.
 pub fn resolve_repo_root_cached(conn: &Connection, project_path: &str) -> Option<String> {

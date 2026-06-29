@@ -105,7 +105,8 @@ mod tests {
 
     #[test]
     fn test_build_date_filter_since_until() {
-        let (sql, params) = build_date_filter(Some("2025-11-10"), Some("2025-11-13"), None).unwrap();
+        let (sql, params) =
+            build_date_filter(Some("2025-11-10"), Some("2025-11-13"), None).unwrap();
         assert_eq!(sql, "timestamp >= ? AND timestamp < ?");
         assert_eq!(params[0], "2025-11-10T00:00:00");
         assert_eq!(params[1], "2025-11-14T00:00:00");

@@ -9,7 +9,7 @@ use crate::git_utils::resolve_repo_root;
 use crate::schema::init_schema;
 use crate::summarization;
 
-use super::{Message, ConversationMeta};
+use super::{ConversationMeta, Message};
 
 /// JSONL message entry.
 #[derive(Debug, Deserialize)]
@@ -194,10 +194,7 @@ impl ConversationIndexer {
             let components_to_try: Vec<String> = if consume == 1 {
                 vec![component_parts[0].clone()]
             } else {
-                vec![
-                    component_parts.join("."),
-                    component_parts.join("-"),
-                ]
+                vec![component_parts.join("."), component_parts.join("-")]
             };
 
             for component in &components_to_try {
@@ -371,7 +368,8 @@ impl ConversationIndexer {
                         Err(e) => {
                             self.log(&format!(
                                 "Warning: failed to read entry in {}: {}",
-                                home.display(), e
+                                home.display(),
+                                e
                             ));
                             continue;
                         }
@@ -391,7 +389,8 @@ impl ConversationIndexer {
             Err(e) => {
                 self.log(&format!(
                     "Warning: failed to read home directory {}: {}",
-                    home.display(), e
+                    home.display(),
+                    e
                 ));
             }
         }
@@ -435,15 +434,14 @@ impl ConversationIndexer {
         self.log(&format!(
             "Scanning {} project directories: {}",
             project_dirs.len(),
-            project_dirs.iter()
+            project_dirs
+                .iter()
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
 
-        let cutoff_time = days_back.map(|d| {
-            chrono::Local::now() - chrono::TimeDelta::days(d)
-        });
+        let cutoff_time = days_back.map(|d| chrono::Local::now() - chrono::TimeDelta::days(d));
 
         let mut conversation_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
 
@@ -457,7 +455,8 @@ impl ConversationIndexer {
                 Err(e) => {
                     self.log(&format!(
                         "Warning: failed to read project directory {}: {}",
-                        projects_dir.display(), e
+                        projects_dir.display(),
+                        e
                     ));
                     continue;
                 }
@@ -471,7 +470,9 @@ impl ConversationIndexer {
 
                 // Skip summarizer project
                 if summarizer_hash.as_ref().is_some_and(|hash| {
-                    project_dir.file_name().map_or(false, |name| name.to_string_lossy() == *hash)
+                    project_dir
+                        .file_name()
+                        .map_or(false, |name| name.to_string_lossy() == *hash)
                 }) {
                     continue;
                 }
@@ -481,7 +482,8 @@ impl ConversationIndexer {
                     Err(e) => {
                         self.log(&format!(
                             "Warning: failed to read project subdirectory {}: {}",
-                            project_dir.display(), e
+                            project_dir.display(),
+                            e
                         ));
                         continue;
                     }
@@ -788,7 +790,14 @@ impl ConversationIndexer {
         // Collect parent_uuid and content info we need for traversal
         let msg_info: Vec<(String, Option<String>, String, String)> = messages
             .iter()
-            .map(|m| (m.uuid.clone(), m.parent_uuid.clone(), m.message_type.clone(), m.content.clone()))
+            .map(|m| {
+                (
+                    m.uuid.clone(),
+                    m.parent_uuid.clone(),
+                    m.message_type.clone(),
+                    m.content.clone(),
+                )
+            })
             .collect();
 
         // Find all messages that use conversation-search
@@ -973,11 +982,14 @@ impl ConversationIndexer {
 
         let decoded_path = Self::decode_project_dir_name(&dir_name);
         let decode_succeeded = decoded_path.is_some();
-        let mut project_path = decoded_path
-            .unwrap_or_else(|| {
-                let naive = dir_name.replace('-', "/");
-                if naive.starts_with('/') { naive } else { format!("/{}", naive) }
-            });
+        let mut project_path = decoded_path.unwrap_or_else(|| {
+            let naive = dir_name.replace('-', "/");
+            if naive.starts_with('/') {
+                naive
+            } else {
+                format!("/{}", naive)
+            }
+        });
 
         // Get session ID
         let session_id = match messages[0].session_id.as_ref() {
@@ -1000,8 +1012,13 @@ impl ConversationIndexer {
         // 6. "Untitled conversation"
         let project_dir = file_path.parent().map(|p| p.to_path_buf());
         let session_info = project_dir.as_ref().and_then(|pd| {
-            self.lookup_session_info(pd, &session_id)
-                .map(|e| (e.summary.clone(), e.first_prompt.clone(), e.project_path.clone()))
+            self.lookup_session_info(pd, &session_id).map(|e| {
+                (
+                    e.summary.clone(),
+                    e.first_prompt.clone(),
+                    e.project_path.clone(),
+                )
+            })
         });
         let (si_summary, si_first_prompt, si_project_path) = match session_info {
             Some((s, fp, pp)) => (s, fp, pp),
@@ -1023,14 +1040,17 @@ impl ConversationIndexer {
             .or_else(|| conv_meta.as_ref().and_then(|m| m.custom_title.clone()))
             .or(si_summary)
             .or_else(|| si_first_prompt.map(|fp| fp.chars().take(100).collect()))
-            .or_else(|| conv_meta.as_ref().and_then(|m| m.first_user_message.clone()))
+            .or_else(|| {
+                conv_meta
+                    .as_ref()
+                    .and_then(|m| m.first_user_message.clone())
+            })
             .unwrap_or_else(|| "Untitled conversation".to_string());
 
         // Resolve repo_root before opening the write transaction — it shells
         // out to `git` and writes to `repo_root_cache` via self.conn, which
         // would conflict with the outer transaction we're about to open.
-        let repo_root =
-            self.resolve_repo_root(&project_path, Some(&file_path.to_string_lossy()));
+        let repo_root = self.resolve_repo_root(&project_path, Some(&file_path.to_string_lossy()));
 
         // Pick root message (used only on the INSERT path).
         let root_message_uuid = messages
@@ -1069,11 +1089,10 @@ impl ConversationIndexer {
             // next pass and re-insert it, inflating duplicate counts. Worse,
             // the message could end up attributed to a different session.
             let existing_uuids: HashSet<String> = {
-                let mut stmt = tx
-                    .prepare("SELECT message_uuid FROM messages WHERE session_id = ?")?;
-                let rows: rusqlite::Result<HashSet<String>> = stmt
-                    .query_map([&session_id], |row| row.get(0))?
-                    .collect();
+                let mut stmt =
+                    tx.prepare("SELECT message_uuid FROM messages WHERE session_id = ?")?;
+                let rows: rusqlite::Result<HashSet<String>> =
+                    stmt.query_map([&session_id], |row| row.get(0))?.collect();
                 rows?
             };
 
@@ -1229,7 +1248,10 @@ impl ConversationIndexer {
             // Already logged the drop above; suppress the misleading
             // "Indexed N messages" footer.
         } else if is_update {
-            self.log(&format!("  Added {} new messages", messages_to_insert.len()));
+            self.log(&format!(
+                "  Added {} new messages",
+                messages_to_insert.len()
+            ));
         } else {
             self.log(&format!("  Indexed {} messages", messages_to_insert.len()));
         }
@@ -1300,7 +1322,10 @@ impl ConversationIndexer {
     #[allow(dead_code)]
     pub fn index_all(&mut self, days_back: Option<i64>) -> Result<()> {
         let files = self.scan_conversations(days_back);
-        self.log(&format!("Found {} conversation files to index", files.len()));
+        self.log(&format!(
+            "Found {} conversation files to index",
+            files.len()
+        ));
 
         let total = files.len();
         for (i, file_path) in files.into_iter().enumerate() {
@@ -1583,7 +1608,10 @@ mod tests {
         let meta_uuids = ConversationIndexer::mark_meta_conversations(&mut messages);
 
         // Both messages should be marked as meta
-        assert!(meta_uuids.contains("a1"), "assistant message should be meta");
+        assert!(
+            meta_uuids.contains("a1"),
+            "assistant message should be meta"
+        );
         assert!(meta_uuids.contains("u1"), "user ancestor should be meta");
         assert!(messages[0].is_meta_conversation);
         assert!(messages[1].is_meta_conversation);
@@ -1684,11 +1712,7 @@ mod tests {
     /// Write a JSONL file inside `dir` and return its path. Unlike
     /// `write_temp_jsonl` this keeps the file in a real (named) directory so
     /// the indexer's project_path derivation has something to work with.
-    fn write_jsonl_in_dir(
-        dir: &std::path::Path,
-        name: &str,
-        lines: &[&str],
-    ) -> std::path::PathBuf {
+    fn write_jsonl_in_dir(dir: &std::path::Path, name: &str, lines: &[&str]) -> std::path::PathBuf {
         let path = dir.join(format!("{}.jsonl", name));
         let mut f = std::fs::File::create(&path).unwrap();
         for line in lines {
@@ -1717,23 +1741,31 @@ mod tests {
         let proj = dir.path();
 
         // Session A: 3 messages.
-        let file_a = write_jsonl_in_dir(proj, "sessA", &[
-            r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessA","message":{"role":"user","content":"Initial question about pdf rendering"}}"#,
-            r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessA","message":{"role":"assistant","content":"Reply about pdf"}}"#,
-            r#"{"uuid":"u3","parentUuid":"u2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessA","message":{"role":"user","content":"Follow-up in A"}}"#,
-        ]);
+        let file_a = write_jsonl_in_dir(
+            proj,
+            "sessA",
+            &[
+                r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessA","message":{"role":"user","content":"Initial question about pdf rendering"}}"#,
+                r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessA","message":{"role":"assistant","content":"Reply about pdf"}}"#,
+                r#"{"uuid":"u3","parentUuid":"u2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessA","message":{"role":"user","content":"Follow-up in A"}}"#,
+            ],
+        );
         indexer.index_conversation(&file_a).unwrap();
 
         // Session B: a resume of A. It re-emits u1, u2, u3 (same UUIDs) and
         // appends two new messages u4, u5. The new messages contain the
         // distinctive token "devbox-needle" so we can verify they're FTS-able.
-        let file_b = write_jsonl_in_dir(proj, "sessB", &[
-            r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"Initial question about pdf rendering"}}"#,
-            r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessB","message":{"role":"assistant","content":"Reply about pdf"}}"#,
-            r#"{"uuid":"u3","parentUuid":"u2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"Follow-up in A"}}"#,
-            r#"{"uuid":"u4","parentUuid":"u3","isSidechain":false,"timestamp":"2025-01-15T11:00:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"devbox-needle question"}}"#,
-            r#"{"uuid":"u5","parentUuid":"u4","isSidechain":false,"timestamp":"2025-01-15T11:01:00Z","type":"assistant","sessionId":"sessB","message":{"role":"assistant","content":"devbox-needle answer"}}"#,
-        ]);
+        let file_b = write_jsonl_in_dir(
+            proj,
+            "sessB",
+            &[
+                r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"Initial question about pdf rendering"}}"#,
+                r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessB","message":{"role":"assistant","content":"Reply about pdf"}}"#,
+                r#"{"uuid":"u3","parentUuid":"u2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"Follow-up in A"}}"#,
+                r#"{"uuid":"u4","parentUuid":"u3","isSidechain":false,"timestamp":"2025-01-15T11:00:00Z","type":"user","sessionId":"sessB","message":{"role":"user","content":"devbox-needle question"}}"#,
+                r#"{"uuid":"u5","parentUuid":"u4","isSidechain":false,"timestamp":"2025-01-15T11:01:00Z","type":"assistant","sessionId":"sessB","message":{"role":"assistant","content":"devbox-needle answer"}}"#,
+            ],
+        );
         indexer.index_conversation(&file_b).unwrap();
 
         let conn = indexer.connection();
@@ -1760,7 +1792,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(msgs_under_a, 3, "session A keeps its 3 original messages");
-        assert_eq!(msgs_under_b, 2, "session B only owns the new u4, u5 after OR IGNORE");
+        assert_eq!(
+            msgs_under_b, 2,
+            "session B only owns the new u4, u5 after OR IGNORE"
+        );
 
         // message_count reflects COUNT(*), not parsed JSONL length.
         let conv_a_count: i64 = conn
@@ -1778,7 +1813,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(conv_a_count, 3);
-        assert_eq!(conv_b_count, 2, "must NOT be 5 — INSERT OR IGNORE skipped u1-u3");
+        assert_eq!(
+            conv_b_count, 2,
+            "must NOT be 5 — INSERT OR IGNORE skipped u1-u3"
+        );
 
         // FTS finds the new devbox-needle content.
         let fts_hit: i64 = conn
@@ -1790,15 +1828,17 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert!(fts_hit >= 2, "FTS should find both u4 and u5 (got {})", fts_hit);
+        assert!(
+            fts_hit >= 2,
+            "FTS should find both u4 and u5 (got {})",
+            fts_hit
+        );
 
         // Both files have a sync_state entry.
         let sync_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM claude_code_sync_state",
-                [],
-                |r| r.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM claude_code_sync_state", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(sync_count, 2);
     }
@@ -1814,10 +1854,14 @@ mod tests {
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
         let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
 
-        let file = write_jsonl_in_dir(dir.path(), "session1", &[
-            r#"{"uuid":"x1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"hello"}}"#,
-            r#"{"uuid":"x2","parentUuid":"x1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess1","message":{"role":"assistant","content":"world"}}"#,
-        ]);
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "session1",
+            &[
+                r#"{"uuid":"x1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"hello"}}"#,
+                r#"{"uuid":"x2","parentUuid":"x1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess1","message":{"role":"assistant","content":"world"}}"#,
+            ],
+        );
         indexer.index_conversation(&file).unwrap();
 
         let conn = indexer.connection();
@@ -1836,7 +1880,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(inconsistent, 0, "post-index DB must have no orphan/skewed rows");
+        assert_eq!(
+            inconsistent, 0,
+            "post-index DB must have no orphan/skewed rows"
+        );
 
         // sync_state was written inside the same transaction.
         let sync_count: i64 = conn
@@ -1873,19 +1920,27 @@ mod tests {
         let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
 
         // B (the resume) — index it FIRST.
-        let file_b = write_jsonl_in_dir(dir.path(), "sessB_rev", &[
-            r#"{"uuid":"r1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessB_rev","message":{"role":"user","content":"shared content"}}"#,
-            r#"{"uuid":"r2","parentUuid":"r1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessB_rev","message":{"role":"assistant","content":"shared reply"}}"#,
-            r#"{"uuid":"r3","parentUuid":"r2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessB_rev","message":{"role":"user","content":"shared followup"}}"#,
-        ]);
+        let file_b = write_jsonl_in_dir(
+            dir.path(),
+            "sessB_rev",
+            &[
+                r#"{"uuid":"r1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessB_rev","message":{"role":"user","content":"shared content"}}"#,
+                r#"{"uuid":"r2","parentUuid":"r1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessB_rev","message":{"role":"assistant","content":"shared reply"}}"#,
+                r#"{"uuid":"r3","parentUuid":"r2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessB_rev","message":{"role":"user","content":"shared followup"}}"#,
+            ],
+        );
         indexer.index_conversation(&file_b).unwrap();
 
         // A (the original) — same UUIDs, but indexed SECOND.
-        let file_a = write_jsonl_in_dir(dir.path(), "sessA_rev", &[
-            r#"{"uuid":"r1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessA_rev","message":{"role":"user","content":"shared content"}}"#,
-            r#"{"uuid":"r2","parentUuid":"r1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessA_rev","message":{"role":"assistant","content":"shared reply"}}"#,
-            r#"{"uuid":"r3","parentUuid":"r2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessA_rev","message":{"role":"user","content":"shared followup"}}"#,
-        ]);
+        let file_a = write_jsonl_in_dir(
+            dir.path(),
+            "sessA_rev",
+            &[
+                r#"{"uuid":"r1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessA_rev","message":{"role":"user","content":"shared content"}}"#,
+                r#"{"uuid":"r2","parentUuid":"r1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sessA_rev","message":{"role":"assistant","content":"shared reply"}}"#,
+                r#"{"uuid":"r3","parentUuid":"r2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"sessA_rev","message":{"role":"user","content":"shared followup"}}"#,
+            ],
+        );
         indexer.index_conversation(&file_a).unwrap();
 
         let conn = indexer.connection();
@@ -1922,7 +1977,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(sync_a, 1, "sync_state must be written even when conv row is dropped");
+        assert_eq!(
+            sync_a, 1,
+            "sync_state must be written even when conv row is dropped"
+        );
 
         // Invariant: no orphan / no skewed rows.
         let inconsistent: i64 = conn
@@ -1950,10 +2008,14 @@ mod tests {
         let db_path = dir.path().join("test.db").to_string_lossy().to_string();
         let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
 
-        let file = write_jsonl_in_dir(dir.path(), "session1", &[
-            r#"{"uuid":"y1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"hi"}}"#,
-            r#"{"uuid":"y2","parentUuid":"y1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess1","message":{"role":"assistant","content":"hello"}}"#,
-        ]);
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "session1",
+            &[
+                r#"{"uuid":"y1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"hi"}}"#,
+                r#"{"uuid":"y2","parentUuid":"y1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess1","message":{"role":"assistant","content":"hello"}}"#,
+            ],
+        );
 
         indexer.index_conversation(&file).unwrap();
         // Snapshot indexed_at to detect whether the second call updated the row.
@@ -1975,7 +2037,11 @@ mod tests {
 
         let conn = indexer.connection();
         let msg_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = 'sess1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'sess1'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(msg_count, 2, "must not duplicate messages on re-index");
 
@@ -2017,7 +2083,10 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1100));
         {
             use std::io::Write as _;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
             writeln!(f, r#"{{"uuid":"g3","parentUuid":"g2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"user","sessionId":"grow","message":{{"role":"user","content":"q2"}}}}"#).unwrap();
             writeln!(f, r#"{{"uuid":"g4","parentUuid":"g3","isSidechain":false,"timestamp":"2025-01-15T10:03:00Z","type":"assistant","sessionId":"grow","message":{{"role":"assistant","content":"a2"}}}}"#).unwrap();
             f.sync_all().unwrap();
@@ -2027,9 +2096,16 @@ mod tests {
 
         let conn = indexer.connection();
         let msg_count: i64 = conn
-            .query_row("SELECT COUNT(*) FROM messages WHERE session_id = 'grow'", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE session_id = 'grow'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(msg_count, 4, "all 4 messages must be present after grow + reindex");
+        assert_eq!(
+            msg_count, 4,
+            "all 4 messages must be present after grow + reindex"
+        );
 
         let conv_count: i64 = conn
             .query_row(
@@ -2038,7 +2114,10 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(conv_count, 4, "message_count must match COUNT(*) post-update");
+        assert_eq!(
+            conv_count, 4,
+            "message_count must match COUNT(*) post-update"
+        );
 
         // Invariant: no orphans, no skew.
         let inconsistent: i64 = conn
@@ -2067,13 +2146,21 @@ mod tests {
         let mut indexer = ConversationIndexer::new(&db_path, true).unwrap();
 
         // Index one healthy session so we have a non-orphan to leave alone.
-        let healthy = write_jsonl_in_dir(dir.path(), "healthy", &[
-            r#"{"uuid":"h1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"healthy","message":{"role":"user","content":"keep me"}}"#,
-        ]);
+        let healthy = write_jsonl_in_dir(
+            dir.path(),
+            "healthy",
+            &[
+                r#"{"uuid":"h1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"healthy","message":{"role":"user","content":"keep me"}}"#,
+            ],
+        );
         indexer.index_conversation(&healthy).unwrap();
 
         // Manually inject orphans that mimic the pre-fix bug.
-        let orphan_file = dir.path().join("orphan1.jsonl").to_string_lossy().to_string();
+        let orphan_file = dir
+            .path()
+            .join("orphan1.jsonl")
+            .to_string_lossy()
+            .to_string();
         let conn = indexer.connection();
         conn.execute(
             "INSERT INTO conversations (session_id, project_path, conversation_file, conversation_summary, first_message_at, last_message_at, message_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -2082,21 +2169,26 @@ mod tests {
         conn.execute(
             "INSERT INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
             rusqlite::params![&orphan_file, 1234567890.0_f64],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO conversations (session_id, project_path, conversation_file, conversation_summary, first_message_at, last_message_at, message_count) VALUES (?, ?, ?, ?, ?, ?, ?)",
             rusqlite::params!["orphan2", "/p", "/tmp/nofile.jsonl", "ghost2", "2025-01-01T00:00:00Z", "2025-01-01T00:00:00Z", 7_i64],
         ).unwrap();
 
         // Sanity: 3 conversations now (1 healthy + 2 orphans).
-        let pre: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0)).unwrap();
+        let pre: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(pre, 3);
 
         let repaired = indexer.repair_orphan_conversations().unwrap();
         assert_eq!(repaired, 2);
 
         let conn = indexer.connection();
-        let post: i64 = conn.query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0)).unwrap();
+        let post: i64 = conn
+            .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(post, 1, "only the healthy row should remain");
 
         // sync_state for the orphan file should be gone (so re-index will re-parse).
