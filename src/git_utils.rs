@@ -39,7 +39,7 @@ pub fn resolve_repo_root(filesystem_path: &str) -> Option<String> {
     };
 
     // .git dir -> parent is repo root
-    if resolved.file_name().map_or(false, |n| n == ".git") {
+    if resolved.file_name().is_some_and(|n| n == ".git") {
         resolved.parent().map(|p| p.to_string_lossy().to_string())
     } else {
         Some(resolved.to_string_lossy().to_string())

@@ -1,0 +1,16 @@
+# lefthook — git hooks manager. Activate once per clone with: lefthook install
+#
+# pre-push mirrors the CI lint gate (.github/workflows/ci.yml) so formatting and
+# clippy failures are caught locally before they reach GitHub.
+#
+# Note: the release version-tag check lives in .githooks/pre-push and is NOT run
+# here on purpose — it fires on every push and would block ordinary feature-branch
+# pushes whenever Cargo.toml isn't bumped. It only matters for release tags.
+pre-push:
+  parallel: false
+  commands:
+    fmt:
+      glob: "*.rs"
+      run: cargo fmt --all --check
+    clippy:
+      run: cargo clippy --all-targets --all-features -- -D warnings

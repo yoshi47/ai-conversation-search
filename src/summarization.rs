@@ -112,11 +112,7 @@ pub fn message_uses_conversation_search(content: &str, message_type: &str) -> bo
     if content_lower.contains("allowed 1 tools for this command") {
         if let Some(marker_pos) = content_lower.find("allowed 1 tools") {
             if let Some(search_pos) = content_lower.find("conversation-search") {
-                let diff = if marker_pos > search_pos {
-                    marker_pos - search_pos
-                } else {
-                    search_pos - marker_pos
-                };
+                let diff = marker_pos.abs_diff(search_pos);
                 if diff < 100 {
                     return true;
                 }
