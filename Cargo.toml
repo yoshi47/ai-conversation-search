@@ -18,3 +18,19 @@ walkdir = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints.rust]
+# Deny unsafe: this is a pure-safe-Rust CLI; any unsafe block should be a deliberate review decision.
+unsafe_code = "forbid"
+# Catch dead code / unused results early.
+unused_must_use = "warn"
+
+[lints.clippy]
+# Enable the standard clippy lint groups at warn level.
+# `priority = -1` lets individual lints below override these group settings.
+all = { level = "warn", priority = -1 }
+# A few high-signal pedantic lints worth enforcing project-wide.
+needless_pass_by_value = "warn"
+redundant_clone = "warn"
+# Opt out of pedantic lints that are noisy for this codebase.
+too_many_arguments = "allow"

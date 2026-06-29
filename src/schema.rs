@@ -203,7 +203,7 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> bool {
                 )
                 .optional()
                 .unwrap_or(None);
-            fts_sql.map_or(true, |s| s.contains("trigram"))
+            fts_sql.is_none_or(|s| s.contains("trigram"))
         }
         v => unreachable!("unhandled custom migration version: {}", v),
     }

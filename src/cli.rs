@@ -634,35 +634,32 @@ fn inject_resume_command(val: &mut serde_json::Value) {
                 inject_resume_command(item);
             }
         }
-        serde_json::Value::Object(map) => {
-            // Only inject into objects that have session_id (i.e., result rows)
-            if map.contains_key("session_id") {
-                let source = map
-                    .get("source")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("claude_code")
-                    .to_string();
-                let session_id = map
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let project_path = map
-                    .get("project_path")
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
+        // Only inject into objects that have session_id (i.e., result rows)
+        serde_json::Value::Object(map) if map.contains_key("session_id") => {
+            let source = map
+                .get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("claude_code")
+                .to_string();
+            let session_id = map
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let project_path = map
+                .get("project_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
-                let resume = match (session_id, project_path) {
-                    (Some(sid), Some(pp)) => match source.as_str() {
-                        "opencode" | "codex" => serde_json::Value::Null,
-                        _ => serde_json::Value::String(format!(
-                            "cd {} && {} --resume {}",
-                            pp, cmd, sid
-                        )),
-                    },
-                    _ => serde_json::Value::Null,
-                };
-                map.insert("resume_command".to_string(), resume);
-            }
+            let resume = match (session_id, project_path) {
+                (Some(sid), Some(pp)) => match source.as_str() {
+                    "opencode" | "codex" => serde_json::Value::Null,
+                    _ => {
+                        serde_json::Value::String(format!("cd {} && {} --resume {}", pp, cmd, sid))
+                    }
+                },
+                _ => serde_json::Value::Null,
+            };
+            map.insert("resume_command".to_string(), resume);
         }
         _ => {}
     }

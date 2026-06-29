@@ -1,0 +1,4 @@
+# Use the same edition as Cargo.toml so `cargo fmt` and standalone `rustfmt` agree.
+edition = "2021"
+# Keep the community-standard 100-column width (explicit for clarity).
+max_width = 100

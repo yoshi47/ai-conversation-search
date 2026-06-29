@@ -98,7 +98,7 @@ pub fn count_conversation_files_on_disk() -> usize {
 
         for file_entry in dir_entries.flatten() {
             let conv_file = file_entry.path();
-            if conv_file.extension().map_or(true, |e| e != "jsonl") {
+            if conv_file.extension().is_none_or(|e| e != "jsonl") {
                 continue;
             }
             if let Some(stem) = conv_file.file_stem() {
@@ -400,8 +400,8 @@ impl ConversationIndexer {
             for dir in extra.split(':').filter(|s| !s.is_empty()) {
                 let expanded = if dir == "~" {
                     home.clone()
-                } else if dir.starts_with("~/") {
-                    home.join(&dir[2..])
+                } else if let Some(rest) = dir.strip_prefix("~/") {
+                    home.join(rest)
                 } else {
                     PathBuf::from(dir)
                 };
@@ -472,7 +472,7 @@ impl ConversationIndexer {
                 if summarizer_hash.as_ref().is_some_and(|hash| {
                     project_dir
                         .file_name()
-                        .map_or(false, |name| name.to_string_lossy() == *hash)
+                        .is_some_and(|name| name.to_string_lossy() == *hash)
                 }) {
                     continue;
                 }
@@ -491,7 +491,7 @@ impl ConversationIndexer {
 
                 for file_entry in dir_entries.flatten() {
                     let conv_file = file_entry.path();
-                    if conv_file.extension().map_or(true, |e| e != "jsonl") {
+                    if conv_file.extension().is_none_or(|e| e != "jsonl") {
                         continue;
                     }
 
@@ -522,7 +522,7 @@ impl ConversationIndexer {
         }
 
         // Sort by cached mtime descending (no additional stat calls)
-        conversation_files.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        conversation_files.sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
 
         conversation_files.into_iter().map(|(p, _)| p).collect()
     }
@@ -550,7 +550,7 @@ impl ConversationIndexer {
                     break;
                 }
                 let path = file_entry.path();
-                if path.extension().map_or(true, |e| e != "jsonl") {
+                if path.extension().is_none_or(|e| e != "jsonl") {
                     continue;
                 }
                 checked += 1;

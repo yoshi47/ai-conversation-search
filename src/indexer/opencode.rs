@@ -133,8 +133,7 @@ impl OpenCodeIndexer {
             )",
         )?;
 
-        let result = self.do_index(&oc_conn, &search_conn, days_back);
-        result
+        self.do_index(&oc_conn, &search_conn, days_back)
     }
 
     fn get_last_sync_time(conn: &Connection) -> Option<i64> {
@@ -167,10 +166,8 @@ impl OpenCodeIndexer {
         let cutoff_ms: i64 = if let Some(d) = days_back {
             let cutoff = chrono::Local::now() - chrono::TimeDelta::days(d);
             cutoff.timestamp_millis()
-        } else if let Some(ls) = last_sync {
-            ls
         } else {
-            0
+            last_sync.unwrap_or_default()
         };
 
         let mut stmt = oc_conn.prepare(
@@ -183,6 +180,7 @@ impl OpenCodeIndexer {
              ORDER BY s.time_updated DESC",
         )?;
 
+        #[allow(clippy::type_complexity)]
         let sessions: Vec<(
             String,
             String,

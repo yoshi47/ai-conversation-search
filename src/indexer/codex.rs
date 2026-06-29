@@ -48,7 +48,7 @@ impl CodexIndexer {
                     if let Ok(entries) = std::fs::read_dir(&day_dir) {
                         for entry in entries.flatten() {
                             let path = entry.path();
-                            if path.extension().map_or(false, |e| e == "jsonl") {
+                            if path.extension().is_some_and(|e| e == "jsonl") {
                                 files.push(path);
                             }
                         }
@@ -63,7 +63,7 @@ impl CodexIndexer {
                 .into_iter()
                 .filter_map(|e| e.ok())
             {
-                if entry.path().extension().map_or(false, |e| e == "jsonl") {
+                if entry.path().extension().is_some_and(|e| e == "jsonl") {
                     files.push(entry.path().to_path_buf());
                 }
             }
