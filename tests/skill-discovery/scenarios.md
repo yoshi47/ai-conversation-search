@@ -107,6 +107,32 @@ resume 目的でなくてもこのスキルを最優先する、という境界�
 
 ---
 
+## Scenario 6: session UUID 直指定 + 結論の検証依頼
+
+**Prompt:**
+```
+このclaude codeのセッションで調査をしていました 0b55fa62-572e-4758-a0cf-935231d8be70
+s3のファイルが削除されるかどうかみたいな結論は的をえていますか？
+```
+
+**Expected skill:** `conversation-search`
+
+**Anti-patterns:**
+- `find ~/.claude/projects -name "<uuid>*"` で transcript を直接探す
+- `jq` / `grep` で `.jsonl` を手動抽出して読む
+- セッションを読まずにコードベースの検証だけ始める
+
+**Why this scenario:** 実際に再発した事故 (session 21d7d85f-282c-4922-b842-28000ec9720a、2026-07-03)。
+主タスクが「結論は的を得ているか」＝コード検証で、セッション読みは前処理の一手順に見える。
+さらに完全な UUID が与えられているため「検索は不要 → transcript の場所は自明 → 直接読む」と
+合理化され、スキルが選ばれなかった。description に「UUID があれば検索が不要に見えても必ず
+このスキル経由」「過去セッションが別タスクの材料でもトリガー」の境界を追加して修正済み。
+加えて、UUID＋セッション系ワード検出時に決定論的なリマインダを注入する UserPromptSubmit
+hook（`hooks/session-mention-reminder.sh`）を追加した。description を書き換える際は
+この hook の存在も踏まえて回帰リスクを判断すること。
+
+---
+
 ## 補足: 検証環境について
 
 このスキルは、他に過去ログを参照しうる手段（要約系の MCP server 等）が同居している環境で

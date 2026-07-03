@@ -18,6 +18,7 @@ Find and resume past AI coding conversations using smart hybrid extraction and J
 - **Progressive Exploration**: Simple search → broader search → manual exploration
 - **Conversation Context**: Expand context incrementally around any message
 - **Claude Code Skill**: Integrated Skill that outputs session resumption commands
+- **Skill Trigger Hook**: Plugin-bundled UserPromptSubmit hook that deterministically reminds Claude to use the skill when a prompt contains a session UUID
 - **Multi-Project Support**: Works across all your AI coding projects
 
 ## Quick Start

@@ -1,6 +1,6 @@
 ---
 name: conversation-search
-description: Find, review, and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) from their raw transcripts — returns the real session content, resumable session IDs, project paths, and the exact `claude --resume` command. Use whenever the user references a past session or prior conversation: to identify WHICH session something happened in, resume it, locate where a topic/PR/issue was discussed, or understand WHAT was discussed or decided earlier. The word "session"/"セッション" or any reference to a past conversation is the trigger — even when the user only wants the content, read the raw transcripts. Triggers: "find that conversation about X", "which session was that", "what did we discuss/decide", "resume that conversation", a session UUID, a GitHub PR/issue URL about past work. Japanese: "どのセッション", "過去のセッション(を確認/把握)して", "どこで話した/やった/確認した", "確認してた", "どんな内容/話だった(っけ)", "中身を把握", "～だっけ？", "あの会話", "あのPR/issue", "resume/続きやりたい".
+description: Find, review, and resume past AI coding conversations (Claude Code, OpenCode, Codex CLI) from their raw transcripts — returns the real session content, resumable session IDs, project paths, and the exact `claude --resume` command. Use whenever the user references a past session or prior conversation: to identify WHICH session something happened in, resume it, locate where a topic/PR/issue was discussed, or understand WHAT was discussed or decided earlier. The word "session"/"セッション" or any reference to a past conversation is the trigger — even when the user only wants the content, read the raw transcripts. A raw session UUID in the prompt ALWAYS triggers this skill — even when the transcript path looks obvious, and even when the session is only input to another task (verifying its conclusion, continuing its work); never find/grep ~/.claude/projects manually. Triggers: "find that conversation about X", "which session was that", "what did we discuss/decide", "resume that conversation", a session UUID, a GitHub PR/issue URL about past work. Japanese: "どのセッション", "過去のセッション(を確認/把握)して", "このセッションで調査してた <uuid>", "(そのセッションの)結論は合ってる/的を得てる？", "どこで話した/やった/確認した", "確認してた", "どんな内容/話だった(っけ)", "中身を把握", "～だっけ？", "あの会話", "あのPR/issue", "resume/続きやりたい".
 allowed-tools: Bash, TodoWrite
 ---
 
@@ -48,6 +48,12 @@ wants to know "what was discussed", because the transcript is the source of trut
 | "What was discussed / decided in that session?" / "どんな内容/話だったっけ？" | ✅ |
 | User pastes a GitHub PR/issue URL and asks where it was discussed | ✅ |
 | Find a session by raw text (PR number, error message, exact phrase) | ✅ |
+| User gives a session UUID and asks to verify/continue that work / "このセッションで調査してた <uuid>、結論合ってる？" | ✅ |
+
+A session UUID in the prompt is decisive **even when it makes searching look
+unnecessary**: do not `find`/`grep` `~/.claude/projects` manually — read it with
+`ai-conversation-search tree <SESSION_ID>` (then `context <MESSAGE_UUID>` to
+expand around a specific message).
 
 The presence of the word **"session" / "セッション"** or a reference to a past
 conversation is decisive — use this skill regardless of whether the user
@@ -249,7 +255,7 @@ ai-conversation-search status --json
 
 ### Context & Tree
 ```bash
-ai-conversation-search context <UUID> --json
+ai-conversation-search context <MESSAGE_UUID> --json
 ai-conversation-search tree <SESSION_ID> --json
 ```
 
