@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.13.1] - 2026-07-03
+
+### Added
+
+- UserPromptSubmit hook（`hooks/session-mention-reminder.sh`）: プロンプトに session UUID とセッション系ワードの両方が含まれるとき、`conversation-search` スキル利用のリマインダを additionalContext として注入。description チューニングだけでは確率的だった「UUID 直指定」ケースを決定論的にトリガーする。fail-open 設計（jq 不在・不正 JSON・パターン不一致はすべて silent no-op、ユーザーのプロンプトを絶対にブロックしない）
+- `tests/skill-discovery/`: Scenario 6（session UUID 直指定＋結論の検証依頼）を追加。「主タスクがコード検証で UUID が既知だと『検索不要』と合理化されてスキルが選ばれない」再発事故（2026-07-03）を記録
+
+### Fixed
+
+- Manual Install をラッパースクリプト配布に変更し、手動インストールで `pick` / `setup-hooks` が使えなくなる問題を修正
+
+### Changed
+
+- SKILL.md description: 「session UUID がプロンプトにあれば、transcript の場所が自明でも・セッションが別タスク（結論検証・続き作業）の材料でも必ずこのスキルを使う。`~/.claude/projects` を find/grep しない」という境界を追記。decision table にも該当行を追加
+- SKILL.md: `context` コマンドの引数表記を `<MESSAGE_UUID>` に明確化（session UUID を渡す誤誘導を防止）
+- CI: clippy + rustfmt lint、CI workflow、lefthook hooks を追加し、rustfmt を全体適用
+
 ## [0.13.0] - 2026-06-17
 
 ### Added
