@@ -82,17 +82,28 @@ ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--un
 document length, very long machine-generated transcripts sink automatically. Use
 `--sort=recent` when you want to browse chronologically instead.
 
-**Important — short terms disable both OR and ranking:** if **any** term in the query is
-shorter than 3 characters, the **whole query** bypasses FTS (the trigram tokenizer needs 3+
-characters) and falls back to substring matching. On that path multi-term queries use **AND,
-not OR**, results are ordered by recency, and `--sort` has no effect.
+**Short terms (under 3 characters):** the trigram tokenizer needs 3+ characters, so short
+terms cannot be ranked by. They are applied as a **mandatory substring filter** on top of
+the FTS results instead — a result must contain every short term, while the longer terms
+are OR-joined and ranked.
 
-Example: `パッケージ 更新 ドキュメント` takes this path because `更新` is 2 characters.
+Example: in `パッケージ 更新 ドキュメント`, `更新` is 2 characters, so results are ranked
+by `パッケージ`/`ドキュメント` relevance but must all contain `更新`.
 
-Escape hatch: quoting any part of the query — `"..."` or `--exact` — skips the check
-entirely and goes to FTS.
+**Only if _every_ term is under 3 characters** (e.g. `認証 実装`) does the whole query fall
+back to substring matching: AND semantics, recency order, and `--sort` has no effect. An
+empty query behaves the same way.
 
-An empty query also orders by recency; `--sort` has no effect there either.
+Escape hatch: quoting any part of the query — `"..."` or `--exact` — sends it to FTS
+verbatim.
+
+Explicit `AND`/`OR`/`NOT` operators also go to FTS verbatim, but **only if every operand is
+3+ characters**. Otherwise the query takes the substring-matching path and the operator is
+treated as a literal word — a sub-3-character operand cannot be expressed in FTS at all, so
+honoring the operator would silently drop it. Quote the short operand to force FTS.
+
+Case sensitivity differs by term length: long terms fold case across Unicode, short terms
+only across ASCII (they go through `LIKE`).
 
 **Note:** Cannot mix `--days` with `--date/--since/--until`.
 

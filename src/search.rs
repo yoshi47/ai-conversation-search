@@ -243,6 +243,70 @@ fn escape_like(value: &str) -> String {
         .replace('_', "\\_")
 }
 
+/// The trigram tokenizer emits no tokens for shorter terms, so they match nothing in FTS.
+const MIN_TRIGRAM_CHARS: usize = 3;
+
+/// How a query maps onto the FTS and LIKE machinery.
+enum QueryPlan<'a> {
+    /// Hand the query to FTS verbatim: quoted phrases and explicit operators.
+    Raw(String),
+    /// Terms of `MIN_TRIGRAM_CHARS`+ go to FTS, OR-joined and bm25-ranked. Shorter
+    /// terms cannot be ranked by, so they narrow the phase-2 rows with LIKE instead.
+    Hybrid {
+        fts_query: String,
+        short_terms: Vec<&'a str>,
+    },
+    /// Nothing reaches the trigram minimum. Full-table LIKE, AND semantics, recency
+    /// order. Also covers the empty query, where `terms` is empty.
+    LikeOnly { terms: Vec<&'a str> },
+}
+
+fn plan_query(trimmed: &str) -> QueryPlan<'_> {
+    // Quoting is the documented escape hatch: it reaches FTS whatever the term lengths.
+    if trimmed.contains('"') {
+        return QueryPlan::Raw(trimmed.to_string());
+    }
+
+    let terms: Vec<&str> = trimmed.split_whitespace().collect();
+    let (long_terms, short_terms): (Vec<&str>, Vec<&str>) = terms
+        .iter()
+        .copied()
+        .partition(|t| t.chars().count() >= MIN_TRIGRAM_CHARS);
+
+    // Why not test for operators first: `OR` is two characters, so an all-short query
+    // such as `更新 OR 認証` would reach FTS with no tokenizable term and return zero
+    // rows. LikeOnly treats the operator as a literal, which is imperfect but non-empty.
+    if long_terms.is_empty() {
+        return QueryPlan::LikeOnly { terms };
+    }
+
+    // Spaces are load-bearing: a bare `contains("AND")` would misroute `STANDARD`.
+    if trimmed.contains(" AND ") || trimmed.contains(" OR ") || trimmed.contains(" NOT ") {
+        // An explicit-operator query goes to FTS whole, so a sub-trigram term inside it
+        // cannot be lifted out into a LIKE the way Hybrid does -- and it would tokenize to
+        // nothing, silently changing what the operator means (`A AND 失敗` matches zero
+        // rows, `A NOT 失敗` excludes nothing). LikeOnly can't express the operator either,
+        // but it treats it as a literal and keeps every term in play. `OR` is excluded from
+        // the test because it is itself two characters.
+        let has_short_operand = short_terms
+            .iter()
+            .any(|t| !matches!(*t, "AND" | "OR" | "NOT"));
+        if has_short_operand {
+            return QueryPlan::LikeOnly { terms };
+        }
+        return QueryPlan::Raw(trimmed.to_string());
+    }
+
+    QueryPlan::Hybrid {
+        fts_query: long_terms
+            .iter()
+            .map(|t| format!("\"{}\"", t))
+            .collect::<Vec<_>>()
+            .join(" OR "),
+        short_terms,
+    }
+}
+
 /// Extract a snippet around the first occurrence of any search term in content.
 /// Returns a window of `max_len` chars centered on the match, with `**` highlighting.
 fn extract_snippet(content: &str, search_terms: &[&str], max_len: usize) -> String {
@@ -594,172 +658,152 @@ impl ConversationSearch {
         }
 
         let trimmed = query.trim();
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
-        // Check if any search term has < 3 characters (trigram minimum).
-        // Skip this check when query contains quotes (FTS5 phrase queries handle short words).
-        let terms: Vec<&str> = trimmed.split_whitespace().collect();
-        let has_short_term = !trimmed.contains('"') && terms.iter().any(|t| t.chars().count() < 3);
-
-        let sql = if trimmed.is_empty() {
-            let mut sql = String::from(
-                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
-            );
-
-            Self::append_filters(&mut sql, &mut params, filter)?;
-
-            sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
-            params.push(Box::new(limit));
-            sql
-        } else if has_short_term {
-            // Trigram requires >= 3 characters per term; fall back to LIKE for short terms.
-            //
-            // This path intentionally keeps AND semantics and recency order, unlike the FTS
-            // path (OR + bm25). There is no term-frequency signal to rank by here, and a
-            // 2-character term ORed against anything matches nearly the whole corpus, so OR
-            // without ranking would return pure noise. The asymmetry is deliberate.
-            let mut sql = String::from(
-                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
-            );
-
-            for term in &terms {
-                sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
-                params.push(Box::new(format!("%{}%", escape_like(term))));
-            }
-
-            Self::append_filters(&mut sql, &mut params, filter)?;
-
-            sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
-            params.push(Box::new(limit));
-            sql
-        } else {
-            // Sanitize query for FTS5 trigram tokenizer
-            let fts_query = if !query.contains(" AND ")
-                && !query.contains(" OR ")
-                && !query.contains(" NOT ")
-                && !query.contains('"')
-            {
-                let terms: Vec<&str> = query.split_whitespace().collect();
-                if terms.len() == 1 {
-                    format!("\"{}\"", terms[0])
-                } else {
-                    terms
-                        .iter()
-                        .map(|t| format!("\"{}\"", t))
-                        .collect::<Vec<_>>()
-                        .join(" OR ")
-                }
-            } else {
-                query.to_string()
-            };
-
-            // Two-phase query to work around SQLite trigram FTS performance issue.
-            // SQLite's planner incorrectly uses idx_is_meta_conversation as the driving index,
-            // scanning ~all messages and checking trigram FTS for each row (O(N) full table scan).
-            // Phase 1: Get matching rowids from FTS (fast, ~50ms for 1700 matches).
-            // Phase 2: Query messages+conversations by rowid IN batches.
-            let scored = self.query_fts_rowids(&fts_query)?;
-
-            if scored.is_empty() {
-                let stats = self.gather_search_stats(filter, 0)?;
-                return Ok(SearchResult {
-                    rows: Vec::new(),
-                    stats,
-                });
-            }
-
-            let score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
-
-            // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
-            const BATCH_SIZE: usize = 500;
-            let mut all_results: Vec<SearchResultRow> = Vec::new();
-
-            for chunk in scored.chunks(BATCH_SIZE) {
-                let mut batch_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-
-                let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-                let mut sql = format!(
-                    "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
-                    placeholders
+        let (fts_query, short_terms) = match plan_query(trimmed) {
+            QueryPlan::LikeOnly { terms } => {
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                // No term reaches the trigram minimum, so there is no term-frequency signal
+                // to rank by. This path keeps AND semantics and recency order, unlike the FTS
+                // path (OR + bm25): a 2-character term ORed against anything matches nearly
+                // the whole corpus, and without ranking that is pure noise. Deliberate.
+                let mut sql = String::from(
+                    "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
                 );
 
-                for (rowid, _) in chunk {
-                    batch_params.push(Box::new(*rowid));
+                for term in &terms {
+                    sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
+                    params.push(Box::new(format!("%{}%", escape_like(term))));
                 }
 
-                Self::append_filters(&mut sql, &mut batch_params, filter)?;
-                // No ORDER BY: the final order is decided in Rust below, because the
-                // bm25 score lives in phase 1 and is not visible to this query.
+                Self::append_filters(&mut sql, &mut params, filter)?;
 
-                let batch_results = self.execute_search_typed(&sql, &batch_params)?;
-                all_results.extend(batch_results);
+                sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
+                params.push(Box::new(limit));
 
-                // Early stop, valid ONLY for relevance order.
-                //
-                // WRONG alternative: truncating the phase-1 rowid list to `limit` before
-                // phase 2. Filters (project/date/source/repo) and is_meta_conversation are
-                // applied only in phase 2, so if the top hits all belong to another project
-                // that would return zero rows while the correct answer is non-empty.
-                //
-                // What holds instead: phase 1 returns rowids sorted best-first, so after
-                // processing batches 0..k every unprocessed candidate scores no better than
-                // what we already hold. Once we have `limit` post-filter rows, they are the
-                // globally best `limit` rows -- filters only remove candidates, never promote
-                // them, so this is independent of which filters are active.
-                //
-                // Does not hold for Recent order: recency is uncorrelated with bm25 rank.
-                if filter.sort == SortOrder::Relevance && all_results.len() >= limit as usize {
-                    break;
-                }
+                let rows = self.execute_search_typed(&sql, &params)?;
+                let matched = rows.len() as i64;
+                let stats = self.gather_search_stats(filter, matched)?;
+                return Ok(SearchResult { rows, stats });
             }
-
-            // bm25's length normalization is what sinks the multi-KB observer transcripts,
-            // but it could in principle let a one-line fragment outrank a substantive
-            // discussion. If that shows up, the fix is a length-aware tie-break here
-            // (`(bm25, -len)`), not a length filter -- a hard floor would make
-            // short-but-correct messages unfindable.
-            match filter.sort {
-                SortOrder::Relevance => all_results.sort_by(|a, b| {
-                    let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
-                    let sb = score_by_rowid.get(&b.rowid).copied().unwrap_or(f64::MAX);
-                    sa.partial_cmp(&sb)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        // Ties prefer the newer message AMONG COLLECTED ROWS ONLY. An
-                        // equal-scoring row in a later batch is never fetched once the
-                        // early stop fires, so across a batch boundary ties resolve in
-                        // phase-1 order instead. Accepted: exact bm25 ties are rare, and
-                        // closing the gap means scanning past `limit` on every query.
-                        .then_with(|| b.timestamp.cmp(&a.timestamp))
-                }),
-                SortOrder::Recent => all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)),
-            }
-            all_results.truncate(limit as usize);
-
-            // Post-process: extract snippets with highlighting around match locations
-            let search_terms: Vec<&str> = trimmed.split_whitespace().collect();
-            for row in &mut all_results {
-                row.context_snippet = extract_snippet(&row.context_snippet, &search_terms, 200);
-            }
-            let matched = all_results.len() as i64;
-            let stats = self.gather_search_stats(filter, matched)?;
-            return Ok(SearchResult {
-                rows: all_results,
-                stats,
-            });
+            QueryPlan::Raw(q) => (q, Vec::new()),
+            QueryPlan::Hybrid {
+                fts_query,
+                short_terms,
+            } => (fts_query, short_terms),
         };
 
-        let rows = self.execute_search_typed(&sql, &params)?;
-        let matched = rows.len() as i64;
+        // Two-phase query to work around SQLite trigram FTS performance issue.
+        // SQLite's planner incorrectly uses idx_is_meta_conversation as the driving index,
+        // scanning ~all messages and checking trigram FTS for each row (O(N) full table scan).
+        // Phase 1: Get matching rowids from FTS (fast, ~50ms for 1700 matches).
+        // Phase 2: Query messages+conversations by rowid IN batches.
+        let scored = self.query_fts_rowids(&fts_query)?;
+
+        if scored.is_empty() {
+            let stats = self.gather_search_stats(filter, 0)?;
+            return Ok(SearchResult {
+                rows: Vec::new(),
+                stats,
+            });
+        }
+
+        let score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
+
+        // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
+        const BATCH_SIZE: usize = 500;
+        let mut all_results: Vec<SearchResultRow> = Vec::new();
+
+        for chunk in scored.chunks(BATCH_SIZE) {
+            let mut batch_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let mut sql = format!(
+                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
+                placeholders
+            );
+
+            for (rowid, _) in chunk {
+                batch_params.push(Box::new(*rowid));
+            }
+
+            // Terms under the trigram minimum contribute nothing to the FTS match, so
+            // they narrow here instead. Like every other phase-2 predicate this is
+            // purely subtractive, which is what keeps the early stop below sound.
+            // Why LIKE rather than a Rust-side retain over the already-loaded
+            // full_content: LIKE is ASCII case-insensitive and `str::contains` is not,
+            // and a short term must mean the same thing on both search paths.
+            for term in &short_terms {
+                sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
+                batch_params.push(Box::new(format!("%{}%", escape_like(term))));
+            }
+
+            Self::append_filters(&mut sql, &mut batch_params, filter)?;
+            // No ORDER BY: the final order is decided in Rust below, because the
+            // bm25 score lives in phase 1 and is not visible to this query.
+
+            let batch_results = self.execute_search_typed(&sql, &batch_params)?;
+            all_results.extend(batch_results);
+
+            // Early stop, valid ONLY for relevance order.
+            //
+            // WRONG alternative: truncating the phase-1 rowid list to `limit` before
+            // phase 2. Filters (project/date/source/repo) and is_meta_conversation are
+            // applied only in phase 2, so if the top hits all belong to another project
+            // that would return zero rows while the correct answer is non-empty.
+            //
+            // What holds instead: phase 1 returns rowids sorted best-first, so after
+            // processing batches 0..k every unprocessed candidate scores no better than
+            // what we already hold. Once we have `limit` post-filter rows, they are the
+            // globally best `limit` rows -- filters only remove candidates, never promote
+            // them, so this is independent of which filters are active.
+            //
+            // Does not hold for Recent order: recency is uncorrelated with bm25 rank.
+            if filter.sort == SortOrder::Relevance && all_results.len() >= limit as usize {
+                break;
+            }
+        }
+
+        // bm25's length normalization is what sinks the multi-KB observer transcripts,
+        // but it could in principle let a one-line fragment outrank a substantive
+        // discussion. If that shows up, the fix is a length-aware tie-break here
+        // (`(bm25, -len)`), not a length filter -- a hard floor would make
+        // short-but-correct messages unfindable.
+        match filter.sort {
+            SortOrder::Relevance => all_results.sort_by(|a, b| {
+                let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
+                let sb = score_by_rowid.get(&b.rowid).copied().unwrap_or(f64::MAX);
+                sa.partial_cmp(&sb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    // Ties prefer the newer message AMONG COLLECTED ROWS ONLY. An
+                    // equal-scoring row in a later batch is never fetched once the
+                    // early stop fires, so across a batch boundary ties resolve in
+                    // phase-1 order instead. Accepted: exact bm25 ties are rare, and
+                    // closing the gap means scanning past `limit` on every query.
+                    .then_with(|| b.timestamp.cmp(&a.timestamp))
+            }),
+            SortOrder::Recent => all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)),
+        }
+        all_results.truncate(limit as usize);
+
+        // Post-process: extract snippets with highlighting around match locations
+        let search_terms: Vec<&str> = trimmed.split_whitespace().collect();
+        for row in &mut all_results {
+            row.context_snippet = extract_snippet(&row.context_snippet, &search_terms, 200);
+        }
+        let matched = all_results.len() as i64;
         let stats = self.gather_search_stats(filter, matched)?;
-        Ok(SearchResult { rows, stats })
+        Ok(SearchResult {
+            rows: all_results,
+            stats,
+        })
     }
 
     /// Search and group results by session, with `limit` applied at the SESSION level
     /// (not the message level). Returns up to `limit` distinct sessions and the total match
     /// count for each. The representative message is the session's best-scoring match under
-    /// `SortOrder::Relevance`. Under `SortOrder::Recent` -- and on the LIKE fallback path
-    /// (empty query, or any term under 3 characters) regardless of `sort`, since that path
-    /// has no bm25 score to rank by -- it is the most recent match instead.
+    /// `SortOrder::Relevance`. Under `SortOrder::Recent` -- and on the LIKE-only path
+    /// (empty query, or no term reaching 3 characters) regardless of `sort`, since that
+    /// path has no bm25 score to rank by -- it is the most recent match instead.
     pub fn search_grouped_by_session(
         &mut self,
         query: &str,
@@ -785,77 +829,60 @@ impl ConversationSearch {
         let limit_usize = limit as usize;
 
         let trimmed = query.trim();
-        let terms: Vec<&str> = trimmed.split_whitespace().collect();
-        // Trigram FTS requires >= 3 codepoints per term (unless quoted phrase).
-        let has_short_term = !trimmed.contains('"') && terms.iter().any(|t| t.chars().count() < 3);
+        let plan = plan_query(trimmed);
 
-        if trimmed.is_empty() || has_short_term {
-            // Empty / short-term path: SQL window function picks the most recent message
-            // per session and counts matches per session, then we LIMIT at session level.
-            // Like the non-grouped short-term path, this keeps AND + recency: no FTS query
-            // means no bm25 to rank by.
-            let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            let mut inner_sql = String::from(
-                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, \
-                 m.message_type, m.project_path, m.depth, m.is_sidechain, \
-                 SUBSTR(m.full_content, 1, 500) AS context_snippet, \
-                 c.conversation_summary, c.conversation_file, c.source, \
-                 ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.timestamp DESC) AS rn, \
-                 COUNT(*) OVER (PARTITION BY m.session_id) AS match_count \
-                 FROM messages m JOIN conversations c ON m.session_id = c.session_id \
-                 WHERE m.is_meta_conversation = FALSE",
-            );
+        let (fts_query, short_terms) = match plan {
+            QueryPlan::LikeOnly { terms } => {
+                // SQL window function picks the most recent message per session and counts
+                // matches per session, then we LIMIT at session level. Like the non-grouped
+                // LikeOnly path, this keeps AND + recency: no FTS query means no bm25.
+                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+                let mut inner_sql = String::from(
+                    "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, \
+                     m.message_type, m.project_path, m.depth, m.is_sidechain, \
+                     SUBSTR(m.full_content, 1, 500) AS context_snippet, \
+                     c.conversation_summary, c.conversation_file, c.source, \
+                     ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.timestamp DESC) AS rn, \
+                     COUNT(*) OVER (PARTITION BY m.session_id) AS match_count \
+                     FROM messages m JOIN conversations c ON m.session_id = c.session_id \
+                     WHERE m.is_meta_conversation = FALSE",
+                );
 
-            if !trimmed.is_empty() {
                 for term in &terms {
                     inner_sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
                     params.push(Box::new(format!("%{}%", escape_like(term))));
                 }
+
+                Self::append_filters(&mut inner_sql, &mut params, filter)?;
+
+                let sql = format!(
+                    "WITH ranked AS ({}) SELECT * FROM ranked WHERE rn = 1 \
+                     ORDER BY timestamp DESC LIMIT ?",
+                    inner_sql
+                );
+                params.push(Box::new(limit));
+
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                let rows = self.query_rows(&sql, &param_refs, |row| {
+                    Ok(GroupedRow {
+                        representative: SearchResultRow::from_row(row)?,
+                        match_count: row.get("match_count")?,
+                    })
+                })?;
+
+                let matched_total: i64 = rows.iter().map(|g| g.match_count).sum();
+                let stats = self.gather_search_stats(filter, matched_total)?;
+                return Ok(GroupedSearchResult { rows, stats });
             }
-
-            Self::append_filters(&mut inner_sql, &mut params, filter)?;
-
-            let sql = format!(
-                "WITH ranked AS ({}) SELECT * FROM ranked WHERE rn = 1 \
-                 ORDER BY timestamp DESC LIMIT ?",
-                inner_sql
-            );
-            params.push(Box::new(limit));
-
-            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-                params.iter().map(|p| p.as_ref()).collect();
-            let rows = self.query_rows(&sql, &param_refs, |row| {
-                Ok(GroupedRow {
-                    representative: SearchResultRow::from_row(row)?,
-                    match_count: row.get("match_count")?,
-                })
-            })?;
-
-            let matched_total: i64 = rows.iter().map(|g| g.match_count).sum();
-            let stats = self.gather_search_stats(filter, matched_total)?;
-            return Ok(GroupedSearchResult { rows, stats });
-        }
-
-        // FTS path: same trigram two-phase strategy as search_conversations.
-        let fts_query = if !query.contains(" AND ")
-            && !query.contains(" OR ")
-            && !query.contains(" NOT ")
-            && !query.contains('"')
-        {
-            let fts_terms: Vec<&str> = query.split_whitespace().collect();
-            if fts_terms.len() == 1 {
-                format!("\"{}\"", fts_terms[0])
-            } else {
-                fts_terms
-                    .iter()
-                    .map(|t| format!("\"{}\"", t))
-                    .collect::<Vec<_>>()
-                    .join(" OR ")
-            }
-        } else {
-            query.to_string()
+            QueryPlan::Raw(q) => (q, Vec::new()),
+            QueryPlan::Hybrid {
+                fts_query,
+                short_terms,
+            } => (fts_query, short_terms),
         };
 
+        // FTS path: same trigram two-phase strategy as search_conversations.
         let scored = self.query_fts_rowids(&fts_query)?;
 
         if scored.is_empty() {
@@ -884,6 +911,11 @@ impl ConversationSearch {
             );
             for (rowid, _) in chunk {
                 batch_params.push(Box::new(*rowid));
+            }
+            // Sub-trigram terms narrow here; see search_conversations for the rationale.
+            for term in &short_terms {
+                sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
+                batch_params.push(Box::new(format!("%{}%", escape_like(term))));
             }
             Self::append_filters(&mut sql, &mut batch_params, filter)?;
             // No ORDER BY: final order is decided in Rust below (see search_conversations).
@@ -1855,9 +1887,10 @@ mod tests {
         );
     }
 
-    /// The <3-char LIKE fallback keeps AND semantics and recency ordering while the FTS
-    /// path uses OR + bm25. That asymmetry is deliberate: there is no ranking signal here,
-    /// and a 2-char term ORed against anything matches nearly everything.
+    /// When NO term reaches 3 characters the query keeps AND semantics and recency
+    /// ordering, while the FTS path uses OR + bm25. That asymmetry is deliberate: there is
+    /// no ranking signal here, and a 2-char term ORed against anything matches nearly
+    /// everything.
     #[test]
     fn test_like_fallback_still_and_and_recency_ordered() {
         let conn = setup_test_db();
@@ -2121,6 +2154,300 @@ mod tests {
             !json.contains("rowid"),
             "rowid must be skipped in JSON output, got: {}",
             json
+        );
+    }
+
+    /// Seed one conversation plus the given `(uuid, content, timestamp)` messages.
+    fn setup_hybrid_db(messages: &[(&str, &str, &str)]) -> ConversationSearch {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-01T00:00:00",
+            "2025-01-31T00:00:00",
+            "claude_code",
+        );
+        for (uuid, content, ts) in messages {
+            insert_test_message(&conn, uuid, "sess1", content, "user", ts, "/proj");
+        }
+        ConversationSearch::from_connection(conn)
+    }
+
+    fn uuids(rows: &[SearchResultRow]) -> Vec<&str> {
+        rows.iter().map(|r| r.message_uuid.as_str()).collect()
+    }
+
+    /// A term under the trigram minimum cannot be ranked by, so it acts as a mandatory
+    /// filter on the FTS candidates rather than being silently dropped.
+    #[test]
+    fn test_hybrid_short_term_narrows_fts_results() {
+        let mut s = setup_hybrid_db(&[
+            (
+                "msg1",
+                "デプロイの手順をまとめました",
+                "2025-01-10T10:00:00",
+            ),
+            (
+                "msg2",
+                "デプロイが失敗した原因を調べる",
+                "2025-01-11T10:00:00",
+            ),
+        ]);
+
+        let rows = s
+            .search_conversations("デプロイ 失敗", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["msg2"]);
+    }
+
+    /// The point of routing mixed queries through FTS: bm25 outranks recency, so a long
+    /// machine-generated message cannot bury a tight match just by being newer.
+    #[test]
+    fn test_hybrid_ranks_by_bm25_not_recency() {
+        let padded = format!("デプロイ 失敗 {}", "filler ".repeat(400));
+        let mut s = setup_hybrid_db(&[
+            ("old_tight", "デプロイ 失敗", "2025-01-02T10:00:00"),
+            ("new_padded", &padded, "2025-01-30T10:00:00"),
+        ]);
+
+        let rows = s
+            .search_conversations("デプロイ 失敗", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["old_tight", "new_padded"]);
+    }
+
+    /// When nothing reaches the trigram minimum there is no ranking signal at all, so the
+    /// query keeps AND semantics and recency order.
+    #[test]
+    fn test_hybrid_all_short_terms_falls_back_to_like() {
+        let mut s = setup_hybrid_db(&[
+            ("only_one", "認証だけの話", "2025-01-20T10:00:00"),
+            ("both_old", "認証と実装の話", "2025-01-05T10:00:00"),
+            ("both_new", "実装した認証", "2025-01-25T10:00:00"),
+        ]);
+
+        let rows = s
+            .search_conversations("認証 実装", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["both_new", "both_old"]);
+    }
+
+    /// `OR` is two characters, so a length-only short-term check used to misclassify
+    /// operator queries and match `%OR%` as a literal instead of reaching FTS.
+    #[test]
+    fn test_or_operator_reaches_fts() {
+        let mut s = setup_hybrid_db(&[
+            ("msg1", "rustacean content", "2025-01-10T10:00:00"),
+            ("msg2", "kubernetes content", "2025-01-11T10:00:00"),
+            ("msg3", "unrelated content", "2025-01-12T10:00:00"),
+        ]);
+
+        let rows = s
+            .search_conversations("rustacean OR kubernetes", &default_filter())
+            .unwrap()
+            .rows;
+
+        let mut got = uuids(&rows);
+        got.sort_unstable();
+        assert_eq!(got, vec!["msg1", "msg2"]);
+    }
+
+    /// All-short operator queries must stay on the LIKE path: handed to FTS verbatim they
+    /// tokenize to nothing and return zero rows.
+    #[test]
+    fn test_all_short_operator_query_stays_on_like_path() {
+        let mut s = setup_hybrid_db(&[("msg1", "更新 OR 認証 をまとめた", "2025-01-10T10:00:00")]);
+
+        let rows = s
+            .search_conversations("更新 OR 認証", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["msg1"]);
+    }
+
+    /// A sub-trigram operand inside an explicit-operator query cannot reach FTS: it would
+    /// tokenize to nothing and quietly rewrite the operator (`AND` matching zero rows,
+    /// `NOT` excluding nothing). Such queries stay on the LIKE path instead.
+    #[test]
+    fn test_operator_query_with_short_operand_stays_on_like_path() {
+        let mut s = setup_hybrid_db(&[
+            ("both", "デプロイ AND 失敗 の記録", "2025-01-10T10:00:00"),
+            ("only_long", "デプロイ AND だけ", "2025-01-11T10:00:00"),
+        ]);
+
+        let rows = s
+            .search_conversations("デプロイ AND 失敗", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["both"]);
+    }
+
+    /// The short-term narrowing lives in the phase-2 query, so it must apply under
+    /// `SortOrder::Recent` too -- where the early stop is disabled and every batch is read.
+    #[test]
+    fn test_hybrid_short_term_narrows_under_sort_recent() {
+        let mut s = setup_hybrid_db(&[
+            ("no_short", "デプロイの手順", "2025-01-20T10:00:00"),
+            ("has_short", "デプロイが失敗した", "2025-01-10T10:00:00"),
+        ]);
+
+        let rows = s
+            .search_conversations(
+                "デプロイ 失敗",
+                &SearchFilter {
+                    limit: 10,
+                    sort: SortOrder::Recent,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["has_short"]);
+    }
+
+    /// The short-term LIKE and `append_filters` push parameters into the same statement;
+    /// this pins that their placeholders stay in step.
+    #[test]
+    fn test_hybrid_short_term_coexists_with_project_filter() {
+        let conn = setup_test_db();
+        for (sess, proj) in [("sessA", "/projA"), ("sessB", "/projB")] {
+            insert_test_conversation(
+                &conn,
+                sess,
+                proj,
+                "summary",
+                "2025-01-01T00:00:00",
+                "2025-01-31T00:00:00",
+                "claude_code",
+            );
+            insert_test_message(
+                &conn,
+                &format!("{}_msg", sess),
+                sess,
+                "デプロイが失敗した",
+                "user",
+                "2025-01-10T10:00:00",
+                proj,
+            );
+        }
+
+        let mut s = ConversationSearch::from_connection(conn);
+        let rows = s
+            .search_conversations(
+                "デプロイ 失敗",
+                &SearchFilter {
+                    limit: 10,
+                    project_path: Some("/projA"),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["sessA_msg"]);
+    }
+
+    /// The early stop must not fire on unfiltered candidates. The filler outranks the
+    /// survivors on bm25 (it is dense in the long term), so the survivors land in a later
+    /// batch and are only reached if the short-term LIKE is applied per batch.
+    #[test]
+    fn test_hybrid_early_stop_respects_short_term_filter() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-01T00:00:00",
+            "2025-01-31T00:00:00",
+            "claude_code",
+        );
+        for i in 0..600 {
+            insert_test_message(
+                &conn,
+                &format!("filler{:04}", i),
+                "sess1",
+                "デプロイ",
+                "user",
+                "2025-01-02T10:00:00",
+                "/proj",
+            );
+        }
+        // Padded so bm25 ranks all three below every filler row, which puts them past the
+        // first batch. Three of them against limit=2 makes the early stop actually fire.
+        for (uuid, pad) in [("surv_a", 20), ("surv_b", 60), ("surv_c", 120)] {
+            let content = format!("デプロイ 失敗 {}", "noise ".repeat(pad));
+            insert_test_message(
+                &conn,
+                uuid,
+                "sess1",
+                &content,
+                "user",
+                "2025-01-03T10:00:00",
+                "/proj",
+            );
+        }
+
+        let mut s = ConversationSearch::from_connection(conn);
+        let rows = s
+            .search_conversations(
+                "デプロイ 失敗",
+                &SearchFilter {
+                    limit: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["surv_a", "surv_b"]);
+    }
+
+    /// The grouped path applies the same narrowing, so `match_count` reflects the rows that
+    /// actually contain every term -- not the wider FTS candidate set.
+    #[test]
+    fn test_grouped_hybrid_match_count() {
+        let mut s = setup_hybrid_db(&[
+            ("msg1", "デプロイ 失敗 その1", "2025-01-10T10:00:00"),
+            ("msg2", "デプロイ 失敗 その2", "2025-01-11T10:00:00"),
+            ("msg3", "デプロイ だけ", "2025-01-12T10:00:00"),
+        ]);
+
+        let rows = s
+            .search_grouped_by_session("デプロイ 失敗", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].match_count, 2);
+    }
+
+    /// Short terms are excluded from matching but not from highlighting.
+    #[test]
+    fn test_hybrid_snippet_highlights_short_term() {
+        let mut s = setup_hybrid_db(&[("msg1", "失敗 したデプロイの記録", "2025-01-10T10:00:00")]);
+
+        let rows = s
+            .search_conversations("デプロイ 失敗", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].context_snippet.contains("**失敗**"),
+            "short term must still be highlighted, got: {}",
+            rows[0].context_snippet
         );
     }
 
@@ -2863,8 +3190,8 @@ mod tests {
         assert_eq!(result.rows[1].match_count, 2);
     }
 
-    /// Short query (< 3 codepoints) goes through the LIKE fallback path which
-    /// also uses the window-function session-level grouping.
+    /// An all-short query (no term reaching 3 codepoints) goes through the LIKE-only path,
+    /// which also uses the window-function session-level grouping.
     #[test]
     fn test_search_grouped_short_query_like_path() {
         let conn = setup_test_db();
@@ -3244,7 +3571,7 @@ mod tests {
 
     /// Quoting is the ONLY way to get AND/phrase semantics now that bare multi-word
     /// queries are OR-joined, and it is what `--exact` relies on (cli.rs wraps the query
-    /// in quotes). It also bypasses the <3-char LIKE fallback. Guards both FTS paths.
+    /// in quotes). It also bypasses the term-length routing entirely. Guards both FTS paths.
     #[test]
     fn test_quoted_phrase_bypasses_or_join_and_short_term_fallback() {
         let conn = setup_test_db();
@@ -3299,7 +3626,7 @@ mod tests {
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.rows[0].representative.message_uuid, "contiguous");
 
-        // A quoted query with a <3-char token still reaches FTS instead of the LIKE path.
+        // A quoted query with a <3-char token still reaches FTS verbatim.
         let rows = searcher
             .search_conversations("\"is fun\"", &default_filter())
             .unwrap()
