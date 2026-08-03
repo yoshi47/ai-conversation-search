@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- `search --sort <relevance|recent>`: 並び順の選択。デフォルトは `relevance`（bm25）。`recent` で従来の新着順に戻せる
+
+### Changed
+
+- **検索結果の並び順が bm25 関連度順になった**（従来は新着順）。実 DB（780,740 メッセージ）での計測では、単語 1 つの検索で上位 12 件のうち 10 件を占めていた claude-mem observer の巨大メッセージ（6,783〜51,862 字）が、bm25 の文書長正規化によって上位から消え、12 件すべてが実会話になった
+- **多語クエリが AND から OR になった**（FTS 経路のみ）。従来はスペース区切りの語を FTS5 の AND で連結していたため、`パッケージ アップグレード ドキュメント` のような組み合わせは 0 件になりやすかった。OR + bm25 により、より多くの語に一致する文書が上位に来る。`--exact` と明示的な `AND`/`OR`/`NOT` を含むクエリは従来どおり
+- `--group-by-session` の代表メッセージが「最新の一致」から「最良スコアの一致」に変更。`--sort=recent` では従来どおり最新（LIKE フォールバック経路では `--sort` によらず従来どおり最新）
+- 3 文字未満の語を **1 つでも含む**クエリは従来どおり LIKE フォールバック（AND + 新着順）で、`--sort` も効かない。trigram tokenizer が 3 文字以上を要求するため。ランキング信号がないので意図的に据え置き（例: `パッケージ 更新 ドキュメント` は `更新` が 2 文字のため FTS を経由しない）
+
 ## [0.13.1] - 2026-07-03
 
 ### Added

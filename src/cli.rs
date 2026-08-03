@@ -6,7 +6,7 @@ use crate::indexer::codex::CodexIndexer;
 use crate::indexer::count_conversation_files_on_disk;
 use crate::indexer::opencode::{get_opencode_db_path, OpenCodeIndexer};
 use crate::indexer::ConversationIndexer;
-use crate::search::{format_timestamp, ConversationSearch, SearchFilter, TreeNode};
+use crate::search::{format_timestamp, ConversationSearch, SearchFilter, SortOrder, TreeNode};
 
 /// Source display labels
 const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")];
@@ -155,9 +155,12 @@ pub enum Commands {
         /// Show search diagnostics (session/message counts)
         #[arg(long, short = 'v')]
         verbose: bool,
-        /// Group results by session (show best match per session)
+        /// Group results by session (show the top-ranked match per session)
         #[arg(long)]
         group_by_session: bool,
+        /// Result order: relevance (bm25) or recent (newest first)
+        #[arg(long, value_parser = ["relevance", "recent"], default_value = "relevance")]
+        sort: String,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -342,6 +345,7 @@ pub fn run(cli: Cli) -> Result<()> {
             content,
             verbose,
             group_by_session,
+            sort,
             json,
         }) => {
             let effective_query = if exact {
@@ -359,6 +363,11 @@ pub fn run(cli: Cli) -> Result<()> {
                 project_path: project.as_deref(),
                 repo: repo.as_deref(),
                 source: source.as_deref(),
+                // clap's value_parser restricts this to the two known values.
+                sort: match sort.as_str() {
+                    "recent" => SortOrder::Recent,
+                    _ => SortOrder::Relevance,
+                },
             };
             cmd_search(
                 &effective_query,
@@ -394,6 +403,8 @@ pub fn run(cli: Cli) -> Result<()> {
                 project_path: None,
                 repo: repo.as_deref(),
                 source: source.as_deref(),
+                // `list` has no query, so there is no relevance to rank by.
+                sort: SortOrder::Recent,
             };
             cmd_list(&filter, json)
         }

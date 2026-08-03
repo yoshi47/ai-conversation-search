@@ -50,7 +50,7 @@ ai-conversation-search init --no-extract
 Search conversations using full-text search on smart-extracted content.
 
 ```bash
-ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--source SOURCE] [--limit LIMIT] [--content] [--group-by-session] [-v] [--json]
+ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--source SOURCE] [--limit LIMIT] [--sort SORT] [--content] [--group-by-session] [-v] [--json]
 ```
 
 **Arguments:**
@@ -66,16 +66,33 @@ ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--un
 - `--repo REPO`: Filter by repository root (partial match)
 - `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
 - `--limit LIMIT`: Max results (default: 20)
+- `--sort SORT`: Result order — `relevance` (bm25, default) or `recent` (newest first)
 - `--content`: Show full message content instead of summaries
-- `--group-by-session`: Group results by session (show best match per session with match count)
+- `--group-by-session`: Group results by session (show the top-ranked match per session with match count)
 - `-v, --verbose`: Show search diagnostics (sessions scanned, messages matched, unindexed warnings)
 - `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions)
 
 **Search Syntax:**
 - Simple: `authentication bug`
-- Multiple terms: `react hooks useEffect` (implicit AND)
+- Multiple terms: `react hooks useEffect` (implicit OR, ranked by relevance — documents matching more terms rank higher)
 - Phrases: `"exact phrase"` (or use `--exact`)
 - Operators: `auth AND bug`, `react OR vue`
+
+**Ranking:** Results are ordered by bm25 relevance by default. Because bm25 normalizes by
+document length, very long machine-generated transcripts sink automatically. Use
+`--sort=recent` when you want to browse chronologically instead.
+
+**Important — short terms disable both OR and ranking:** if **any** term in the query is
+shorter than 3 characters, the **whole query** bypasses FTS (the trigram tokenizer needs 3+
+characters) and falls back to substring matching. On that path multi-term queries use **AND,
+not OR**, results are ordered by recency, and `--sort` has no effect.
+
+Example: `パッケージ 更新 ドキュメント` takes this path because `更新` is 2 characters.
+
+Escape hatch: quoting any part of the query — `"..."` or `--exact` — skips the check
+entirely and goes to FTS.
+
+An empty query also orders by recency; `--sort` has no effect there either.
 
 **Note:** Cannot mix `--days` with `--date/--since/--until`.
 

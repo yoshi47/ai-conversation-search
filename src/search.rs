@@ -9,6 +9,15 @@ use crate::db;
 use crate::error::{AppError, Result};
 use crate::indexer::{ConversationIndexer, Message};
 
+/// Result ordering for text search.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SortOrder {
+    /// bm25 relevance, best-first. Default for `search`.
+    Relevance,
+    /// Newest first. The only meaningful order for `list`.
+    Recent,
+}
+
 /// Common filter parameters for search and list operations.
 pub struct SearchFilter<'a> {
     pub days_back: Option<i64>,
@@ -19,6 +28,7 @@ pub struct SearchFilter<'a> {
     pub project_path: Option<&'a str>,
     pub repo: Option<&'a str>,
     pub source: Option<&'a str>,
+    pub sort: SortOrder,
 }
 
 impl Default for SearchFilter<'_> {
@@ -32,6 +42,7 @@ impl Default for SearchFilter<'_> {
             project_path: None,
             repo: None,
             source: None,
+            sort: SortOrder::Relevance,
         }
     }
 }
@@ -39,6 +50,10 @@ impl Default for SearchFilter<'_> {
 /// A single search result row (messages JOIN conversations).
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchResultRow {
+    // Skipped in JSON: the rowid is an internal join key for bm25 scores, and
+    // `--json` output is a CLI contract consumed by bin/ai-conversation-search.
+    #[serde(skip)]
+    pub rowid: i64,
     pub message_uuid: String,
     pub session_id: String,
     pub parent_uuid: Option<String>,
@@ -56,6 +71,7 @@ pub struct SearchResultRow {
 impl SearchResultRow {
     fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
         Ok(Self {
+            rowid: row.get("message_rowid")?,
             message_uuid: row.get("message_uuid")?,
             session_id: row.get("session_id")?,
             parent_uuid: row.get("parent_uuid")?,
@@ -587,7 +603,7 @@ impl ConversationSearch {
 
         let sql = if trimmed.is_empty() {
             let mut sql = String::from(
-                "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
+                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
             );
 
             Self::append_filters(&mut sql, &mut params, filter)?;
@@ -596,9 +612,14 @@ impl ConversationSearch {
             params.push(Box::new(limit));
             sql
         } else if has_short_term {
-            // Trigram requires >= 3 characters per term; fall back to LIKE for short terms
+            // Trigram requires >= 3 characters per term; fall back to LIKE for short terms.
+            //
+            // This path intentionally keeps AND semantics and recency order, unlike the FTS
+            // path (OR + bm25). There is no term-frequency signal to rank by here, and a
+            // 2-character term ORed against anything matches nearly the whole corpus, so OR
+            // without ranking would return pure noise. The asymmetry is deliberate.
             let mut sql = String::from(
-                "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
+                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
             );
 
             for term in &terms {
@@ -626,7 +647,7 @@ impl ConversationSearch {
                         .iter()
                         .map(|t| format!("\"{}\"", t))
                         .collect::<Vec<_>>()
-                        .join(" AND ")
+                        .join(" OR ")
                 }
             } else {
                 query.to_string()
@@ -637,9 +658,9 @@ impl ConversationSearch {
             // scanning ~all messages and checking trigram FTS for each row (O(N) full table scan).
             // Phase 1: Get matching rowids from FTS (fast, ~50ms for 1700 matches).
             // Phase 2: Query messages+conversations by rowid IN batches.
-            let rowids = self.query_fts_rowids(&fts_query)?;
+            let scored = self.query_fts_rowids(&fts_query)?;
 
-            if rowids.is_empty() {
+            if scored.is_empty() {
                 let stats = self.gather_search_stats(filter, 0)?;
                 return Ok(SearchResult {
                     rows: Vec::new(),
@@ -647,32 +668,71 @@ impl ConversationSearch {
                 });
             }
 
+            let score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
+
             // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
             const BATCH_SIZE: usize = 500;
             let mut all_results: Vec<SearchResultRow> = Vec::new();
 
-            for chunk in rowids.chunks(BATCH_SIZE) {
+            for chunk in scored.chunks(BATCH_SIZE) {
                 let mut batch_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
                 let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                 let mut sql = format!(
-                    "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
+                    "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
                     placeholders
                 );
 
-                for rowid in chunk {
+                for (rowid, _) in chunk {
                     batch_params.push(Box::new(*rowid));
                 }
 
                 Self::append_filters(&mut sql, &mut batch_params, filter)?;
-                sql.push_str(" ORDER BY m.timestamp DESC");
+                // No ORDER BY: the final order is decided in Rust below, because the
+                // bm25 score lives in phase 1 and is not visible to this query.
 
                 let batch_results = self.execute_search_typed(&sql, &batch_params)?;
                 all_results.extend(batch_results);
+
+                // Early stop, valid ONLY for relevance order.
+                //
+                // WRONG alternative: truncating the phase-1 rowid list to `limit` before
+                // phase 2. Filters (project/date/source/repo) and is_meta_conversation are
+                // applied only in phase 2, so if the top hits all belong to another project
+                // that would return zero rows while the correct answer is non-empty.
+                //
+                // What holds instead: phase 1 returns rowids sorted best-first, so after
+                // processing batches 0..k every unprocessed candidate scores no better than
+                // what we already hold. Once we have `limit` post-filter rows, they are the
+                // globally best `limit` rows -- filters only remove candidates, never promote
+                // them, so this is independent of which filters are active.
+                //
+                // Does not hold for Recent order: recency is uncorrelated with bm25 rank.
+                if filter.sort == SortOrder::Relevance && all_results.len() >= limit as usize {
+                    break;
+                }
             }
 
-            // Sort all results by timestamp DESC and take limit
-            all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+            // bm25's length normalization is what sinks the multi-KB observer transcripts,
+            // but it could in principle let a one-line fragment outrank a substantive
+            // discussion. If that shows up, the fix is a length-aware tie-break here
+            // (`(bm25, -len)`), not a length filter -- a hard floor would make
+            // short-but-correct messages unfindable.
+            match filter.sort {
+                SortOrder::Relevance => all_results.sort_by(|a, b| {
+                    let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
+                    let sb = score_by_rowid.get(&b.rowid).copied().unwrap_or(f64::MAX);
+                    sa.partial_cmp(&sb)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        // Ties prefer the newer message AMONG COLLECTED ROWS ONLY. An
+                        // equal-scoring row in a later batch is never fetched once the
+                        // early stop fires, so across a batch boundary ties resolve in
+                        // phase-1 order instead. Accepted: exact bm25 ties are rare, and
+                        // closing the gap means scanning past `limit` on every query.
+                        .then_with(|| b.timestamp.cmp(&a.timestamp))
+                }),
+                SortOrder::Recent => all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)),
+            }
             all_results.truncate(limit as usize);
 
             // Post-process: extract snippets with highlighting around match locations
@@ -695,8 +755,11 @@ impl ConversationSearch {
     }
 
     /// Search and group results by session, with `limit` applied at the SESSION level
-    /// (not the message level). Returns up to `limit` distinct sessions, each represented
-    /// by its most-recent matching message and the total match count for that session.
+    /// (not the message level). Returns up to `limit` distinct sessions and the total match
+    /// count for each. The representative message is the session's best-scoring match under
+    /// `SortOrder::Relevance`. Under `SortOrder::Recent` -- and on the LIKE fallback path
+    /// (empty query, or any term under 3 characters) regardless of `sort`, since that path
+    /// has no bm25 score to rank by -- it is the most recent match instead.
     pub fn search_grouped_by_session(
         &mut self,
         query: &str,
@@ -729,9 +792,11 @@ impl ConversationSearch {
         if trimmed.is_empty() || has_short_term {
             // Empty / short-term path: SQL window function picks the most recent message
             // per session and counts matches per session, then we LIMIT at session level.
+            // Like the non-grouped short-term path, this keeps AND + recency: no FTS query
+            // means no bm25 to rank by.
             let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             let mut inner_sql = String::from(
-                "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, \
+                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, \
                  m.message_type, m.project_path, m.depth, m.is_sidechain, \
                  SUBSTR(m.full_content, 1, 500) AS context_snippet, \
                  c.conversation_summary, c.conversation_file, c.source, \
@@ -785,15 +850,15 @@ impl ConversationSearch {
                     .iter()
                     .map(|t| format!("\"{}\"", t))
                     .collect::<Vec<_>>()
-                    .join(" AND ")
+                    .join(" OR ")
             }
         } else {
             query.to_string()
         };
 
-        let rowids = self.query_fts_rowids(&fts_query)?;
+        let scored = self.query_fts_rowids(&fts_query)?;
 
-        if rowids.is_empty() {
+        if scored.is_empty() {
             let stats = self.gather_search_stats(filter, 0)?;
             return Ok(GroupedSearchResult {
                 rows: Vec::new(),
@@ -801,34 +866,57 @@ impl ConversationSearch {
             });
         }
 
+        // NOTE: no early stop here, unlike `search_conversations`. `match_count` and
+        // `total_matched_messages` below are computed over ALL post-filter matches, so
+        // every batch must be scanned. Adding an early break here silently corrupts them.
         const BATCH_SIZE: usize = 500;
         let mut all_results: Vec<SearchResultRow> = Vec::new();
-        for chunk in rowids.chunks(BATCH_SIZE) {
+        for chunk in scored.chunks(BATCH_SIZE) {
             let mut batch_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let mut sql = format!(
-                "SELECT m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, \
+                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, \
                  m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, \
                  c.conversation_summary, c.conversation_file, c.source \
                  FROM messages m JOIN conversations c ON m.session_id = c.session_id \
                  WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
                 placeholders
             );
-            for rowid in chunk {
+            for (rowid, _) in chunk {
                 batch_params.push(Box::new(*rowid));
             }
             Self::append_filters(&mut sql, &mut batch_params, filter)?;
-            sql.push_str(" ORDER BY m.timestamp DESC");
+            // No ORDER BY: final order is decided in Rust below (see search_conversations).
             let batch_results = self.execute_search_typed(&sql, &batch_params)?;
             all_results.extend(batch_results);
         }
 
-        // `stats.matched_messages` is the count post-filter (matches `search_conversations`
-        // FTS path, not the pre-filter rowid count).
+        // Full post-filter match count. This deliberately differs from
+        // `search_conversations`, whose `matched_messages` counts RETURNED rows (truncated
+        // to `limit`, and cut short by the early stop): grouping needs the true total to
+        // report `match_count` per session.
         let total_matched_messages = all_results.len() as i64;
 
-        // Group by session: representative = most recent matching message; count all matches.
-        all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+        // Group by session; count all matches. Sorting the flat list first means the
+        // loop below picks up both the session order and its representative for free:
+        // a session's score is the best (lowest) bm25 among its matches, and the first
+        // row seen for a session is exactly that best-scoring message.
+        //
+        // The representative moves with the ranking on purpose. Surfacing a session
+        // because it holds a highly relevant message, then showing a different message
+        // as the snippet, makes the ranking look broken.
+        let score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
+        match filter.sort {
+            SortOrder::Relevance => all_results.sort_by(|a, b| {
+                let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
+                let sb = score_by_rowid.get(&b.rowid).copied().unwrap_or(f64::MAX);
+                sa.partial_cmp(&sb)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.timestamp.cmp(&a.timestamp))
+            }),
+            // Recent: representative reverts to the most recent matching message.
+            SortOrder::Recent => all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)),
+        }
 
         let search_terms: Vec<&str> = trimmed.split_whitespace().collect();
         let mut session_data: HashMap<String, (SearchResultRow, i64)> = HashMap::new();
@@ -908,14 +996,23 @@ impl ConversationSearch {
         Ok(())
     }
 
-    fn query_fts_rowids(&self, fts_query: &str) -> Result<Vec<i64>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT rowid FROM message_content_fts WHERE full_content MATCH ?")?;
-        let rowids = stmt
-            .query_map(rusqlite::params![fts_query], |row| row.get(0))?
-            .collect::<std::result::Result<Vec<i64>, _>>()?;
-        Ok(rowids)
+    /// Returns `(rowid, bm25_score)` pairs sorted best-first.
+    ///
+    /// bm25 returns a NEGATIVE double where more negative means more relevant, so
+    /// ascending order is best-first. Callers depend on this ordering for the
+    /// early-stop optimization in `search_conversations`.
+    fn query_fts_rowids(&self, fts_query: &str) -> Result<Vec<(i64, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, bm25(message_content_fts) AS score \
+             FROM message_content_fts WHERE full_content MATCH ? \
+             ORDER BY score",
+        )?;
+        let scored = stmt
+            .query_map(rusqlite::params![fts_query], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<(i64, f64)>, _>>()?;
+        Ok(scored)
     }
 
     fn execute_search_typed(
@@ -1565,6 +1662,466 @@ mod tests {
             limit: 10,
             ..Default::default()
         }
+    }
+
+    /// The early-stop in the FTS path must never drop rows that filters would have kept.
+    ///
+    /// This is the guard against the tempting-but-wrong optimization of truncating the
+    /// phase-1 rowid list before phase 2: filters are applied only in phase 2, so if the
+    /// best-scoring hits all belong to another project, truncating early returns nothing.
+    /// The fixture puts >500 (one full batch) high-scoring rows in /projB and the only
+    /// /projA rows at the very end of the score order.
+    #[test]
+    fn test_early_stop_respects_filters() {
+        let conn = setup_test_db();
+        for (sid, proj) in [("sessA", "/projA"), ("sessB", "/projB")] {
+            insert_test_conversation(
+                &conn,
+                sid,
+                proj,
+                "summary",
+                "2025-01-15T09:00:00",
+                "2025-01-15T10:00:00",
+                "claude_code",
+            );
+        }
+
+        // 600 tight (high-scoring) matches in the filtered-out project: more than one
+        // BATCH_SIZE of 500, so the batching loop genuinely engages.
+        for i in 0..600 {
+            insert_test_message(
+                &conn,
+                &format!("b{}", i),
+                "sessB",
+                "rustacean",
+                "user",
+                "2025-01-15T10:00:00",
+                "/projB",
+            );
+        }
+        // The surviving rows score worst, so they land in the LAST batch.
+        let padded = format!(
+            "{} rustacean {}",
+            "filler ".repeat(300),
+            "filler ".repeat(300)
+        );
+        for i in 0..2 {
+            insert_test_message(
+                &conn,
+                &format!("a{}", i),
+                "sessA",
+                &padded,
+                "user",
+                "2025-01-15T10:00:00",
+                "/projA",
+            );
+        }
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let filter = SearchFilter {
+            limit: 20,
+            project_path: Some("/projA"),
+            ..Default::default()
+        };
+        let rows = searcher
+            .search_conversations("rustacean", &filter)
+            .unwrap()
+            .rows;
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "early stop must not discard rows the filter would keep"
+        );
+        assert!(rows.iter().all(|r| r.session_id == "sessA"));
+    }
+
+    /// Pins the SQL-side `ORDER BY score` direction in `query_fts_rowids`, which the Rust
+    /// comparator cannot cover: on a single-batch fixture the phase-1 order is invisible
+    /// because the final order is recomputed in Rust.
+    ///
+    /// It only becomes observable once the early stop fires. With phase 1 sorted
+    /// worst-first, the stop fills `all_results` from the WORST candidates and breaks
+    /// before ever reaching the good one, which then vanishes from the results entirely.
+    #[test]
+    fn test_phase1_order_is_best_first() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+
+        // One tight match buried among 700 padded ones: more than one BATCH_SIZE, so the
+        // early stop fires long before the last batch.
+        let padded = format!(
+            "{} rustacean {}",
+            "filler ".repeat(300),
+            "filler ".repeat(300)
+        );
+        for i in 0..700 {
+            insert_test_message(
+                &conn,
+                &format!("pad{}", i),
+                "sess1",
+                &padded,
+                "user",
+                "2025-01-15T10:00:00",
+                "/proj",
+            );
+        }
+        insert_test_message(
+            &conn,
+            "best",
+            "sess1",
+            "rustacean",
+            "user",
+            "2025-01-15T09:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let filter = SearchFilter {
+            limit: 5,
+            ..Default::default()
+        };
+        let rows = searcher
+            .search_conversations("rustacean", &filter)
+            .unwrap()
+            .rows;
+
+        assert_eq!(rows.len(), 5);
+        assert_eq!(
+            rows[0].message_uuid, "best",
+            "the best match must survive the early stop"
+        );
+    }
+
+    /// `search_conversations` does not validate `limit` (unlike the grouped path), so the
+    /// degenerate values must at least not panic.
+    #[test]
+    fn test_search_zero_limit_returns_empty() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "rustacean content",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let zero = SearchFilter {
+            limit: 0,
+            ..Default::default()
+        };
+        assert_eq!(
+            searcher
+                .search_conversations("rustacean", &zero)
+                .unwrap()
+                .rows
+                .len(),
+            0
+        );
+
+        // Negative limit keeps its pre-existing (unvalidated) behavior: no panic.
+        let negative = SearchFilter {
+            limit: -1,
+            ..Default::default()
+        };
+        assert_eq!(
+            searcher
+                .search_conversations("rustacean", &negative)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+    }
+
+    /// The <3-char LIKE fallback keeps AND semantics and recency ordering while the FTS
+    /// path uses OR + bm25. That asymmetry is deliberate: there is no ranking signal here,
+    /// and a 2-char term ORed against anything matches nearly everything.
+    #[test]
+    fn test_like_fallback_still_and_and_recency_ordered() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "both_old",
+            "sess1",
+            "認証 実装 の話",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "both_new",
+            "sess1",
+            "実装 と 認証 について",
+            "user",
+            "2025-01-15T11:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "one_only",
+            "sess1",
+            "認証 だけ",
+            "user",
+            "2025-01-15T12:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let rows = searcher
+            .search_conversations("認証 実装", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(rows.len(), 2, "AND semantics: one_only must not match");
+        assert_eq!(rows[0].message_uuid, "both_new", "recency order");
+        assert_eq!(rows[1].message_uuid, "both_old");
+    }
+
+    /// bm25 is negative and lower is better. If the ORDER BY sign were inverted, the
+    /// long sparse match would come first.
+    #[test]
+    fn test_bm25_sign_convention_lower_is_better() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "dense",
+            "sess1",
+            "rustacean rustacean",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        let sparse = format!(
+            "{} rustacean {}",
+            "filler ".repeat(300),
+            "filler ".repeat(300)
+        );
+        insert_test_message(
+            &conn,
+            "sparse",
+            "sess1",
+            &sparse,
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let rows = searcher
+            .search_conversations("rustacean", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].message_uuid, "dense");
+    }
+
+    /// The reason this feature exists: an older, highly relevant message must outrank a
+    /// newer, barely relevant one.
+    #[test]
+    fn test_bm25_ranking_beats_recency() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-20T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "old_relevant",
+            "sess1",
+            "rustacean rustacean rustacean",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        let new_sparse = format!(
+            "{} rustacean {}",
+            "filler ".repeat(300),
+            "filler ".repeat(300)
+        );
+        insert_test_message(
+            &conn,
+            "new_sparse",
+            "sess1",
+            &new_sparse,
+            "user",
+            "2025-01-20T10:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let rows = searcher
+            .search_conversations("rustacean", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].message_uuid, "old_relevant",
+            "relevance must beat recency by default"
+        );
+
+        // ...and --sort=recent restores the old behavior.
+        let recent_filter = SearchFilter {
+            limit: 10,
+            sort: SortOrder::Recent,
+            ..Default::default()
+        };
+        let rows = searcher
+            .search_conversations("rustacean", &recent_filter)
+            .unwrap()
+            .rows;
+        assert_eq!(rows[0].message_uuid, "new_sparse");
+    }
+
+    /// Scores come from phase 1 but rows are filtered in phase 2. The rowid join must
+    /// survive filters removing rows.
+    #[test]
+    fn test_rowid_join_survives_filters() {
+        let conn = setup_test_db();
+        for (sid, proj) in [("sessA", "/projA"), ("sessB", "/projB")] {
+            insert_test_conversation(
+                &conn,
+                sid,
+                proj,
+                "summary",
+                "2025-01-15T09:00:00",
+                "2025-01-15T10:00:00",
+                "claude_code",
+            );
+        }
+        let sparse = format!(
+            "{} rustacean {}",
+            "filler ".repeat(300),
+            "filler ".repeat(300)
+        );
+        insert_test_message(
+            &conn,
+            "a_sparse",
+            "sessA",
+            &sparse,
+            "user",
+            "2025-01-15T10:00:00",
+            "/projA",
+        );
+        insert_test_message(
+            &conn,
+            "a_dense",
+            "sessA",
+            "rustacean rustacean",
+            "user",
+            "2025-01-15T10:01:00",
+            "/projA",
+        );
+        insert_test_message(
+            &conn,
+            "b_dense",
+            "sessB",
+            "rustacean rustacean",
+            "user",
+            "2025-01-15T10:02:00",
+            "/projB",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let filter = SearchFilter {
+            limit: 10,
+            project_path: Some("/projA"),
+            ..Default::default()
+        };
+        let rows = searcher
+            .search_conversations("rustacean", &filter)
+            .unwrap()
+            .rows;
+
+        assert_eq!(rows.len(), 2, "only /projA rows survive the filter");
+        assert!(rows.iter().all(|r| r.session_id == "sessA"));
+        assert_eq!(rows[0].message_uuid, "a_dense", "still score-ordered");
+    }
+
+    /// The `rowid` field is an internal join key for bm25 scores. `--json` output is
+    /// consumed by bin/ai-conversation-search, so it must not leak into the payload.
+    #[test]
+    fn test_json_output_has_no_rowid_field() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "rustacean content",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let rows = searcher
+            .search_conversations("rustacean", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(rows.len(), 1);
+        let json = serde_json::to_string(&rows[0]).unwrap();
+        assert!(
+            !json.contains("rowid"),
+            "rowid must be skipped in JSON output, got: {}",
+            json
+        );
     }
 
     fn setup_test_db() -> Connection {
@@ -2448,7 +3005,7 @@ mod tests {
 
     /// Representative is the most-recent matching message per session.
     #[test]
-    fn test_search_grouped_representative_is_most_recent() {
+    fn test_search_grouped_representative_is_best_scoring() {
         let conn = setup_test_db();
         insert_test_conversation(
             &conn,
@@ -2459,20 +3016,23 @@ mod tests {
             "2025-01-15T11:00:00",
             "claude_code",
         );
+        // The scores must be unambiguous: a tight match vs. a wall of filler that merely
+        // contains the term. Two similar-length messages would let float noise decide.
         insert_test_message(
             &conn,
-            "old",
+            "old_tight",
             "sessA",
-            "match here",
+            "match",
             "user",
             "2025-01-15T09:00:00",
             "/proj",
         );
+        let padded = format!("{} match {}", "filler ".repeat(300), "filler ".repeat(300));
         insert_test_message(
             &conn,
-            "new",
+            "new_padded",
             "sessA",
-            "match here too",
+            &padded,
             "user",
             "2025-01-15T11:00:00",
             "/proj",
@@ -2489,8 +3049,263 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(result.rows[0].representative.message_uuid, "new");
+        assert_eq!(
+            result.rows[0].representative.message_uuid, "old_tight",
+            "representative is the best-scoring message, not the most recent"
+        );
         assert_eq!(result.rows[0].match_count, 2);
+
+        // --sort=recent restores the most-recent representative.
+        let result = searcher
+            .search_grouped_by_session(
+                "match",
+                &SearchFilter {
+                    limit: 5,
+                    sort: SortOrder::Recent,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.rows[0].representative.message_uuid, "new_padded");
+        assert_eq!(result.rows[0].match_count, 2);
+    }
+
+    /// Session score is the BEST (min) bm25 among its matches, not the mean -- otherwise a
+    /// session with one excellent match drowns in its own mediocre ones.
+    #[test]
+    fn test_grouped_session_score_is_best_message() {
+        let conn = setup_test_db();
+        for (sid, last) in [
+            ("sessA", "2025-01-15T12:00:00"),
+            ("sessB", "2025-01-15T13:00:00"),
+        ] {
+            insert_test_conversation(
+                &conn,
+                sid,
+                "/proj",
+                "s",
+                "2025-01-15T09:00:00",
+                last,
+                "claude_code",
+            );
+        }
+        let padded = format!(
+            "{} rustacean {}",
+            "filler ".repeat(300),
+            "filler ".repeat(300)
+        );
+
+        // sessA: one excellent match plus mediocre ones.
+        insert_test_message(
+            &conn,
+            "a_best",
+            "sessA",
+            "rustacean",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "a_mid",
+            "sessA",
+            &padded,
+            "user",
+            "2025-01-15T12:00:00",
+            "/proj",
+        );
+        // sessB: only mediocre matches, but more recent.
+        insert_test_message(
+            &conn,
+            "b_mid",
+            "sessB",
+            &padded,
+            "user",
+            "2025-01-15T13:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let result = searcher
+            .search_grouped_by_session(
+                "rustacean",
+                &SearchFilter {
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].representative.session_id, "sessA");
+        assert_eq!(result.rows[0].representative.message_uuid, "a_best");
+        assert_eq!(result.rows[1].representative.session_id, "sessB");
+    }
+
+    /// The grouped path must never early-stop: `match_count` counts ALL post-filter
+    /// matches in the session, so every batch has to be scanned.
+    ///
+    /// The fixture must exceed BATCH_SIZE (500), otherwise a smuggled-in early break
+    /// would never fire and the test would pass vacuously.
+    #[test]
+    fn test_grouped_match_count_unaffected_by_ranking() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sessA",
+            "/proj",
+            "A",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        for i in 0..600 {
+            insert_test_message(
+                &conn,
+                &format!("msg{}", i),
+                "sessA",
+                "rustacean content here",
+                "user",
+                "2025-01-15T10:00:00",
+                "/proj",
+            );
+        }
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let result = searcher
+            .search_grouped_by_session(
+                "rustacean",
+                &SearchFilter {
+                    limit: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(
+            result.rows[0].match_count, 600,
+            "match_count must cover all matches even with limit=1 and >1 batch"
+        );
+    }
+
+    /// The grouped path builds its FTS query independently of `search_conversations`, so
+    /// the OR join needs its own guard. `--group-by-session` is the mode the skill uses most.
+    #[test]
+    fn test_grouped_multi_term_or_join() {
+        let conn = setup_test_db();
+        for (sid, proj) in [("sessA", "/proj"), ("sessB", "/proj")] {
+            insert_test_conversation(
+                &conn,
+                sid,
+                proj,
+                "s",
+                "2025-01-15T09:00:00",
+                "2025-01-15T10:00:00",
+                "claude_code",
+            );
+        }
+        insert_test_message(
+            &conn,
+            "both",
+            "sessA",
+            "rustacean programming language",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "one",
+            "sessB",
+            "rustacean is a term for rust users",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let result = searcher
+            .search_grouped_by_session(
+                "rustac programm",
+                &SearchFilter {
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2, "OR join: both sessions match");
+        assert_eq!(
+            result.rows[0].representative.session_id, "sessA",
+            "the session matching both terms ranks first"
+        );
+    }
+
+    /// Quoting is the ONLY way to get AND/phrase semantics now that bare multi-word
+    /// queries are OR-joined, and it is what `--exact` relies on (cli.rs wraps the query
+    /// in quotes). It also bypasses the <3-char LIKE fallback. Guards both FTS paths.
+    #[test]
+    fn test_quoted_phrase_bypasses_or_join_and_short_term_fallback() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "contiguous",
+            "sess1",
+            "the rustacean programming guide",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "split",
+            "sess1",
+            "rustacean users write code; programming is fun",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        // Quoted: contiguous phrase only, not an OR over the two words.
+        let rows = searcher
+            .search_conversations("\"rustacean programming\"", &default_filter())
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_uuid, "contiguous");
+
+        // Same on the grouped path.
+        let result = searcher
+            .search_grouped_by_session(
+                "\"rustacean programming\"",
+                &SearchFilter {
+                    limit: 5,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].representative.message_uuid, "contiguous");
+
+        // A quoted query with a <3-char token still reaches FTS instead of the LIKE path.
+        let rows = searcher
+            .search_conversations("\"is fun\"", &default_filter())
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].message_uuid, "split");
     }
 
     /// Meta conversation messages must be excluded on both the window-function path
@@ -3060,12 +3875,14 @@ mod tests {
             .rows;
         assert_eq!(results.len(), 1); // "rustac" is a substring of "rustacean"
 
-        // Multi terms — AND join, each as substring match
+        // Multi terms — OR join, each as substring match
         let results = searcher
             .search_conversations("rustac programm", &default_filter())
             .unwrap()
             .rows;
-        assert_eq!(results.len(), 1); // both substrings found
+        // Single message in this fixture, so OR and AND agree here; cardinality is pinned
+        // by test_search_multi_term_or_join_ranked instead.
+        assert_eq!(results.len(), 1);
     }
 
     // ---- Japanese / CJK search tests ----
@@ -3289,7 +4106,7 @@ mod tests {
     }
 
     #[test]
-    fn test_search_multi_term_and_join() {
+    fn test_search_multi_term_or_join_ranked() {
         let conn = setup_test_db();
         insert_test_conversation(
             &conn,
@@ -3320,14 +4137,18 @@ mod tests {
         );
 
         let mut searcher = ConversationSearch::from_connection(conn);
-        // "rustac programm" should match msg1 (contains both substrings) but not msg2
+        // Multi-term queries are OR-joined, so both messages match; bm25 puts the one
+        // containing BOTH terms first. AND-joining returned nothing useful in practice.
         let results = searcher
             .search_conversations("rustac programm", &default_filter())
             .unwrap()
             .rows;
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].message_uuid, "msg1");
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].message_uuid, "msg1",
+            "the document matching both terms must rank first"
+        );
     }
 
     #[test]
