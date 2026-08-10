@@ -655,19 +655,24 @@ fn confirm_prune(count: i64, assume_yes: bool) -> Result<bool> {
 
 fn cmd_prune_observer(dry_run: bool, assume_yes: bool) -> Result<()> {
     let mut indexer = ConversationIndexer::new(db::DEFAULT_DB_PATH, false)?;
-    let count = indexer.count_observer_sessions()?;
 
     if dry_run {
+        // One scan for both numbers; see survey_observer_sessions.
+        let (count, sample) = indexer.survey_observer_sessions(20)?;
         eprintln!(
             "Would remove {} claude-mem observer session(s) and rebuild the full-text index.",
             count
         );
-        for (session_id, project_path, first_message_at) in indexer.sample_observer_sessions(20)? {
+        for (session_id, project_path, first_message_at) in sample {
             eprintln!("  {}  {}  {}", first_message_at, session_id, project_path);
         }
         eprintln!("Re-run without --dry-run to apply.");
         return Ok(());
     }
+
+    // The destructive path still counts up front: the confirmation prompt and the
+    // zero-session short-circuit both need the number before anything is deleted.
+    let count = indexer.count_observer_sessions()?;
 
     if count == 0 {
         eprintln!("No claude-mem observer sessions in the index.");

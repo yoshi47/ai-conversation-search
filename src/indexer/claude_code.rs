@@ -20,6 +20,9 @@ use super::{ConversationMeta, Message};
 /// check in `do_index_conversation` is what stops that from being permanent.
 const OBSERVER_PROJECT_DIR_SUFFIX: &str = "-claude-mem-observer-sessions";
 
+/// One line of `prune-observer --dry-run` output: session id, project path, first message.
+pub type ObserverSessionSample = (String, String, String);
+
 /// Whether claude-mem observer transcripts should be indexed anyway.
 ///
 /// Escape hatch for restoring transcripts that were skipped; see `index --force`, which
@@ -1396,28 +1399,52 @@ impl ConversationIndexer {
         Ok(count)
     }
 
-    /// A sample of the sessions `prune_observer_sessions` would delete.
+    /// How many observer sessions there are, plus a sample of them, from one scan.
     ///
-    /// Returns `(session_id, project_path, first_message_at)`. Exists so `--dry-run` can
-    /// show what is in range rather than only how many rows there are -- the detection is
-    /// a substring match driving an irreversible delete, so the caller needs to be able to
-    /// spot a session that only looks like an observer transcript.
-    pub fn sample_observer_sessions(&self, limit: i64) -> Result<Vec<(String, String, String)>> {
-        let sql = format!(
+    /// Returns `(count, [(session_id, project_path, first_message_at)])`. The sample exists
+    /// because detection is a substring match driving an irreversible delete: the caller has
+    /// to be able to spot a session that only looks like an observer transcript.
+    ///
+    /// Materialised into a temp table rather than evaluated twice.
+    /// `OBSERVER_SESSION_SELECT_SQL` is a window function over `messages` with no supporting
+    /// index, so every evaluation is a full scan plus a sort; `--dry-run` used to pay for two.
+    pub fn survey_observer_sessions(
+        &self,
+        sample_limit: i64,
+    ) -> Result<(i64, Vec<ObserverSessionSample>)> {
+        // The temp table is connection-scoped and shares its name with the one in
+        // prune_observer_sessions, so an error path that left one behind would poison the
+        // next call in the same process.
+        self.conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS observer_sessions;
+             CREATE TEMP TABLE observer_sessions AS {};",
+            OBSERVER_SESSION_SELECT_SQL
+        ))?;
+
+        let count: i64 =
+            self.conn
+                .query_row("SELECT COUNT(*) FROM observer_sessions", [], |row| {
+                    row.get(0)
+                })?;
+
+        let mut stmt = self.conn.prepare(
             "SELECT c.session_id,
                     COALESCE(c.project_path, ''),
                     COALESCE(c.first_message_at, '')
              FROM conversations c
-             WHERE c.session_id IN ({})
+             JOIN observer_sessions o ON o.session_id = c.session_id
              ORDER BY c.first_message_at DESC
              LIMIT ?",
-            OBSERVER_SESSION_SELECT_SQL
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt
-            .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+        )?;
+        let sample = stmt
+            .query_map([sample_limit], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows)
+        drop(stmt);
+
+        self.conn.execute_batch("DROP TABLE observer_sessions;")?;
+        Ok((count, sample))
     }
 
     /// Rebuild the full-text index from `messages`.
@@ -1447,7 +1474,8 @@ impl ConversationIndexer {
         let tx = self.conn.unchecked_transaction()?;
 
         tx.execute_batch(&format!(
-            "CREATE TEMP TABLE observer_sessions AS {};",
+            "DROP TABLE IF EXISTS observer_sessions;
+             CREATE TEMP TABLE observer_sessions AS {};",
             OBSERVER_SESSION_SELECT_SQL
         ))?;
 
@@ -2552,6 +2580,42 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[test]
+    fn test_survey_observer_sessions_counts_and_samples() {
+        let (_dir, indexer) = create_test_indexer();
+        seed_observer_and_normal_rows(&indexer);
+
+        let (count, sample) = indexer.survey_observer_sessions(20).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(sample.len(), 1);
+        assert_eq!(sample[0].0, "obs1");
+    }
+
+    /// The temp table is connection-scoped, so a survey that failed to clean up would make
+    /// the next call on the same connection fail with "table already exists".
+    #[test]
+    fn test_survey_observer_sessions_is_repeatable() {
+        let (_dir, indexer) = create_test_indexer();
+        seed_observer_and_normal_rows(&indexer);
+
+        let first = indexer.survey_observer_sessions(20).unwrap();
+        let second = indexer.survey_observer_sessions(20).unwrap();
+        assert_eq!(first.0, second.0);
+        assert_eq!(first.1, second.1);
+    }
+
+    /// A survey must not consume the sessions it reports on; --dry-run runs before the
+    /// real thing and the count has to still be true afterwards.
+    #[test]
+    fn test_survey_observer_sessions_does_not_delete() {
+        let (_dir, mut indexer) = create_test_indexer();
+        seed_observer_and_normal_rows(&indexer);
+
+        indexer.survey_observer_sessions(20).unwrap();
+        assert_eq!(indexer.count_observer_sessions().unwrap(), 1);
+        assert_eq!(indexer.prune_observer_sessions().unwrap(), 1);
     }
 
     #[test]
