@@ -202,10 +202,13 @@ An ambiguous prefix is reported as an error rather than resolved to one of the m
 ### `ai-conversation-search prune-observer`
 Remove claude-mem observer sessions indexed by earlier versions
 ```bash
-ai-conversation-search prune-observer [--dry-run]
+ai-conversation-search prune-observer [--dry-run] [--yes]
 ```
 New observer sessions are skipped at index time, so this only needs running once.
 Irreversible and can take several minutes — back up `~/.conversation-search/index.db` first.
+
+Run `--dry-run` first to see what would go. The real run asks for confirmation; without a
+terminal (scripts, agent shells) it refuses unless you pass `--yes`.
 
 ### `ai-conversation-search pick` *(wrapper only)*
 Interactive session picker using fzf with live full-text search

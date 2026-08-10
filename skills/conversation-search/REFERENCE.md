@@ -307,11 +307,17 @@ ai-conversation-search index --all
 Remove claude-mem observer sessions that earlier versions put in the index.
 
 ```bash
-ai-conversation-search prune-observer [--dry-run]
+ai-conversation-search prune-observer [--dry-run] [--yes]
 ```
 
 **Options:**
 - `--dry-run`: Report how many sessions would be removed, without changing anything
+- `--yes`: Skip the confirmation prompt. Required when stdin is not a terminal
+
+**Agent usage:** an agent shell never has a terminal, so the plain command exits 1 with
+`prune-observer requires --yes when stdin is not a terminal`. Run `--dry-run`, show the
+count to the user, and let them decide — do not reach for `--yes` on your own. This deletes
+rows and cannot be undone.
 
 **Notes:**
 - Irreversible, and can take several minutes on a large index (it rebuilds the FTS index

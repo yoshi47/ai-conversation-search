@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 
 use crate::db;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use crate::indexer::codex::CodexIndexer;
 use crate::indexer::count_conversation_files_on_disk;
 use crate::indexer::opencode::{get_opencode_db_path, OpenCodeIndexer};
@@ -162,6 +162,9 @@ pub enum Commands {
         /// Report what would be removed without changing the database
         #[arg(long)]
         dry_run: bool,
+        /// Skip the confirmation prompt (required when stdin is not a terminal)
+        #[arg(long)]
+        yes: bool,
     },
     /// Show index status and health
     Status {
@@ -386,7 +389,7 @@ pub fn run(cli: Cli) -> Result<()> {
             force,
             quiet,
         }) => cmd_index(days, all, force, quiet),
-        Some(Commands::PruneObserver { dry_run }) => cmd_prune_observer(dry_run),
+        Some(Commands::PruneObserver { dry_run, yes }) => cmd_prune_observer(dry_run, yes),
         Some(Commands::Status { json }) => cmd_status(json),
         Some(Commands::Search {
             query,
@@ -615,7 +618,42 @@ fn cmd_index(days: i64, all: bool, force: bool, quiet: bool) -> Result<()> {
 /// Deliberately a command rather than a schema migration: migrations run inside the
 /// detached indexer that `search` spawns, so a destructive one would fire silently on the
 /// first search after upgrading, before anyone could take a backup.
-fn cmd_prune_observer(dry_run: bool) -> Result<()> {
+/// Ask before an irreversible delete.
+///
+/// A non-TTY without `--yes` is refused rather than assumed. This command is reachable from
+/// scripts and from agent shells, which never have a terminal, and "nobody answered" must
+/// not read as "yes" for something that cannot be undone.
+fn confirm_prune(count: i64, assume_yes: bool) -> Result<bool> {
+    use std::io::{IsTerminal, Write};
+
+    if assume_yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "Refusing to remove {} session(s) without confirmation.",
+            count
+        );
+        eprintln!("stdin is not a terminal. Re-run with --yes, or --dry-run to preview.");
+        return Err(AppError::General(
+            "prune-observer requires --yes when stdin is not a terminal".to_string(),
+        ));
+    }
+
+    eprint!(
+        "Remove {} observer session(s)? This cannot be undone. [y/N] ",
+        count
+    );
+    let _ = std::io::stderr().flush();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn cmd_prune_observer(dry_run: bool, assume_yes: bool) -> Result<()> {
     let mut indexer = ConversationIndexer::new(db::DEFAULT_DB_PATH, false)?;
     let count = indexer.count_observer_sessions()?;
 
@@ -651,6 +689,11 @@ fn cmd_prune_observer(dry_run: bool) -> Result<()> {
     eprintln!(
         "The observations themselves stay in claude-mem's own database; only this index changes."
     );
+
+    if !confirm_prune(count, assume_yes)? {
+        eprintln!("Aborted. Nothing was removed.");
+        return Ok(());
+    }
 
     let removed = match indexer.prune_observer_sessions() {
         Ok(n) => n,
@@ -1207,6 +1250,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("conv-search-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(".last-auto-index")
+    }
+
+    #[test]
+    fn test_confirm_prune_yes_flag_skips_stdin() {
+        // Must not read stdin at all -- this is the path scripts and agents take.
+        assert!(confirm_prune(5, true).unwrap());
+    }
+
+    #[test]
+    fn test_confirm_prune_refuses_without_tty() {
+        // The test harness's stdin is not a terminal, which is exactly the property under
+        // test: no terminal and no --yes must be an error, never a silent "yes".
+        let err = confirm_prune(5, false).expect_err("non-TTY without --yes must be refused");
+        assert!(
+            err.to_string().contains("--yes"),
+            "error should name the flag that unblocks it, got: {}",
+            err
+        );
     }
 
     #[test]
