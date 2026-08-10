@@ -211,8 +211,12 @@ pub struct SearchStats {
     pub total_indexed_messages: i64,
     pub sessions_in_scope: i64,
     pub matched_messages: i64,
-    /// Whether `limit` cut off results that otherwise matched. A lower bound on the FTS
-    /// path, exact elsewhere -- see the assignment sites.
+    /// Whether `limit` cut off results that otherwise matched.
+    ///
+    /// Exact on the LIKE paths. On the FTS path it can over-report: unscanned candidates
+    /// count as truncation even though they may all fail the filters. Over-warning is the
+    /// deliberate direction -- see the assignment site -- so `false` is the trustworthy
+    /// answer here and `true` means "look again", not "there is definitely more".
     pub truncated: bool,
 }
 
@@ -1825,7 +1829,7 @@ impl ConversationSearch {
 
 #[cfg(test)]
 impl ConversationSearch {
-    fn from_connection(conn: Connection) -> Self {
+    pub(crate) fn from_connection(conn: Connection) -> Self {
         Self {
             conn,
             db_path: String::new(),

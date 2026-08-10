@@ -94,7 +94,10 @@ fi
 # "No sessions found" instead of a version problem.
 acs_binary_is_current() {
     [ -x "$BINARY" ] || return 1
-    _acs_reported=$("$BINARY" --version 2>/dev/null) || return 1
+    # </dev/null because this executes whatever is parked at the cache path. A script or
+    # wrapper left there by an ACS_VERSION experiment could read stdin and hang the probe
+    # with a blank terminal on every invocation.
+    _acs_reported=$("$BINARY" --version 2>/dev/null </dev/null) || return 1
     case "$_acs_reported" in
         *" ${VERSION}") return 0 ;;
         *" ${VERSION} "*) return 0 ;;
@@ -117,6 +120,16 @@ if ! acs_binary_is_current; then
     chmod +x "$TMPFILE"
     mv "$TMPFILE" "$BINARY"
     trap - EXIT
+
+    # Re-check, and fail loudly instead of looping. Without this a release asset built
+    # from the wrong tag re-downloads several MB on every single invocation, reporting a
+    # permanent condition with a message that reads as transient.
+    if ! acs_binary_is_current; then
+        echo "Error: downloaded binary does not report v${VERSION}." >&2
+        echo "  It reports: $("$BINARY" --version 2>/dev/null </dev/null || echo '(no version)')" >&2
+        echo "  The release asset may be wrong. Delete ${BINARY} and report this." >&2
+        exit 1
+    fi
 fi
 
 if [ ! -f "${HOME}/.conversation-search/index.db" ]; then
@@ -320,7 +333,13 @@ RELOAD_EOF
     RESUME_CMD=$(printf '%s' "$SELECTED" | cut -f2)
 
     if [ -z "$RESUME_CMD" ]; then
-        echo "This session does not support resume (source may be OpenCode/Codex)." >&2
+        # resume_command is null for OpenCode/Codex sessions, and also when the CLI refused
+        # to build a command it could not make safe (a project path with a control
+        # character). The label in the picker row distinguishes them, so point at it rather
+        # than guessing -- naming only OpenCode/Codex contradicts a [CC] row on screen.
+        echo "No resume command for this session." >&2
+        echo "  [OC]/[CX] rows: OpenCode and Codex are resumed with their own tools." >&2
+        echo "  [CC] rows: the project path could not be safely quoted; resume manually." >&2
         exit 1
     fi
 

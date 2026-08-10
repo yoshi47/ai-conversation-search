@@ -20,8 +20,16 @@ use super::{ConversationMeta, Message};
 /// check in `do_index_conversation` is what stops that from being permanent.
 const OBSERVER_PROJECT_DIR_SUFFIX: &str = "-claude-mem-observer-sessions";
 
-/// One line of `prune-observer --dry-run` output: session id, project path, first message.
-pub type ObserverSessionSample = (String, String, String);
+/// One line of `prune-observer --dry-run` output.
+///
+/// Named fields rather than a tuple: this is what a human reads to spot a false positive
+/// before an irreversible delete, and with three `String`s a reordered SELECT would compile
+/// and silently mislabel the preview.
+pub struct ObserverSessionSample {
+    pub session_id: String,
+    pub project_path: String,
+    pub first_message_at: String,
+}
 
 /// Whether claude-mem observer transcripts should be indexed anyway.
 ///
@@ -29,22 +37,29 @@ pub type ObserverSessionSample = (String, String, String);
 /// is also needed because skipped files record their mtime and would otherwise be
 /// considered up to date.
 fn observer_indexing_enabled() -> bool {
-    let raw = match std::env::var("CONVERSATION_SEARCH_INDEX_OBSERVER") {
-        Ok(v) => v,
-        Err(_) => return false,
+    std::env::var("CONVERSATION_SEARCH_INDEX_OBSERVER")
+        .ok()
+        .and_then(|raw| parse_env_flag(&raw))
+        .unwrap_or(false)
+}
+
+/// Warn once, in the foreground, if the observer escape hatch was set to a value that is
+/// not understood.
+///
+/// Separate from `observer_indexing_enabled` because that runs inside the detached indexer
+/// `search` spawns, whose stderr is `/dev/null` -- a warning raised there never reaches the
+/// person who set the variable, which is exactly the "it does not work and nothing says
+/// why" failure being guarded against. Call this from the parent process instead.
+pub fn warn_on_unrecognised_observer_flag() {
+    let Ok(raw) = std::env::var("CONVERSATION_SEARCH_INDEX_OBSERVER") else {
+        return;
     };
-    match parse_env_flag(&raw) {
-        Some(enabled) => enabled,
-        None => {
-            // Falling back to "off" without a word is how `=true` turned into "the escape
-            // hatch does not work and nothing says why".
-            eprintln!(
-                "Warning: CONVERSATION_SEARCH_INDEX_OBSERVER='{}' is not a recognised boolean \
-                 (use 1/true/yes/on or 0/false/no/off); treating it as off.",
-                raw
-            );
-            false
-        }
+    if parse_env_flag(&raw).is_none() {
+        eprintln!(
+            "Warning: CONVERSATION_SEARCH_INDEX_OBSERVER='{}' is not a recognised boolean \
+             (use 1/true/yes/on or 0/false/no/off); treating it as off.",
+            raw
+        );
     }
 }
 
@@ -1440,8 +1455,9 @@ impl ConversationIndexer {
     /// to be able to spot a session that only looks like an observer transcript.
     ///
     /// Materialised into a temp table rather than evaluated twice.
-    /// `OBSERVER_SESSION_SELECT_SQL` is a window function over `messages` with no supporting
-    /// index, so every evaluation is a full scan plus a sort; `--dry-run` used to pay for two.
+    /// `OBSERVER_SESSION_SELECT_SQL` partitions by `session_id` and orders by `timestamp`,
+    /// and no index covers that pair (nor the `message_type = 'user'` predicate), so every
+    /// evaluation is a full scan of `messages` plus a sort.
     pub fn survey_observer_sessions(
         &self,
         sample_limit: i64,
@@ -1472,7 +1488,11 @@ impl ConversationIndexer {
         )?;
         let sample = stmt
             .query_map([sample_limit], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok(ObserverSessionSample {
+                    session_id: row.get(0)?,
+                    project_path: row.get(1)?,
+                    first_message_at: row.get(2)?,
+                })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
@@ -1669,6 +1689,55 @@ mod tests {
         }
         file.flush().unwrap();
         file
+    }
+
+    fn stored_summary(indexer: &ConversationIndexer, session: &str) -> String {
+        indexer
+            .connection()
+            .query_row(
+                "SELECT conversation_summary FROM conversations WHERE session_id = ?",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// A blank summary must fall through the chain, not win it.
+    ///
+    /// The point of the priority chain is that a source with nothing in it defers to the
+    /// next one. Rejecting only `None` and not `"   "` stores whitespace, and `list` then
+    /// renders a row with no title and no way to tell that from a rendering fault.
+    #[test]
+    fn test_blank_jsonl_summary_falls_through_to_custom_title() {
+        let (_dir, mut indexer) = create_test_indexer();
+        let file = write_temp_jsonl(&[
+            r#"{"type":"summary","summary":"   ","leafUuid":"u2"}"#,
+            r#"{"type":"custom-title","customTitle":"Real Title"}"#,
+            r#"{"uuid":"u0","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"blank1","message":{"role":"user","content":"hello"}}"#,
+        ]);
+
+        indexer.index_conversation(file.path()).unwrap();
+
+        assert_eq!(stored_summary(&indexer, "blank1"), "Real Title");
+    }
+
+    /// With every source blank, the chain must land on the placeholder rather than on one
+    /// of the blanks.
+    #[test]
+    fn test_blank_everything_falls_through_to_untitled() {
+        let (_dir, mut indexer) = create_test_indexer();
+        let file = write_temp_jsonl(&[
+            r#"{"type":"summary","summary":"  ","leafUuid":"u2"}"#,
+            r#"{"uuid":"u0","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"blank2","message":{"role":"user","content":"   "}}"#,
+        ]);
+
+        indexer.index_conversation(file.path()).unwrap();
+
+        assert_eq!(
+            stored_summary(&indexer, "blank2"),
+            "Untitled conversation",
+            "a whitespace summary must not be stored"
+        );
     }
 
     #[test]
@@ -2790,7 +2859,11 @@ mod tests {
         let (count, sample) = indexer.survey_observer_sessions(20).unwrap();
         assert_eq!(count, 1);
         assert_eq!(sample.len(), 1);
-        assert_eq!(sample[0].0, "obs1");
+        assert_eq!(sample[0].session_id, "obs1");
+        // Field-by-field, so a reordered SELECT shows up here rather than as a mislabeled
+        // confirmation prompt.
+        assert_eq!(sample[0].project_path, "/proj");
+        assert_eq!(sample[0].first_message_at, "2025-01-15T09:00:00");
     }
 
     /// The temp table is connection-scoped, so a survey that failed to clean up would make
@@ -2800,10 +2873,47 @@ mod tests {
         let (_dir, indexer) = create_test_indexer();
         seed_observer_and_normal_rows(&indexer);
 
-        let first = indexer.survey_observer_sessions(20).unwrap();
-        let second = indexer.survey_observer_sessions(20).unwrap();
-        assert_eq!(first.0, second.0);
-        assert_eq!(first.1, second.1);
+        let (first_count, first_sample) = indexer.survey_observer_sessions(20).unwrap();
+        let (second_count, second_sample) = indexer.survey_observer_sessions(20).unwrap();
+        assert_eq!(first_count, second_count);
+        assert_eq!(
+            first_sample
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>(),
+            second_sample
+                .iter()
+                .map(|s| &s.session_id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// The `DROP TABLE IF EXISTS` guards exist for error paths that return before the
+    /// trailing drop, leaving the connection-scoped temp table behind. Without a
+    /// pre-existing table to collide with, those guards are never exercised.
+    #[test]
+    fn test_observer_temp_table_guards_survive_a_leaked_table() {
+        let (_dir, mut indexer) = create_test_indexer();
+        seed_observer_and_normal_rows(&indexer);
+
+        indexer
+            .connection()
+            .execute_batch("CREATE TEMP TABLE observer_sessions(session_id TEXT);")
+            .unwrap();
+
+        let (count, _sample) = indexer.survey_observer_sessions(20).unwrap();
+        assert_eq!(count, 1, "survey must not trip over a leaked temp table");
+
+        indexer
+            .connection()
+            .execute_batch("CREATE TEMP TABLE observer_sessions(session_id TEXT);")
+            .unwrap();
+
+        assert_eq!(
+            indexer.prune_observer_sessions().unwrap(),
+            1,
+            "prune must not trip over a leaked temp table"
+        );
     }
 
     /// A survey must not consume the sessions it reports on; --dry-run runs before the

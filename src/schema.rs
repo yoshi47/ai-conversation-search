@@ -244,7 +244,8 @@ fn detect_sql_migration_applied(conn: &Connection, sql: &str) -> bool {
 /// body forever -- so a transient SQLITE_BUSY or a corrupt page would permanently convince
 /// the database it had been migrated. Note the asymmetry with `detect_sql_migration_applied`,
 /// which defaults to `false` on a failed probe: there, a wrong answer just re-runs a
-/// migration that then fails loudly. Only this side fails in the unsafe direction.
+/// migration that is either idempotent (`CREATE ... IF NOT EXISTS`) or fails loudly
+/// (`ALTER TABLE ADD COLUMN`). Only this side fails in the unsafe direction.
 fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bool> {
     // (object type, object name, marker found only in the post-migration form)
     let (obj_type, obj_name, marker) = match version {

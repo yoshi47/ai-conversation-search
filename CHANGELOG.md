@@ -10,7 +10,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
-- `prune-observer` サブコマンド: 過去にインデックスされた claude-mem observer セッションを削除する。`--dry-run` で件数のみ確認できる
+- `prune-observer` サブコマンド: 過去にインデックスされた claude-mem observer セッションを削除する。`--dry-run` で件数と対象の一部を確認できる。実行時は確認を求め、stdin が端末でない場合（スクリプト・エージェント経由）は `--yes` がなければ拒否して終了する
+- `search --content-chars N`: `--content` で表示する本文の文字数上限（既定 300）。`--content` は `--json` と `--group-by-session` でも効くようになった（JSON では各行に `full_content` と `full_content_truncated` が付く）
 - `index --force`: 前回から変更のないファイルも読み直す。`--all` は日付範囲を広げるだけで、処理済みとして記録されたファイルには効かないため
 
 ### Changed
@@ -19,7 +20,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`--json` の `resume_command` がシェルクォートされるようになった**。`cd -- '<path>' && claude --resume <id>` の形になる。空白を含むパスで `cd` が別の場所に落ち、`;` や `$(...)` を含むディレクトリ名なら `eval` 時に任意コマンドが走っていた。パスやセッション ID が安全に表現できない場合（制御文字を含む等）は `null` を返す
 - **claude-mem observer セッションをインデックスしなくなった**。observer は一次セッションのツール実行を XML で複製したものと claude-mem が生成した観測ログからなり、どちらも本体は別の場所にある（前者は一次セッション、後者は `~/.claude-mem/claude-mem.db` の `observations` / `session_summaries`、いずれも検索可能）。実 DB では conversations の 78%（21,856/27,964）、messages の 29%（236,341/808,165）を占め、実ヒット 1 件につき複数の重複が付いていた。`CONVERSATION_SEARCH_INDEX_OBSERVER=1` と `--all --force` の併用で従来どおり取り込める
 - **`--limit` で結果が打ち切られたとき stderr に通知するようになった**（`-v` の有無によらず）。従来は既定の 20 件で黙って切られており、「ヒットしなかった＝存在しない」と誤読する余地があった。FTS / LIKE フォールバックそれぞれの通常・`--group-by-session` の全 4 経路で検出する
-- `search` の `--limit` に負値を渡すとエラーになる（従来は無制限として扱われていた）。`--group-by-session` 側は以前からエラー
+- `search` と `list` の `--limit` に負値を渡すとエラーになる（従来は無制限として扱われていた）。`--group-by-session` 側は以前からエラー
+- **`list` も `--limit` の打ち切りを通知するようになった**。従来は `search` にしか通知がなく、上限に当たった一覧が「これで全部」として読まれていた
+- **`tree` の解決失敗が exit 1 になった**（破壊的変更）。従来は JSON・human いずれも exit 0 で、human 側はエラーを stdout に出していたため、`$?` を見るスクリプトが「曖昧で選べなかった」を「空の会話」と読んでいた。`.warning` は部分データが返っているので exit 0 のまま
+- `CONVERSATION_SEARCH_INDEX_OBSERVER` が `1` 以外の一般的な真偽値（`true` / `yes` / `on` 等）も受理するようになった。認識できない値は stderr に警告する
+- 複数行・空白のみの会話サマリが一覧の行レイアウトを壊さなくなった
 
 ### Fixed
 

@@ -73,11 +73,15 @@ ai-conversation-search --version
 If the command is not found, the plugin may not be properly installed.
 Guide the user: reinstall the plugin or visit https://github.com/yoshi47/ai-conversation-search
 
-If the CLI rejects a command or flag documented in this skill, the binary is
-likely stale. Check `command -v ai-conversation-search`: a manually installed
-binary (e.g. in `~/.local/bin` or `~/.cargo/bin`) can shadow the plugin
-wrapper and will not auto-upgrade; refresh that binary or adjust PATH before
-trusting search results.
+**The reported version must be 0.15.0 or newer.** Below that, `--json` returns a bare
+array instead of the `{"results": [...]}` envelope this skill assumes, so `.results[]`
+yields nothing and every search looks like "no matches" — a wrong answer, not an error.
+Stop and tell the user to upgrade rather than reporting an empty result.
+
+Do not rely on a command being *rejected* to notice a stale binary: the envelope change
+rejects nothing. Check `command -v ai-conversation-search` — a manually installed binary
+(e.g. in `~/.local/bin` or `~/.cargo/bin`) can shadow the plugin wrapper and will not
+auto-upgrade; refresh that binary or adjust PATH before trusting search results.
 
 **Do not proceed with search** until the version check succeeds.
 

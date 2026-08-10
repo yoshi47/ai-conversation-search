@@ -258,10 +258,12 @@ ai-conversation-search tree SESSION_ID [--json]
 **Options:**
 - `--json`: Output as JSON
 
-**Exit status:** `1` when the session id could not be resolved (not found, or an ambiguous
-prefix); the reason is in `.error` in JSON mode and on stderr otherwise. `0` when a tree
-came back, including when `.warning` is set — a warning means partial data was returned and
-is worth reading, not discarding. Do not read a failed lookup as "the conversation is empty".
+**Exit status:** `1` when no tree came back — the session id could not be resolved (not
+found, or an ambiguous prefix), *or* it resolved but its transcript could not be read. The
+reason is in `.error` in JSON mode and on stderr otherwise; read it before deciding which
+of those happened. `0` when a tree came back, including when `.warning` is set — a warning
+means partial data was returned and is worth reading, not discarding. Do not read a
+non-zero exit as "the conversation is empty".
 
 **Use case:** Visualize conversation branching and checkpoint structure.
 
@@ -421,8 +423,9 @@ All commands support `--json` for structured output.
 
 **Two shapes.** `search`, `search --group-by-session` and `list` return an *envelope*:
 rows live under `.results`, and `.truncated` says whether `--limit` cut the answer off.
-Always read `.truncated` — `false` means you are looking at everything that matched;
-`true` means re-run with a higher `--limit` before concluding something is not there.
+Always read `.truncated`. `true` means `--limit` may have cut the answer off — re-run with
+a higher `--limit` before concluding something is not there. On `search` it errs toward
+`true`, so a `true` is worth re-checking rather than trusting as proof more exists.
 `tree`, `context` and `status` return their own objects, unchanged.
 
 ```
