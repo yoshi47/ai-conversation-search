@@ -26,9 +26,35 @@ const OBSERVER_PROJECT_DIR_SUFFIX: &str = "-claude-mem-observer-sessions";
 /// is also needed because skipped files record their mtime and would otherwise be
 /// considered up to date.
 fn observer_indexing_enabled() -> bool {
-    std::env::var("CONVERSATION_SEARCH_INDEX_OBSERVER")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    let raw = match std::env::var("CONVERSATION_SEARCH_INDEX_OBSERVER") {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    match parse_env_flag(&raw) {
+        Some(enabled) => enabled,
+        None => {
+            // Falling back to "off" without a word is how `=true` turned into "the escape
+            // hatch does not work and nothing says why".
+            eprintln!(
+                "Warning: CONVERSATION_SEARCH_INDEX_OBSERVER='{}' is not a recognised boolean \
+                 (use 1/true/yes/on or 0/false/no/off); treating it as off.",
+                raw
+            );
+            false
+        }
+    }
+}
+
+/// Parse a boolean environment variable, or `None` if the value is not recognised.
+///
+/// An empty value counts as off rather than unrecognised: `VAR= cmd` is a normal way to
+/// disable one inline, and warning about it would be noise.
+fn parse_env_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "" | "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 fn is_observer_project_dir_name(dir_name: &str) -> bool {
@@ -1548,6 +1574,24 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    #[test]
+    fn test_parse_env_flag_accepts_common_spellings() {
+        for raw in ["1", "true", "TRUE", " on ", "yes"] {
+            assert_eq!(parse_env_flag(raw), Some(true), "raw = {:?}", raw);
+        }
+        for raw in ["0", "false", "OFF", "no", ""] {
+            assert_eq!(parse_env_flag(raw), Some(false), "raw = {:?}", raw);
+        }
+    }
+
+    #[test]
+    fn test_parse_env_flag_rejects_unknown_values() {
+        // Unknown must be distinguishable from "off" so the caller can say something.
+        // Silently reading `maybe` as off is the bug this replaced.
+        assert_eq!(parse_env_flag("maybe"), None);
+        assert_eq!(parse_env_flag("2"), None);
+    }
 
     fn create_test_indexer() -> (tempfile::TempDir, ConversationIndexer) {
         let dir = tempfile::tempdir().unwrap();
