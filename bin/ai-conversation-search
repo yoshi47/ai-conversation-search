@@ -87,10 +87,29 @@ if [ "$1" = "setup-hooks" ]; then
     exit 0
 fi
 
-if [ ! -x "$BINARY" ]; then
+# Existence alone is not enough. The cache path is keyed on the version string only, so
+# anything parked at that path -- a local build, a truncated download, a binary left by an
+# ACS_VERSION experiment -- is used forever. A wrapper/binary mismatch is silent rather than
+# loud: the wrapper's jq expressions simply yield nothing, and acs_pick reports
+# "No sessions found" instead of a version problem.
+acs_binary_is_current() {
+    [ -x "$BINARY" ] || return 1
+    _acs_reported=$("$BINARY" --version 2>/dev/null) || return 1
+    case "$_acs_reported" in
+        *" ${VERSION}") return 0 ;;
+        *" ${VERSION} "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! acs_binary_is_current; then
     TARGET=$(detect_target)
     URL="https://github.com/${REPO}/releases/download/v${VERSION}/ai-conversation-search-${TARGET}"
-    echo "Downloading ai-conversation-search v${VERSION} (${TARGET})..." >&2
+    if [ -x "$BINARY" ]; then
+        echo "Cached binary does not report v${VERSION}; re-downloading..." >&2
+    else
+        echo "Downloading ai-conversation-search v${VERSION} (${TARGET})..." >&2
+    fi
     mkdir -p "$CACHE_DIR"
     TMPFILE="${BINARY}.tmp.$$"
     trap 'rm -f "$TMPFILE"' EXIT
