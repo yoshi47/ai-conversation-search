@@ -233,9 +233,12 @@ pub enum Commands {
         /// Max results (default: 20)
         #[arg(long, default_value_t = 20)]
         limit: i64,
-        /// Show full content
+        /// Show message bodies instead of snippets
         #[arg(long)]
         content: bool,
+        /// Max characters of body to show with --content (default: 300)
+        #[arg(long, default_value_t = 300)]
+        content_chars: usize,
         /// Show search diagnostics (session/message counts)
         #[arg(long, short = 'v')]
         verbose: bool,
@@ -433,6 +436,7 @@ pub fn run(cli: Cli) -> Result<()> {
             source,
             limit,
             content,
+            content_chars,
             verbose,
             group_by_session,
             sort,
@@ -463,6 +467,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 &effective_query,
                 &filter,
                 content,
+                content_chars,
                 verbose,
                 group_by_session,
                 json,
@@ -917,10 +922,22 @@ fn display_summary(summary: Option<&str>) -> &str {
     }
 }
 
+/// Truncate to `max` characters, reporting whether anything was dropped.
+///
+/// `chars()`, not bytes: the corpus is largely Japanese and a byte slice would panic on a
+/// multibyte boundary. The bool exists because appending an ellipsis unconditionally told
+/// the reader that a complete twelve-character message had been cut short.
+fn truncate_chars(s: &str, max: usize) -> (String, bool) {
+    let out: String = s.chars().take(max).collect();
+    let dropped = s.chars().nth(max).is_some();
+    (out, dropped)
+}
+
 fn cmd_search(
     query: &str,
     filter: &SearchFilter<'_>,
     show_content: bool,
+    content_chars: usize,
     verbose: bool,
     group_by_session: bool,
     json_output: bool,
@@ -929,7 +946,15 @@ fn cmd_search(
     let mut search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
 
     if group_by_session {
-        return cmd_search_grouped(&mut search, query, filter, verbose, json_output);
+        return cmd_search_grouped(
+            &mut search,
+            query,
+            filter,
+            show_content,
+            content_chars,
+            verbose,
+            json_output,
+        );
     }
 
     let search_result = search.search_conversations(query, filter)?;
@@ -1003,8 +1028,8 @@ fn cmd_search(
 
         if show_content {
             if let Some(content) = search.get_full_message_content(message_uuid) {
-                let truncated: String = content.chars().take(300).collect();
-                println!("\n   {}...", truncated);
+                let (text, dropped) = truncate_chars(&content, content_chars);
+                println!("\n   {}{}", text, if dropped { "…" } else { "" });
             }
         } else {
             println!("\n   {}", result.context_snippet);
@@ -1035,6 +1060,8 @@ fn cmd_search_grouped(
     search: &mut ConversationSearch,
     query: &str,
     filter: &SearchFilter<'_>,
+    show_content: bool,
+    content_chars: usize,
     verbose: bool,
     json_output: bool,
 ) -> Result<()> {
@@ -1094,7 +1121,15 @@ fn cmd_search_grouped(
         println!("   Session: {}", session_id);
         println!("   Project: {}", project_dir);
         println!("   Time: {}", timestamp);
-        println!("\n   {}", r.context_snippet);
+
+        if show_content {
+            if let Some(content) = search.get_full_message_content(&r.message_uuid) {
+                let (text, dropped) = truncate_chars(&content, content_chars);
+                println!("\n   {}{}", text, if dropped { "…" } else { "" });
+            }
+        } else {
+            println!("\n   {}", r.context_snippet);
+        }
 
         if source_str != "opencode" && source_str != "codex" {
             println!("\n   Resume:");
@@ -1311,6 +1346,41 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("conv-search-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(".last-auto-index")
+    }
+
+    #[test]
+    fn test_truncate_chars_shorter_than_max_is_untouched() {
+        assert_eq!(truncate_chars("hello", 300), ("hello".to_string(), false));
+    }
+
+    #[test]
+    fn test_truncate_chars_exact_length_is_not_marked_dropped() {
+        // The off-by-one that printed a bare "..." after complete messages.
+        assert_eq!(truncate_chars("abcde", 5), ("abcde".to_string(), false));
+    }
+
+    #[test]
+    fn test_truncate_chars_longer_is_cut_and_flagged() {
+        assert_eq!(truncate_chars("abcdef", 5), ("abcde".to_string(), true));
+    }
+
+    #[test]
+    fn test_truncate_chars_multibyte_boundary() {
+        // Byte slicing here would panic; chars() must count codepoints.
+        let (out, dropped) = truncate_chars("日本語のテキスト", 3);
+        assert_eq!(out, "日本語");
+        assert!(dropped);
+    }
+
+    #[test]
+    fn test_truncate_chars_zero_max() {
+        assert_eq!(truncate_chars("abc", 0), (String::new(), true));
+    }
+
+    #[test]
+    fn test_truncate_chars_zero_max_on_empty_input() {
+        // Nothing was dropped, so nothing should claim otherwise.
+        assert_eq!(truncate_chars("", 0), (String::new(), false));
     }
 
     fn tree_fixture(warning: Option<&str>, error: Option<&str>) -> crate::search::ConversationTree {
