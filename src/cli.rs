@@ -1205,30 +1205,56 @@ fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Exit status for a tree result.
+///
+/// `error` means nothing usable came back -- an unresolvable or ambiguous session id. A
+/// script reading `$?` has to be able to tell that from a conversation that is genuinely
+/// empty, which is what exiting 0 used to say.
+///
+/// `warning` deliberately stays 0: it means partial data *was* returned, and a non-zero
+/// exit would tell callers to throw away output they should be reading.
+fn tree_exit_code(tree: &crate::search::ConversationTree) -> i32 {
+    if tree.error.is_some() {
+        1
+    } else {
+        0
+    }
+}
+
 fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
     maybe_background_index();
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
     let tree = search.get_conversation_tree(session_id)?;
+    let code = tree_exit_code(&tree);
 
     if json_output {
+        // The JSON body is unchanged, error key and all: the fzf preview and any existing
+        // reader of `.error` keep working, and only the exit status becomes honest.
         let json_val = serde_json::to_value(&tree)?;
         let localized = localize_timestamps(json_val);
         println!("{}", serde_json::to_string_pretty(&localized)?);
-        return Ok(());
+    } else {
+        println!("Conversation tree: {}\n", session_id);
+
+        if let Some(ref err) = tree.error {
+            // stderr, not stdout: `tree ... > out.txt` should leave the failure visible in
+            // the terminal rather than buried in the file.
+            eprintln!("Error: {}", err);
+        } else {
+            if let Some(ref warning) = tree.warning {
+                eprintln!("Warning: {}", warning);
+            }
+            print_tree_nodes(&tree.tree, 0);
+        }
     }
 
-    println!("Conversation tree: {}\n", session_id);
-
-    if let Some(ref err) = tree.error {
-        println!("Error: {}", err);
-        return Ok(());
+    if code != 0 {
+        // process::exit skips destructors, so flush first or the JSON above is lost when
+        // stdout is a pipe.
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
     }
-
-    if let Some(ref warning) = tree.warning {
-        eprintln!("Warning: {}", warning);
-    }
-
-    print_tree_nodes(&tree.tree, 0);
 
     Ok(())
 }
@@ -1285,6 +1311,38 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("conv-search-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(".last-auto-index")
+    }
+
+    fn tree_fixture(warning: Option<&str>, error: Option<&str>) -> crate::search::ConversationTree {
+        crate::search::ConversationTree {
+            conversation: None,
+            tree: Vec::new(),
+            total_messages: 0,
+            warning: warning.map(String::from),
+            error: error.map(String::from),
+        }
+    }
+
+    #[test]
+    fn test_tree_exit_code_error_is_failure() {
+        assert_eq!(
+            tree_exit_code(&tree_fixture(None, Some("Conversation x not found"))),
+            1
+        );
+    }
+
+    #[test]
+    fn test_tree_exit_code_warning_still_succeeds() {
+        // Partial data is still data; a non-zero exit would tell callers to discard it.
+        assert_eq!(
+            tree_exit_code(&tree_fixture(Some("Showing 3 of 10 message(s)."), None)),
+            0
+        );
+    }
+
+    #[test]
+    fn test_tree_exit_code_clean_is_zero() {
+        assert_eq!(tree_exit_code(&tree_fixture(None, None)), 0);
     }
 
     #[test]

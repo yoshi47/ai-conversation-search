@@ -253,6 +253,11 @@ ai-conversation-search tree SESSION_ID [--json]
 **Options:**
 - `--json`: Output as JSON
 
+**Exit status:** `1` when the session id could not be resolved (not found, or an ambiguous
+prefix); the reason is in `.error` in JSON mode and on stderr otherwise. `0` when a tree
+came back, including when `.warning` is set — a warning means partial data was returned and
+is worth reading, not discarding. Do not read a failed lookup as "the conversation is empty".
+
 **Use case:** Visualize conversation branching and checkpoint structure.
 
 Each node's `summary` is the first non-empty line of the message (120 characters).

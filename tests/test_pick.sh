@@ -305,6 +305,37 @@ fi
 fi
 echo ""
 
+# --- tree failure contract ---
+echo "--- tree failure contract ---"
+
+# Guarded assignment: this script runs under `set -e`, and `tree` now exits 1 on an
+# unresolvable id, which would otherwise abort the whole suite here.
+TREE_OUT=$("$BINARY" tree "definitely-no-such-session-id" --json 2>/dev/null) && TREE_RC=0 || TREE_RC=$?
+
+if [ "$TREE_RC" -eq 1 ]; then
+    pass "tree exits 1 when the session cannot be resolved"
+else
+    fail "tree exits 1 on unresolvable id" "Got exit $TREE_RC"
+fi
+
+if [ -n "$(printf '%s' "$TREE_OUT" | jq -r '.error // empty' 2>/dev/null)" ]; then
+    pass "tree still emits parseable JSON carrying .error"
+else
+    fail "tree emits .error on failure" "Got: $(printf '%s' "$TREE_OUT" | head -c 120)"
+fi
+
+# fzf runs the preview in its own shell and ignores its exit status, so a failing tree
+# must degrade the preview rather than blank it. This mirrors bin/ai-conversation-search.
+PREV_ON_FAIL=$("$BINARY" tree "definitely-no-such-session-id" --json 2>/dev/null \
+    | jq -r '"📁 " + (.conversation.project_path // "unknown")' 2>/dev/null \
+    || echo "[Preview unavailable]")
+if [ -n "$PREV_ON_FAIL" ]; then
+    pass "preview pipeline survives tree's non-zero exit"
+else
+    fail "preview pipeline survives tree's non-zero exit" "Got empty output"
+fi
+echo ""
+
 # --- Variable shadowing ---
 echo "--- Variable safety ---"
 
