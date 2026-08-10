@@ -441,9 +441,12 @@ impl CodexIndexer {
             return Ok(0);
         }
 
+        // Blank-rejecting, not just empty-vec-rejecting: a whitespace-only first part would
+        // otherwise be stored and render as an empty row in `list`.
         let title = title_parts
             .first()
             .map(|s| s.as_str())
+            .filter(|s| !s.trim().is_empty())
             .unwrap_or("Untitled");
         let session_timestamp = payload
             .get("timestamp")

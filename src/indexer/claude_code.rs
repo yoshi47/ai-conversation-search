@@ -1192,16 +1192,32 @@ impl ConversationIndexer {
             }
         }
 
+        // Each step rejects blanks rather than only None: an empty or whitespace-only
+        // title upstream would otherwise win the chain and be stored, and `list` has no
+        // way to tell that apart from a real summary. Falling through to the next source
+        // is what the chain is for.
+        let non_blank = |s: String| Some(s).filter(|v| !v.trim().is_empty());
         let conversation_summary = conv_meta
             .as_ref()
             .and_then(|m| m.summary.clone())
-            .or_else(|| conv_meta.as_ref().and_then(|m| m.custom_title.clone()))
-            .or(si_summary)
-            .or_else(|| si_first_prompt.map(|fp| fp.chars().take(100).collect()))
+            .and_then(non_blank)
+            .or_else(|| {
+                conv_meta
+                    .as_ref()
+                    .and_then(|m| m.custom_title.clone())
+                    .and_then(non_blank)
+            })
+            .or_else(|| si_summary.and_then(non_blank))
+            .or_else(|| {
+                si_first_prompt
+                    .map(|fp| fp.chars().take(100).collect())
+                    .and_then(non_blank)
+            })
             .or_else(|| {
                 conv_meta
                     .as_ref()
                     .and_then(|m| m.first_user_message.clone())
+                    .and_then(non_blank)
             })
             .unwrap_or_else(|| "Untitled conversation".to_string());
 

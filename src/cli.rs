@@ -969,9 +969,14 @@ fn inject_resume_command(val: &mut serde_json::Value) {
     }
 }
 
+/// Render a stored summary, or a placeholder when there is nothing to show.
+///
+/// Whitespace-only counts as nothing: a row written before the indexers rejected blanks
+/// would otherwise print as a blank line, which reads as a rendering bug rather than a
+/// missing title. Covers `search`, `search --group-by-session` and `list` in one place.
 fn display_summary(summary: Option<&str>) -> &str {
     match summary {
-        Some(s) if !s.is_empty() => s,
+        Some(s) if !s.trim().is_empty() => s,
         _ => "[no summary]",
     }
 }
@@ -1409,6 +1414,23 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("conv-search-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(".last-auto-index")
+    }
+
+    #[test]
+    fn test_display_summary_treats_blank_as_missing() {
+        assert_eq!(display_summary(None), "[no summary]");
+        assert_eq!(display_summary(Some("")), "[no summary]");
+        // Whitespace-only would otherwise print as a blank line, which reads as a
+        // rendering bug rather than a missing title.
+        assert_eq!(display_summary(Some("   ")), "[no summary]");
+        assert_eq!(display_summary(Some("\n\t ")), "[no summary]");
+    }
+
+    #[test]
+    fn test_display_summary_keeps_real_values() {
+        assert_eq!(display_summary(Some("Auth Bug Fix")), "Auth Bug Fix");
+        // Not trimmed for display -- only tested for emptiness.
+        assert_eq!(display_summary(Some(" padded ")), " padded ");
     }
 
     #[test]

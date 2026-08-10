@@ -378,7 +378,12 @@ impl OpenCodeIndexer {
             return Ok(0);
         }
 
-        let display_title = info.title.unwrap_or("Untitled");
+        // Blank-rejecting, not just None-rejecting: a whitespace-only upstream title would
+        // otherwise be stored and render as an empty row in `list`.
+        let display_title = info
+            .title
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or("Untitled");
         let session_created_iso = Self::epoch_ms_to_iso(info.time_created);
 
         search_conn.execute(
