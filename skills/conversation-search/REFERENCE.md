@@ -70,7 +70,10 @@ ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--un
 - `--content`: Show full message content instead of summaries (human output only; ignored with `--json`)
 - `--group-by-session`: Group results by session (show the top-ranked match per session with match count)
 - `-v, --verbose`: Show search diagnostics (sessions scanned, messages matched, unindexed warnings)
-- `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions)
+- `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions).
+  `resume_command` is shell-quoted and safe to `eval`. It is `null` for OpenCode/Codex
+  sessions, and also `null` when the project path or session id cannot be expressed safely
+  in a shell command — treat `null` as "resume manually", not as an error.
 
 **Search Syntax:**
 - Simple: `authentication bug`
@@ -212,7 +215,10 @@ ai-conversation-search list [--days DAYS] [--since DATE] [--until DATE] [--date 
 - `--limit LIMIT`: Max conversations to show (default: 20)
 - `--repo REPO`: Filter by repository root (partial match)
 - `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
-- `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions)
+- `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions).
+  `resume_command` is shell-quoted and safe to `eval`. It is `null` for OpenCode/Codex
+  sessions, and also `null` when the project path or session id cannot be expressed safely
+  in a shell command — treat `null` as "resume manually", not as an error.
 
 **Note:** Cannot mix `--days` with `--date/--since/--until`.
 
@@ -411,7 +417,7 @@ All commands support `--json` for structured output.
     "source": "claude_code",
     "depth": 3,
     "is_sidechain": false,
-    "resume_command": "cd /home/user/projects/myapp && claude --resume session-xyz"
+    "resume_command": "cd -- /home/user/projects/myapp && claude --resume session-xyz"
   }
 ]
 ```
@@ -424,7 +430,7 @@ All commands support `--json` for structured output.
     "session_id": "session-xyz",
     "source": "claude_code",
     "match_count": 5,
-    "resume_command": "cd /home/user/projects/myapp && claude --resume session-xyz"
+    "resume_command": "cd -- /home/user/projects/myapp && claude --resume session-xyz"
   }
 ]
 ```

