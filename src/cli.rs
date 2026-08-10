@@ -70,6 +70,36 @@ fn is_shell_safe_value(s: &str) -> bool {
     !s.chars().any(|c| c.is_control())
 }
 
+/// Envelope for the list-shaped `--json` commands: `search`, `search --group-by-session`,
+/// and `list`.
+///
+/// A bare array has nowhere to say "there was more than this". The truncation notice only
+/// ever went to stderr, so every machine consumer read a `--limit`-capped list as the
+/// complete answer -- which is how "not found" gets confused with "not looked for".
+///
+/// No `count` field: it is `results | length`, and a number sitting next to `truncated`
+/// reads as the total match count rather than the returned one.
+#[derive(serde::Serialize)]
+struct JsonEnvelope {
+    results: serde_json::Value,
+    truncated: bool,
+}
+
+/// Serialize rows into the envelope, inject `resume_command`, and print.
+///
+/// `inject_resume_command` runs on the inner array *before* wrapping. It recurses into
+/// arrays and mutates session-bearing objects but does not descend into object values, so
+/// it would silently no-op on an already-wrapped envelope. Teaching it to descend was
+/// rejected: `tree` and `context` embed `conversation` objects that also carry
+/// `session_id`, and those would start sprouting `resume_command` keys as a side effect.
+fn print_json_envelope<T: serde::Serialize>(rows: &T, truncated: bool) -> Result<()> {
+    let mut results = localize_timestamps(serde_json::to_value(rows)?);
+    inject_resume_command(&mut results);
+    let envelope = JsonEnvelope { results, truncated };
+    println!("{}", serde_json::to_string_pretty(&envelope)?);
+    Ok(())
+}
+
 /// Recursively convert UTC ISO timestamps to local timezone in JSON values.
 fn localize_timestamps(val: serde_json::Value) -> serde_json::Value {
     use chrono::DateTime;
@@ -907,10 +937,9 @@ fn cmd_search(
     let stats = &search_result.stats;
 
     if json_output {
-        let json_results = serde_json::to_value(&results)?;
-        let mut localized = localize_timestamps(json_results);
-        inject_resume_command(&mut localized);
-        println!("{}", serde_json::to_string_pretty(&localized)?);
+        print_json_envelope(&results, stats.truncated)?;
+        // Kept on stderr as well: someone piping into jq still benefits from the line,
+        // and dropping it would be a second breaking change for no gain.
         print_truncation_notice(stats.truncated, results.len(), "results");
         if verbose {
             eprintln!(
@@ -1013,10 +1042,7 @@ fn cmd_search_grouped(
     let stats = &result.stats;
 
     if json_output {
-        let json_val = serde_json::to_value(&result.rows)?;
-        let mut localized = localize_timestamps(json_val);
-        inject_resume_command(&mut localized);
-        println!("{}", serde_json::to_string_pretty(&localized)?);
+        print_json_envelope(&result.rows, stats.truncated)?;
         print_truncation_notice(stats.truncated, result.rows.len(), "sessions");
         if verbose {
             eprintln!(
@@ -1142,10 +1168,7 @@ fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
     let convs = &result.rows;
 
     if json_output {
-        let json_val = serde_json::to_value(convs)?;
-        let mut localized = localize_timestamps(json_val);
-        inject_resume_command(&mut localized);
-        println!("{}", serde_json::to_string_pretty(&localized)?);
+        print_json_envelope(convs, result.truncated)?;
         print_truncation_notice(result.truncated, convs.len(), "conversations");
         return Ok(());
     }

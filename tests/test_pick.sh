@@ -126,11 +126,23 @@ else
     fail "search --json succeeds"
 fi
 
-COUNT=$(jq 'length' "$TMPFILE")
+# Note the `.results |`: on the envelope, a bare `jq 'length'` returns the number of KEYS,
+# so `-gt 0` would pass no matter what the search found and this test would quietly stop
+# testing anything.
+COUNT=$(jq '.results | length' "$TMPFILE")
 if [ "$COUNT" -gt 0 ]; then
     pass "search returns results ($COUNT sessions)"
 else
     fail "search returns results" "Got 0"
+fi
+
+# --- envelope shape ---
+if [ "$(jq -r 'type' "$TMPFILE")" = "object" ] \
+   && [ "$(jq -r '.results | type' "$TMPFILE")" = "array" ] \
+   && [ "$(jq -r '.truncated | type' "$TMPFILE")" = "boolean" ]; then
+    pass "JSON is an envelope with results[] and truncated"
+else
+    fail "JSON envelope shape" "Got: $(jq -c 'del(.results)' "$TMPFILE" 2>/dev/null || head -c 120 "$TMPFILE")"
 fi
 echo ""
 
@@ -138,8 +150,8 @@ echo ""
 # Format: SESSION_ID<TAB>RESUME_CMD<TAB>DISPLAY
 echo "--- jq transformation ---"
 
-LINES=$(jq -r '.[] |
-  "\(.session_id)\t\(.resume_command // "")\t" +
+LINES=$(jq -r '.results[] |
+  "\(.session_id)\t\(.resume_command // "" | gsub("[\\n\\r\\t]"; " "))\t" +
   (if .source == "opencode" then "[OC]"
    elif .source == "codex" then "[CX]"
    else "[CC]" end) + " " +
@@ -203,7 +215,7 @@ echo ""
 # one session so downstream resume-by-cut works.
 echo "--- resume_command availability ---"
 
-RESUMABLE_COUNT=$(jq '[.[] | select(.resume_command != null and .resume_command != "")] | length' "$TMPFILE")
+RESUMABLE_COUNT=$(jq '[.results[] | select(.resume_command != null and .resume_command != "")] | length' "$TMPFILE")
 if [ "$RESUMABLE_COUNT" -gt 0 ]; then
     pass "$RESUMABLE_COUNT sessions carry resume_command"
 else
@@ -216,7 +228,7 @@ echo "--- --here filtering ---"
 
 CWD="$SCRIPT_DIR"
 FILTERED=$(mktemp)
-jq --arg pp "$CWD" '[.[] | select(.project_path == $pp)]' "$TMPFILE" > "$FILTERED"
+jq --arg pp "$CWD" '[.results[] | select(.project_path == $pp)]' "$TMPFILE" > "$FILTERED"
 FILTERED_COUNT=$(jq 'length' "$FILTERED")
 
 if [ "$FILTERED_COUNT" -le "$COUNT" ]; then
@@ -263,7 +275,7 @@ echo ""
 echo "--- preview command ---"
 
 # Pick a real session from the fetched JSON to exercise the preview path.
-FIRST_SESSION=$(jq -r '.[0].session_id // empty' "$TMPFILE")
+FIRST_SESSION=$(jq -r '.results[0].session_id // empty' "$TMPFILE")
 if [ -z "$FIRST_SESSION" ]; then
     echo "  SKIP: preview tests (no sessions available)"
 else
@@ -303,12 +315,19 @@ else
     fail "REPO variable shadowing check"
 fi
 
-# The pick function should not introduce a top-level TMPFILE (reserved by the
-# download wrapper). Reload-based pick has no mktemp call at all.
-if ! grep -q '^\s*TMPFILE=.*mktemp' "$WRAPPER"; then
-    pass "no TMPFILE variable shadowing"
+# The pick function should not introduce a TMPFILE (the name is reserved by the download
+# and setup-hooks paths, which set their own trap on it). Reload-based pick has no mktemp
+# call at all.
+#
+# Scoped to acs_pick's body: scanning the whole file also caught the legitimate
+# setup-hooks TMPFILE, so this check failed for a reason it was never about.
+PICK_BODY=$(sed -n '/^acs_pick() {/,/^}/p' "$WRAPPER")
+if [ -z "$PICK_BODY" ]; then
+    fail "could not locate acs_pick() in wrapper" "the TMPFILE check would pass vacuously"
+elif printf '%s' "$PICK_BODY" | grep -q 'TMPFILE=.*mktemp'; then
+    fail "TMPFILE variable shadowing detected in acs_pick"
 else
-    fail "TMPFILE variable shadowing detected"
+    pass "no TMPFILE variable shadowing"
 fi
 
 # POSIX compliance: no $'\t' bashism

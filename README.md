@@ -292,8 +292,13 @@ All commands support `--json` flag:
 ai-conversation-search search "authentication" --json > auth_convs.json
 
 # Programmatic processing
-ai-conversation-search list --days 30 --json | jq '.[] | .conversation_summary'
+ai-conversation-search list --days 30 --json | jq '.results[] | .conversation_summary'
 ```
+
+`search`, `search --group-by-session` and `list` return
+`{"results": [...], "truncated": bool}`. `truncated: true` means `--limit` cut the answer
+off, so an empty or short list is not proof that nothing matched. `tree`, `context` and
+`status` return their own objects.
 
 ## Configuration
 

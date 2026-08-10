@@ -238,10 +238,10 @@ out=$("$ACS_BIN" search "$q" --group-by-session --json \
     ${ACS_SOURCE:+--source "$ACS_SOURCE"} \
     ${ACS_PROJECT:+--project "$ACS_PROJECT"} \
     ${ACS_LIMIT:+--limit "$ACS_LIMIT"} \
-    2>/dev/null) || out="[]"
-[ -z "$out" ] && out="[]"
+    2>/dev/null) || out='{"results":[]}'
+[ -z "$out" ] && out='{"results":[]}'
 printf '%s' "$out" | jq -r '
-    .[] |
+    .results[] |
     # Tabs and newlines are the field and record separators for the `cut` below, so a
     # resume_command carrying either would hand `eval` a fragment of itself. The CLI
     # already refuses to emit those, but this line is the one that would break, so it

@@ -409,36 +409,53 @@ ai-conversation-search setup-hooks
 
 All commands support `--json` for structured output.
 
+**Two shapes.** `search`, `search --group-by-session` and `list` return an *envelope*:
+rows live under `.results`, and `.truncated` says whether `--limit` cut the answer off.
+Always read `.truncated` — `false` means you are looking at everything that matched;
+`true` means re-run with a higher `--limit` before concluding something is not there.
+`tree`, `context` and `status` return their own objects, unchanged.
+
+```
+search / search --group-by-session / list  →  { "results": [ … ], "truncated": false }
+tree / context / status                    →  a command-specific object
+```
+
 **Search results:**
 ```json
-[
-  {
-    "message_uuid": "abc-123",
-    "timestamp": "2025-01-13T10:30:00",
-    "message_type": "user",
-    "summary": "User asks about authentication bug",
-    "project_path": "/home/user/projects/myapp",
-    "conversation_summary": "Auth Bug Fix",
-    "session_id": "session-xyz",
-    "source": "claude_code",
-    "depth": 3,
-    "is_sidechain": false,
-    "resume_command": "cd -- /home/user/projects/myapp && claude --resume session-xyz"
-  }
-]
+{
+  "results": [
+    {
+      "message_uuid": "abc-123",
+      "timestamp": "2025-01-13T10:30:00",
+      "message_type": "user",
+      "summary": "User asks about authentication bug",
+      "project_path": "/home/user/projects/myapp",
+      "conversation_summary": "Auth Bug Fix",
+      "session_id": "session-xyz",
+      "source": "claude_code",
+      "depth": 3,
+      "is_sidechain": false,
+      "resume_command": "cd -- /home/user/projects/myapp && claude --resume session-xyz"
+    }
+  ],
+  "truncated": false
+}
 ```
 
 **Search results with `--group-by-session`:**
 ```json
-[
-  {
-    "message_uuid": "abc-123",
-    "session_id": "session-xyz",
-    "source": "claude_code",
-    "match_count": 5,
-    "resume_command": "cd -- /home/user/projects/myapp && claude --resume session-xyz"
-  }
-]
+{
+  "results": [
+    {
+      "message_uuid": "abc-123",
+      "session_id": "session-xyz",
+      "source": "claude_code",
+      "match_count": 5,
+      "resume_command": "cd -- /home/user/projects/myapp && claude --resume session-xyz"
+    }
+  ],
+  "truncated": false
+}
 ```
 
 **Context results:**

@@ -272,6 +272,11 @@ session; pass more characters to disambiguate.
 
 **Always use `--json` for structured output.**
 
+`search`, `search --group-by-session` and `list` return `{"results": [...], "truncated": bool}` —
+read rows from `.results`, and check `.truncated`. When it is `true`, `--limit` cut the answer
+off and "no match" is not a conclusion you can draw yet; re-run with a higher `--limit`.
+`tree`, `context` and `status` return their own objects, not this envelope.
+
 ### Interactive Session Picker (requires fzf 0.28+ and jq)
 Typing in the picker runs a **live full-text search against message bodies**
 via SQLite FTS5 (trigram tokenizer, Japanese/CJK friendly). Matching happens

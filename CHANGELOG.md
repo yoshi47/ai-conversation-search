@@ -15,6 +15,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **破壊的変更: `search` / `search --group-by-session` / `list` の `--json` が envelope になった**。従来の裸配列から `{"results": [...], "truncated": bool}` に変わる。打ち切り通知は stderr にしかなく、stdout だけを読む消費側は上限に当たった一覧を「これで全部」と読んでいたため。`.results[]` を読み、`.truncated` を確認すること。`tree` / `context` / `status` は元からオブジェクトで、変更なし。**長時間動いている Claude Code セッションは、旧形式の指示を保持している可能性があるため再起動を推奨**
+- **`--json` の `resume_command` がシェルクォートされるようになった**。`cd -- '<path>' && claude --resume <id>` の形になる。空白を含むパスで `cd` が別の場所に落ち、`;` や `$(...)` を含むディレクトリ名なら `eval` 時に任意コマンドが走っていた。パスやセッション ID が安全に表現できない場合（制御文字を含む等）は `null` を返す
 - **claude-mem observer セッションをインデックスしなくなった**。observer は一次セッションのツール実行を XML で複製したものと claude-mem が生成した観測ログからなり、どちらも本体は別の場所にある（前者は一次セッション、後者は `~/.claude-mem/claude-mem.db` の `observations` / `session_summaries`、いずれも検索可能）。実 DB では conversations の 78%（21,856/27,964）、messages の 29%（236,341/808,165）を占め、実ヒット 1 件につき複数の重複が付いていた。`CONVERSATION_SEARCH_INDEX_OBSERVER=1` と `--all --force` の併用で従来どおり取り込める
 - **`--limit` で結果が打ち切られたとき stderr に通知するようになった**（`-v` の有無によらず）。従来は既定の 20 件で黙って切られており、「ヒットしなかった＝存在しない」と誤読する余地があった。FTS / LIKE フォールバックそれぞれの通常・`--group-by-session` の全 4 経路で検出する
 - `search` の `--limit` に負値を渡すとエラーになる（従来は無制限として扱われていた）。`--group-by-session` 側は以前からエラー
