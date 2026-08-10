@@ -85,6 +85,53 @@ struct JsonEnvelope {
     truncated: bool,
 }
 
+/// The `message_uuid` of a result row.
+///
+/// Top level for both shapes: `GroupedRow` carries its representative with
+/// `#[serde(flatten)]`, so `--group-by-session` rows put the message's own fields at the
+/// same level as `match_count`.
+///
+/// Deliberately one key lookup rather than a recursive walk. Recursion would also match
+/// `conversation.message_uuid` in embedded objects, which is the trap already documented on
+/// `inject_resume_command`.
+fn row_message_uuid(item: &serde_json::Value) -> Option<String> {
+    item.get("message_uuid")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+/// Attach message bodies to result rows when `--content` was asked for.
+///
+/// One indexed point lookup per row, so it is only paid for on request. The body is
+/// truncated to the same `--content-chars` the human output uses: REFERENCE.md puts the
+/// average user message at 3.5K characters, so an uncapped `--limit 50 --content --json` is
+/// ~175KB flowing into an agent's context through a skill that says "always use --json".
+fn inject_full_content(
+    val: &mut serde_json::Value,
+    search: &ConversationSearch,
+    content_chars: usize,
+) {
+    let serde_json::Value::Array(arr) = val else {
+        return;
+    };
+    for item in arr.iter_mut() {
+        let Some(uuid) = row_message_uuid(item) else {
+            continue;
+        };
+        let Some(body) = search.get_full_message_content(&uuid) else {
+            continue;
+        };
+        let (text, dropped) = truncate_chars(&body, content_chars);
+        if let Some(map) = item.as_object_mut() {
+            map.insert("full_content".to_string(), serde_json::Value::String(text));
+            map.insert(
+                "full_content_truncated".to_string(),
+                serde_json::Value::Bool(dropped),
+            );
+        }
+    }
+}
+
 /// Serialize rows into the envelope, inject `resume_command`, and print.
 ///
 /// `inject_resume_command` runs on the inner array *before* wrapping. It recurses into
@@ -92,9 +139,16 @@ struct JsonEnvelope {
 /// it would silently no-op on an already-wrapped envelope. Teaching it to descend was
 /// rejected: `tree` and `context` embed `conversation` objects that also carry
 /// `session_id`, and those would start sprouting `resume_command` keys as a side effect.
-fn print_json_envelope<T: serde::Serialize>(rows: &T, truncated: bool) -> Result<()> {
+fn print_json_envelope<T: serde::Serialize>(
+    rows: &T,
+    truncated: bool,
+    content: Option<(&ConversationSearch, usize)>,
+) -> Result<()> {
     let mut results = localize_timestamps(serde_json::to_value(rows)?);
     inject_resume_command(&mut results);
+    if let Some((search, content_chars)) = content {
+        inject_full_content(&mut results, search, content_chars);
+    }
     let envelope = JsonEnvelope { results, truncated };
     println!("{}", serde_json::to_string_pretty(&envelope)?);
     Ok(())
@@ -962,7 +1016,11 @@ fn cmd_search(
     let stats = &search_result.stats;
 
     if json_output {
-        print_json_envelope(&results, stats.truncated)?;
+        print_json_envelope(
+            &results,
+            stats.truncated,
+            show_content.then_some((&search, content_chars)),
+        )?;
         // Kept on stderr as well: someone piping into jq still benefits from the line,
         // and dropping it would be a second breaking change for no gain.
         print_truncation_notice(stats.truncated, results.len(), "results");
@@ -1069,7 +1127,11 @@ fn cmd_search_grouped(
     let stats = &result.stats;
 
     if json_output {
-        print_json_envelope(&result.rows, stats.truncated)?;
+        print_json_envelope(
+            &result.rows,
+            stats.truncated,
+            show_content.then_some((&*search, content_chars)),
+        )?;
         print_truncation_notice(stats.truncated, result.rows.len(), "sessions");
         if verbose {
             eprintln!(
@@ -1203,7 +1265,8 @@ fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
     let convs = &result.rows;
 
     if json_output {
-        print_json_envelope(convs, result.truncated)?;
+        // `list` rows are conversations, not messages -- there is no body to attach.
+        print_json_envelope(convs, result.truncated, None)?;
         print_truncation_notice(result.truncated, convs.len(), "conversations");
         return Ok(());
     }
@@ -1346,6 +1409,26 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("conv-search-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join(".last-auto-index")
+    }
+
+    #[test]
+    fn test_row_message_uuid_reads_top_level() {
+        let row = serde_json::json!({"message_uuid": "abc-123"});
+        assert_eq!(row_message_uuid(&row).as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn test_row_message_uuid_reads_flattened_grouped_row() {
+        // GroupedRow flattens its representative, so the uuid sits next to match_count.
+        let row = serde_json::json!({"message_uuid": "abc-123", "match_count": 5});
+        assert_eq!(row_message_uuid(&row).as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn test_row_message_uuid_ignores_unrelated_nesting() {
+        // A recursive walk would find this one; the lookup is deliberately not recursive.
+        let row = serde_json::json!({"conversation": {"message_uuid": "abc-123"}});
+        assert_eq!(row_message_uuid(&row), None);
     }
 
     #[test]

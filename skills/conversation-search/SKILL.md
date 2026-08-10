@@ -237,7 +237,10 @@ ai-conversation-search search "query" --limit 50 --json
 **Other filter options:**
 - `--repo REPO`: Filter by git repository root (partial match). Matches conversations from the same repo including worktrees and subdirectories.
 - `--limit N`: Max results (**default: 20**). Results are capped at this value. When the cap drops matches, a `Note: showing first N results (more matches exist)` line is printed to stderr — do not read a capped list as "nothing else exists". Raise it before concluding a topic is absent.
-- `--content`: Show fuller message content instead of the 200-character snippet. Human output only; ignored with `--json`.
+- `--content`: Show fuller message content instead of the 200-character snippet. Works for
+  human output, `--group-by-session`, and `--json` (which gains `full_content` and
+  `full_content_truncated` per row). Capped at `--content-chars` (default 300) in both
+  modes — raise it deliberately, since 50 uncapped bodies run to ~175KB of context.
 
 ### List (for temporal queries)
 ```bash

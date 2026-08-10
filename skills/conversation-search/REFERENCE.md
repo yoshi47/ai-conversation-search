@@ -50,7 +50,7 @@ ai-conversation-search init --no-extract
 Search conversations using full-text search on smart-extracted content.
 
 ```bash
-ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--source SOURCE] [--limit LIMIT] [--sort SORT] [--content] [--group-by-session] [-v] [--json]
+ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--source SOURCE] [--limit LIMIT] [--sort SORT] [--content] [--content-chars N] [--group-by-session] [-v] [--json]
 ```
 
 **Arguments:**
@@ -67,7 +67,12 @@ ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--un
 - `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
 - `--limit LIMIT`: Max results (default: 20). When the cap drops matches, `Note: showing first N results (more matches exist)` is printed to stderr regardless of `-v`
 - `--sort SORT`: Result order — `relevance` (bm25, default) or `recent` (newest first)
-- `--content`: Show full message content instead of summaries (human output only; ignored with `--json`)
+- `--content`: Show message bodies instead of snippets. Applies to human output,
+  `--group-by-session`, and `--json`; in JSON each row gains `full_content` and
+  `full_content_truncated`
+- `--content-chars`: Max characters of body to show with `--content` (default: 300).
+  Applies to JSON as well as human output — an uncapped body averages 3.5K characters, so
+  `--limit 50 --content` would be ~175KB
 - `--group-by-session`: Group results by session (show the top-ranked match per session with match count)
 - `-v, --verbose`: Show search diagnostics (sessions scanned, messages matched, unindexed warnings)
 - `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions).
