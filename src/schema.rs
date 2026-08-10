@@ -1,6 +1,6 @@
 use rusqlite::{Connection, OptionalExtension};
 
-use crate::error::Result;
+use crate::error::{AppError, Result};
 
 const SCHEMA_SQL: &str = include_str!("../data/schema.sql");
 
@@ -188,7 +188,8 @@ fn bootstrap_existing_db(conn: &Connection) -> Result<()> {
     for (version, _description, kind) in MIGRATIONS {
         let applied = match kind {
             MigrationKind::Sql(sql) => detect_sql_migration_applied(conn, sql),
-            MigrationKind::Custom => detect_custom_migration_applied(conn, *version),
+            MigrationKind::Custom => detect_custom_migration_applied(conn, *version)
+                .map_err(|e| migration_probe_error(conn, *version, &e))?,
         };
 
         if applied {
@@ -197,6 +198,22 @@ fn bootstrap_existing_db(conn: &Connection) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Turn a failed migration probe into something the reader can act on.
+///
+/// Without this the user gets a bare rusqlite message from a code path they have no way to
+/// connect to their database, on a command (`search`, `list`) they did not know touched the
+/// schema at all.
+fn migration_probe_error(conn: &Connection, version: i64, source: &AppError) -> AppError {
+    let path = conn.path().unwrap_or("<in-memory>");
+    AppError::General(format!(
+        "could not determine whether schema migration {} was applied to {}: {}. \
+         Refusing to continue: assuming \"already applied\" would skip the migration \
+         permanently. If the database is damaged, back it up and rebuild the index with \
+         'ai-conversation-search init --force'.",
+        version, path, source
+    ))
 }
 
 /// Detect if a SQL migration has already been applied by examining its effects.
@@ -220,36 +237,37 @@ fn detect_sql_migration_applied(conn: &Connection, sql: &str) -> bool {
     false
 }
 
-fn detect_custom_migration_applied(conn: &Connection, version: i64) -> bool {
-    match version {
-        8 => {
-            // FTS trigram migration: check if FTS table uses trigram
-            let fts_sql: Option<String> = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='message_content_fts'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            fts_sql.is_none_or(|s| s.contains("trigram"))
-        }
-        9 => {
-            // The fixed trigger issues a 'delete' command; the broken one issued a
-            // DELETE statement. Absent trigger means a fresh DB, where schema.sql
-            // already creates the correct form.
-            let trigger_sql: Option<String> = conn
-                .query_row(
-                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='messages_ad'",
-                    [],
-                    |row| row.get(0),
-                )
-                .optional()
-                .unwrap_or(None);
-            trigger_sql.is_none_or(|s| s.contains("'delete'"))
-        }
+/// Detect whether a custom migration's effect is already present.
+///
+/// Errors are propagated rather than read as "already applied". `true` here makes
+/// `bootstrap_existing_db` record the version, after which `is_migration_applied` skips the
+/// body forever -- so a transient SQLITE_BUSY or a corrupt page would permanently convince
+/// the database it had been migrated. Note the asymmetry with `detect_sql_migration_applied`,
+/// which defaults to `false` on a failed probe: there, a wrong answer just re-runs a
+/// migration that then fails loudly. Only this side fails in the unsafe direction.
+fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bool> {
+    // (object type, object name, marker found only in the post-migration form)
+    let (obj_type, obj_name, marker) = match version {
+        8 => ("table", "message_content_fts", "trigram"),
+        // The fixed trigger issues a 'delete' command; the broken one issued a
+        // DELETE statement.
+        9 => ("trigger", "messages_ad", "'delete'"),
         v => unreachable!("unhandled custom migration version: {}", v),
-    }
+    };
+
+    let sql: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
+            rusqlite::params![obj_type, obj_name],
+            // sqlite_master.sql is NULL for auto-created objects, which is legal and must
+            // not become a hard error via InvalidColumnType.
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+
+    // Absent means a fresh DB, where schema.sql already creates the correct form.
+    Ok(sql.is_none_or(|s| s.contains(marker)))
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -563,6 +581,47 @@ mod tests {
         conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
             .unwrap();
         assert_eq!(orphan_fts_rows(&conn, "zeb"), 0);
+    }
+
+    /// On a fresh database schema.sql already produces the post-migration form, so the
+    /// detectors must report "applied" and let bootstrap record the versions without
+    /// running the bodies.
+    #[test]
+    fn test_detect_custom_migration_fresh_db_reports_applied() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+
+        assert!(detect_custom_migration_applied(&conn, 8).unwrap());
+        assert!(detect_custom_migration_applied(&conn, 9).unwrap());
+    }
+
+    /// The detector has to recognise the pre-0.15.0 trigger as *not* migrated; if it
+    /// reported "applied", bootstrap would record version 9 and the repair would never run.
+    #[test]
+    fn test_detect_custom_migration_legacy_trigger_reports_unapplied() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS messages_ad;
+             CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                 DELETE FROM message_content_fts WHERE rowid = old.rowid;
+             END;",
+        )
+        .unwrap();
+
+        assert!(!detect_custom_migration_applied(&conn, 9).unwrap());
+    }
+
+    /// An absent object means a brand-new database, not a failed probe.
+    #[test]
+    fn test_detect_custom_migration_absent_object_reports_applied() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        conn.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")
+            .unwrap();
+
+        assert!(detect_custom_migration_applied(&conn, 9).unwrap());
     }
 
     #[test]
