@@ -61,12 +61,20 @@ CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     VALUES (new.rowid, new.message_uuid, new.full_content);
 END;
 
+-- Removal uses the 'delete' command rather than `DELETE FROM ... WHERE rowid = ?`.
+-- This is an external-content table (content='messages'), so a plain DELETE re-reads
+-- the content row to find the terms to unindex -- and by AFTER DELETE that row is
+-- already gone, leaving the index entry behind with no error raised.
+-- On UPDATE the failure differs: the content row still exists but already holds the NEW
+-- values, so a plain DELETE unindexes those and the old terms stay searchable forever.
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-    DELETE FROM message_content_fts WHERE rowid = old.rowid;
+    INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
+    VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-    DELETE FROM message_content_fts WHERE rowid = old.rowid;
+    INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
+    VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
     INSERT INTO message_content_fts(rowid, message_uuid, full_content)
     VALUES (new.rowid, new.message_uuid, new.full_content);
 END;

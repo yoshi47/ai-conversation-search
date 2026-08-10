@@ -193,7 +193,19 @@ ai-conversation-search list --since 2025-11-10 --until today [--json]
 View conversation tree structure
 ```bash
 ai-conversation-search tree SESSION_ID [--json]
+
+# A unique prefix works too
+ai-conversation-search tree 1c538017
 ```
+An ambiguous prefix is reported as an error rather than resolved to one of the matches.
+
+### `ai-conversation-search prune-observer`
+Remove claude-mem observer sessions indexed by earlier versions
+```bash
+ai-conversation-search prune-observer [--dry-run]
+```
+New observer sessions are skipped at index time, so this only needs running once.
+Irreversible and can take several minutes — back up `~/.conversation-search/index.db` first.
 
 ### `ai-conversation-search pick` *(wrapper only)*
 Interactive session picker using fzf with live full-text search

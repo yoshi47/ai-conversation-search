@@ -150,6 +150,27 @@ pub fn is_summarizer_conversation(messages: &[crate::indexer::Message]) -> bool 
     indicators.iter().any(|ind| content.contains(ind))
 }
 
+/// Marker claude-mem wraps around every event it mirrors from a primary session.
+const OBSERVER_MARKER: &str = "<observed_from_primary_session>";
+
+/// Detect a claude-mem observer session.
+///
+/// These transcripts mirror another session's tool calls as XML and add claude-mem's own
+/// generated observations; neither is primary material. The user turns duplicate the
+/// primary session, and the assistant turns are stored canonically in claude-mem's own
+/// database, so indexing them yields duplicate hits rather than new information.
+///
+/// Only the first user message is inspected. Matching anywhere in the transcript would
+/// also catch sessions that merely quote the marker while discussing it.
+pub fn is_observer_conversation(messages: &[crate::indexer::Message]) -> bool {
+    let first_user = match messages.iter().find(|m| m.message_type == "user") {
+        Some(m) => m,
+        None => return false,
+    };
+
+    first_user.content.contains(OBSERVER_MARKER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,5 +398,44 @@ mod tests {
             padding
         );
         assert!(!message_uses_conversation_search(&content, "assistant"));
+    }
+
+    // --- is_observer_conversation tests ---
+
+    #[test]
+    fn test_is_observer_conversation_detects_marker() {
+        let messages = vec![
+            make_message(
+                "user",
+                "<observed_from_primary_session>   <what_happened>Read</what_happened> </observed_from_primary_session>",
+            ),
+            make_message("assistant", "<observation><type>discovery</type></observation>"),
+        ];
+        assert!(is_observer_conversation(&messages));
+    }
+
+    /// A session that discusses the observer format must stay searchable.
+    #[test]
+    fn test_is_observer_conversation_ignores_quoted_marker() {
+        let messages = vec![
+            make_message("user", "why is tree empty?"),
+            make_message("assistant", "because observer sessions emit"),
+            make_message(
+                "user",
+                "here is a sample: <observed_from_primary_session>...</observed_from_primary_session>",
+            ),
+        ];
+        assert!(!is_observer_conversation(&messages));
+    }
+
+    #[test]
+    fn test_is_observer_conversation_empty_messages() {
+        assert!(!is_observer_conversation(&[]));
+    }
+
+    #[test]
+    fn test_is_observer_conversation_no_user_message() {
+        let messages = vec![make_message("assistant", "<observed_from_primary_session>")];
+        assert!(!is_observer_conversation(&messages));
     }
 }

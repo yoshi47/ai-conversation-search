@@ -466,9 +466,11 @@ impl CodexIndexer {
             ],
         )?;
 
+        // Truncate by chars, not bytes: titles are arbitrary user text, and a byte slice
+        // panics whenever offset 60 lands inside a multi-byte character.
         self.log(&format!(
             "  Indexed session: {} ({} messages)",
-            &title[..std::cmp::min(title.len(), 60)],
+            title.chars().take(60).collect::<String>(),
             msg_count
         ));
         Ok(msg_count)
@@ -542,6 +544,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first_content, "Hello world");
+    }
+
+    /// The progress line truncates the session title by character count. `quiet` is
+    /// turned off deliberately: that log is the only caller that truncates, so the panic
+    /// is unreachable while quiet.
+    #[test]
+    fn test_non_ascii_title_does_not_panic_when_logging() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+
+        // Leading ASCII shifts the 3-byte characters off a multiple of 3, so byte offset
+        // 60 lands inside a character rather than neatly between two.
+        let title = "DB: データベースのマイグレーションが失敗する原因を調べたい？続きを教えて";
+        assert!(!title.is_char_boundary(60), "fixture no longer straddles");
+        let session_file = write_session_file(
+            dir.path(),
+            "japanese-title.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"99999999-8888-7777-6666-555555555555","cwd":"/tmp","timestamp":"2025-01-15T10:00:00Z"}}"#,
+                &format!(
+                    r#"{{"type":"event_msg","payload":{{"type":"user_message","message":"{}"}},"timestamp":"2025-01-15T10:00:01Z"}}"#,
+                    title
+                ),
+            ],
+        );
+
+        let mut indexer = create_indexer(dir.path());
+        indexer.quiet = false;
+
+        let count = indexer.index_session_file(&conn, &session_file).unwrap();
+        assert_eq!(count, 1);
     }
 
     #[test]

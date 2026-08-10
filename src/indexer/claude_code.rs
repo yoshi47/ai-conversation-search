@@ -6,10 +6,75 @@ use serde::Deserialize;
 
 use crate::error::Result;
 use crate::git_utils::resolve_repo_root;
-use crate::schema::init_schema;
+use crate::schema::{init_schema, FTS_SYNC_TRIGGERS};
 use crate::summarization;
 
 use super::{ConversationMeta, Message};
+
+/// Encoded tail of `<home>/.claude-mem/observer-sessions`, the cwd claude-mem's observer
+/// runs from. Claude Code builds project directory names by replacing `/` and `.` with
+/// `-`, so only the tail is stable across machines and profiles.
+///
+/// The encoding is lossy -- a real project at `~/claude-mem/observer-sessions` collapses
+/// to the same name and would be skipped by this check alone. The per-transcript marker
+/// check in `do_index_conversation` is what stops that from being permanent.
+const OBSERVER_PROJECT_DIR_SUFFIX: &str = "-claude-mem-observer-sessions";
+
+/// Whether claude-mem observer transcripts should be indexed anyway.
+///
+/// Escape hatch for restoring transcripts that were skipped; see `index --force`, which
+/// is also needed because skipped files record their mtime and would otherwise be
+/// considered up to date.
+fn observer_indexing_enabled() -> bool {
+    std::env::var("CONVERSATION_SEARCH_INDEX_OBSERVER")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+fn is_observer_project_dir_name(dir_name: &str) -> bool {
+    dir_name.ends_with(OBSERVER_PROJECT_DIR_SUFFIX)
+}
+
+/// Sessions already in the index whose earliest user message carries the observer marker.
+///
+/// The stored-row counterpart of `summarization::is_observer_conversation`. The two agree
+/// on "first user message only" but not on how "first" is decided: this orders by
+/// timestamp, the Rust check takes transcript order. `message_uuid` breaks timestamp ties
+/// so at least the choice is stable rather than left to the query planner.
+///
+/// Restricted to `claude_code` because observer transcripts are a claude-mem artifact and
+/// this SQL drives an irreversible delete; OpenCode and Codex sessions have no business
+/// being in range.
+///
+/// The marker is matched anywhere in that message rather than anchored: real observer
+/// transcripts open with a preamble, and anchoring drops the match rate to zero
+/// (measured against a full index: 21,888 sessions matched, 0 anchored).
+const OBSERVER_SESSION_SELECT_SQL: &str = "
+    SELECT session_id FROM (
+        SELECT m.session_id, m.full_content,
+               ROW_NUMBER() OVER (
+                   PARTITION BY m.session_id ORDER BY m.timestamp ASC, m.message_uuid ASC
+               ) AS rn
+        FROM messages m
+        JOIN conversations c ON c.session_id = m.session_id
+        WHERE m.message_type = 'user'
+          AND COALESCE(c.source, 'claude_code') = 'claude_code'
+    ) WHERE rn = 1 AND full_content LIKE '%<observed_from_primary_session>%'";
+
+/// Mark a transcript as processed at `mtime` so later runs can skip re-parsing it.
+///
+/// Takes a `&Connection` so it serves both the in-transaction call sites (a
+/// `Transaction` derefs to one) and the pre-transaction skip paths. A missing mtime is
+/// not an error: the file is simply re-examined next run.
+fn record_sync_state(conn: &Connection, file_path: &Path, mtime: Option<f64>) -> Result<()> {
+    if let Some(mtime) = mtime {
+        conn.execute(
+            "INSERT OR REPLACE INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
+            rusqlite::params![file_path.to_string_lossy().as_ref(), mtime],
+        )?;
+    }
+    Ok(())
+}
 
 /// JSONL message entry.
 #[derive(Debug, Deserialize)]
@@ -116,6 +181,8 @@ pub fn count_conversation_files_on_disk() -> usize {
 pub struct ConversationIndexer {
     conn: Connection,
     quiet: bool,
+    force: bool,
+    index_observer: bool,
     summarizer_project_hash: Option<String>,
     sessions_index_cache: HashMap<PathBuf, Option<Vec<SessionsIndexEntry>>>,
 }
@@ -128,9 +195,26 @@ impl ConversationIndexer {
         Ok(Self {
             conn,
             quiet,
+            force: false,
+            index_observer: observer_indexing_enabled(),
             summarizer_project_hash: None,
             sessions_index_cache: HashMap::new(),
         })
+    }
+
+    /// Override the env-derived observer setting. Exists so tests can exercise both
+    /// modes without mutating process environment.
+    #[cfg(test)]
+    fn set_index_observer(&mut self, enabled: bool) {
+        self.index_observer = enabled;
+    }
+
+    /// Re-read transcripts even when `claude_code_sync_state` says they are unchanged.
+    ///
+    /// `--all` only widens the date window, so it cannot bring back files that were
+    /// skipped and stamped -- notably observer transcripts, whose recovery needs this.
+    pub fn set_force(&mut self, force: bool) {
+        self.force = force;
     }
 
     fn log(&self, msg: &str) {
@@ -474,6 +558,22 @@ impl ConversationIndexer {
                         .file_name()
                         .is_some_and(|name| name.to_string_lossy() == *hash)
                 }) {
+                    continue;
+                }
+
+                // Skip claude-mem's observer project wholesale. The per-conversation
+                // check in do_index_conversation catches these too, but only after
+                // parsing the file -- and this directory holds tens of thousands of
+                // multi-KB transcripts, so recognising it by name avoids that cost.
+                if !self.index_observer
+                    && project_dir
+                        .file_name()
+                        .is_some_and(|name| is_observer_project_dir_name(&name.to_string_lossy()))
+                {
+                    self.log(&format!(
+                        "Skipping claude-mem observer project directory: {}",
+                        project_dir.display()
+                    ));
                     continue;
                 }
 
@@ -923,7 +1023,7 @@ impl ConversationIndexer {
             }
         };
 
-        if let Some(mtime) = file_mtime {
+        if let Some(mtime) = file_mtime.filter(|_| !self.force) {
             if let Ok(existing_mtime) = self.conn.query_row(
                 "SELECT mtime FROM claude_code_sync_state WHERE file_path = ?",
                 [file_path.to_string_lossy().as_ref()],
@@ -960,6 +1060,17 @@ impl ConversationIndexer {
         // Skip summarizer conversations
         if summarization::is_summarizer_conversation(&messages) {
             self.log("  Skipping automated summarizer conversation");
+            return Ok(());
+        }
+
+        // Backstop for observer transcripts that the directory-name check in
+        // scan_conversations missed -- claude-mem changing its layout, or a path reaching
+        // us through CONVERSATION_SEARCH_EXTRA_DIRS.
+        if !self.index_observer && summarization::is_observer_conversation(&messages) {
+            self.log("  Skipping claude-mem observer conversation");
+            // Recorded even though nothing is indexed: claude-mem keeps producing these,
+            // and without a sync_state row every run would re-parse each one in full.
+            record_sync_state(&self.conn, file_path, file_mtime)?;
             return Ok(());
         }
 
@@ -1104,12 +1215,7 @@ impl ConversationIndexer {
             if new_messages.is_empty() {
                 self.log("  No new messages, skipping");
                 // Still record sync_state so we don't re-parse unchanged file.
-                if let Some(mtime) = file_mtime {
-                    tx.execute(
-                        "INSERT OR REPLACE INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
-                        rusqlite::params![file_path.to_string_lossy().as_ref(), mtime],
-                    )?;
-                }
+                record_sync_state(&tx, file_path, file_mtime)?;
                 tx.commit()?;
                 return Ok(());
             }
@@ -1228,12 +1334,7 @@ impl ConversationIndexer {
 
         // Record sync_state inside the same tx so it never gets ahead of the
         // actual data on disk.
-        if let Some(mtime) = file_mtime {
-            tx.execute(
-                "INSERT OR REPLACE INTO claude_code_sync_state (file_path, mtime) VALUES (?, ?)",
-                rusqlite::params![file_path.to_string_lossy().as_ref(), mtime],
-            )?;
-        }
+        record_sync_state(&tx, file_path, file_mtime)?;
 
         tx.commit()?;
 
@@ -1257,6 +1358,101 @@ impl ConversationIndexer {
         }
 
         Ok(())
+    }
+
+    /// Count the claude-mem observer sessions currently held in the index.
+    pub fn count_observer_sessions(&self) -> Result<i64> {
+        let count = self.conn.query_row(
+            &format!("SELECT COUNT(*) FROM ({})", OBSERVER_SESSION_SELECT_SQL),
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    /// A sample of the sessions `prune_observer_sessions` would delete.
+    ///
+    /// Returns `(session_id, project_path, first_message_at)`. Exists so `--dry-run` can
+    /// show what is in range rather than only how many rows there are -- the detection is
+    /// a substring match driving an irreversible delete, so the caller needs to be able to
+    /// spot a session that only looks like an observer transcript.
+    pub fn sample_observer_sessions(&self, limit: i64) -> Result<Vec<(String, String, String)>> {
+        let sql = format!(
+            "SELECT c.session_id,
+                    COALESCE(c.project_path, ''),
+                    COALESCE(c.first_message_at, '')
+             FROM conversations c
+             WHERE c.session_id IN ({})
+             ORDER BY c.first_message_at DESC
+             LIMIT ?",
+            OBSERVER_SESSION_SELECT_SQL
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Rebuild the full-text index from `messages`.
+    ///
+    /// Non-destructive, and the only way to clear entries stranded by the pre-0.15.0
+    /// delete trigger. Those entries are worse than dead weight: `messages.rowid` is
+    /// implicit and gets reused, so a stranded posting eventually points at an unrelated
+    /// message and search returns it as a match with no error anywhere.
+    pub fn rebuild_fts(&mut self) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO message_content_fts(message_content_fts) VALUES('rebuild')",
+            [],
+        )?;
+        Ok(())
+    }
+
+    /// Delete every indexed claude-mem observer session and rebuild the full-text index.
+    ///
+    /// Sessions are identified once, up front, and both tables are then deleted by that
+    /// id set. Deriving the conversations half from "rows with no messages" instead would
+    /// also destroy legitimately message-less conversations, which the raw-transcript
+    /// fallback in search depends on. Leaving conversations rows behind is equally wrong:
+    /// `repair_orphan_conversations` would keep trying to resurrect them on every index.
+    ///
+    /// Returns the number of sessions removed.
+    pub fn prune_observer_sessions(&mut self) -> Result<i64> {
+        let tx = self.conn.unchecked_transaction()?;
+
+        tx.execute_batch(&format!(
+            "CREATE TEMP TABLE observer_sessions AS {};",
+            OBSERVER_SESSION_SELECT_SQL
+        ))?;
+
+        let removed: i64 = tx.query_row("SELECT COUNT(*) FROM observer_sessions", [], |row| {
+            row.get(0)
+        })?;
+
+        // Dropped for the duration of the delete: the trigger would fire once per row to
+        // unindex content that the rebuild below regenerates wholesale. On a database
+        // still carrying duplicated postings from the old trigger, feeding those rows
+        // back through 'delete' is also not well-defined.
+        tx.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
+
+        tx.execute(
+            "DELETE FROM conversations WHERE session_id IN (SELECT session_id FROM observer_sessions)",
+            [],
+        )?;
+        tx.execute(
+            "DELETE FROM messages WHERE session_id IN (SELECT session_id FROM observer_sessions)",
+            [],
+        )?;
+        tx.execute_batch("DROP TABLE observer_sessions;")?;
+        tx.execute_batch(FTS_SYNC_TRIGGERS)?;
+
+        tx.execute(
+            "INSERT INTO message_content_fts(message_content_fts) VALUES('rebuild')",
+            [],
+        )?;
+
+        tx.commit()?;
+        Ok(removed)
     }
 
     /// Repair conversations rows whose message rows are missing.
@@ -2203,5 +2399,318 @@ mod tests {
 
         // Calling repair again is a no-op.
         assert_eq!(indexer.repair_orphan_conversations().unwrap(), 0);
+    }
+
+    // ---- claude-mem observer skip tests ----
+
+    const OBSERVER_JSONL: &[&str] = &[
+        r#"{"uuid":"o1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"obs1","message":{"role":"user","content":"<observed_from_primary_session>   <what_happened>Read</what_happened> </observed_from_primary_session>"}}"#,
+        r#"{"uuid":"o2","parentUuid":"o1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"obs1","message":{"role":"assistant","content":"<observation><type>discovery</type></observation>"}}"#,
+    ];
+
+    fn count_messages(indexer: &ConversationIndexer) -> i64 {
+        indexer
+            .connection()
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn test_indexer_skips_observer_conversation() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(dir.path(), "observer", OBSERVER_JSONL);
+
+        indexer.index_conversation(&file).unwrap();
+
+        assert_eq!(count_messages(&indexer), 0);
+    }
+
+    #[test]
+    fn test_indexer_records_sync_state_for_skipped_observer() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(dir.path(), "observer", OBSERVER_JSONL);
+
+        indexer.index_conversation(&file).unwrap();
+
+        // Without this row every run would re-parse the transcript in full.
+        let stamped: i64 = indexer
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_sync_state WHERE file_path = ?",
+                [file.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1);
+    }
+
+    #[test]
+    fn test_indexer_indexes_observer_when_env_set() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(dir.path(), "observer", OBSERVER_JSONL);
+
+        indexer.set_index_observer(true);
+        indexer.index_conversation(&file).unwrap();
+
+        assert_eq!(count_messages(&indexer), 2);
+    }
+
+    /// Path-based and marker-based detection must agree, since the scan-time check
+    /// (directory name) and the parse-time check (first user message) are independent.
+    #[test]
+    fn test_observer_project_dir_name_matches_encoded_paths() {
+        assert!(is_observer_project_dir_name(
+            "-Users-yoshiki-kadono--claude-mem-observer-sessions"
+        ));
+        assert!(is_observer_project_dir_name(
+            "-mnt-host-users--claude-mem-observer-sessions"
+        ));
+        assert!(!is_observer_project_dir_name("-Users-someone-myproject"));
+        // A project literally named "...observer-sessions" without the claude-mem
+        // segment must stay indexed.
+        assert!(!is_observer_project_dir_name(
+            "-Users-someone-observer-sessions"
+        ));
+    }
+
+    // ---- prune_observer_sessions tests ----
+
+    /// Counts index entries whose content row is gone. Reading `message_content_fts`
+    /// columns directly cannot see these -- it resolves through the content table and
+    /// errors on the missing row.
+    fn orphan_fts_rows(conn: &Connection, needle: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT rowid FROM message_content_fts WHERE message_content_fts MATCH ?) f
+             LEFT JOIN messages m ON m.rowid = f.rowid WHERE m.rowid IS NULL",
+            [needle],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn seed_observer_and_normal_rows(indexer: &ConversationIndexer) {
+        let conn = indexer.connection();
+        for (session, content) in [
+            (
+                "obs1",
+                "<observed_from_primary_session>Read</observed_from_primary_session>",
+            ),
+            ("normal1", "how do I fix the deploy"),
+        ] {
+            conn.execute(
+                "INSERT INTO conversations (session_id, project_path, message_count, first_message_at, last_message_at, source) VALUES (?, '/proj', 1, '2025-01-15T09:00:00', '2025-01-15T10:00:00', 'claude_code')",
+                rusqlite::params![session],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content) VALUES (?, ?, 0, '2025-01-15T10:00:00', 'user', '/proj', ?)",
+                rusqlite::params![format!("msg-{}", session), session, content],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn test_prune_observer_removes_both_tables() {
+        let (_dir, mut indexer) = create_test_indexer();
+        seed_observer_and_normal_rows(&indexer);
+
+        assert_eq!(indexer.count_observer_sessions().unwrap(), 1);
+        assert_eq!(indexer.prune_observer_sessions().unwrap(), 1);
+
+        let conn = indexer.connection();
+        let remaining_conv: Vec<String> = conn
+            .prepare("SELECT session_id FROM conversations ORDER BY session_id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(remaining_conv, vec!["normal1".to_string()]);
+
+        let remaining_msgs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining_msgs, 1);
+
+        // The observer terms must be gone from the FTS index, not merely from `messages`.
+        let orphans: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM (SELECT rowid FROM message_content_fts WHERE message_content_fts MATCH 'obs') f
+                 LEFT JOIN messages m ON m.rowid = f.rowid WHERE m.rowid IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphans, 0);
+    }
+
+    /// A conversation with no messages is a supported state that the raw-transcript
+    /// fallback relies on, so pruning must not treat it as garbage.
+    #[test]
+    fn test_prune_observer_preserves_message_less_conversation() {
+        let (_dir, mut indexer) = create_test_indexer();
+        seed_observer_and_normal_rows(&indexer);
+        indexer
+            .connection()
+            .execute(
+                "INSERT INTO conversations (session_id, project_path, message_count, first_message_at, last_message_at, source) VALUES ('empty1', '/proj', 0, '2025-01-15T09:00:00', '2025-01-15T10:00:00', 'claude_code')",
+                [],
+            )
+            .unwrap();
+
+        indexer.prune_observer_sessions().unwrap();
+
+        let survived: i64 = indexer
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = 'empty1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(survived, 1);
+    }
+
+    /// The marker has to be in the *first* user message. A session that quotes it later --
+    /// such as one discussing this very feature -- is a normal conversation, and deleting
+    /// it is irreversible.
+    #[test]
+    fn test_prune_observer_ignores_marker_after_first_message() {
+        let (_dir, mut indexer) = create_test_indexer();
+        let conn = indexer.connection();
+        conn.execute(
+            "INSERT INTO conversations (session_id, project_path, message_count, first_message_at, last_message_at, source) VALUES ('discuss1', '/proj', 2, '2025-01-15T09:00:00', '2025-01-15T10:00:00', 'claude_code')",
+            [],
+        )
+        .unwrap();
+        for (uuid, ts, content) in [
+            ("d1", "2025-01-15T10:00:00", "why is tree empty?"),
+            (
+                "d2",
+                "2025-01-15T10:05:00",
+                "here is a sample: <observed_from_primary_session>Read</observed_from_primary_session>",
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content) VALUES (?, 'discuss1', 0, ?, 'user', '/proj', ?)",
+                rusqlite::params![uuid, ts, content],
+            )
+            .unwrap();
+        }
+
+        assert_eq!(indexer.count_observer_sessions().unwrap(), 0);
+        assert_eq!(indexer.prune_observer_sessions().unwrap(), 0);
+
+        let survived: i64 = indexer
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = 'discuss1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(survived, 1);
+    }
+
+    /// Pruning also has to clear index entries stranded by the pre-0.15.0 trigger. Those
+    /// survive the delete itself, so only the rebuild removes them.
+    #[test]
+    fn test_prune_observer_clears_previously_stranded_fts_rows() {
+        let (_dir, mut indexer) = create_test_indexer();
+        seed_observer_and_normal_rows(&indexer);
+
+        {
+            let conn = indexer.connection();
+            // Reinstate the broken trigger and strand an entry through it.
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS messages_ad;
+                 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                     DELETE FROM message_content_fts WHERE rowid = old.rowid;
+                 END;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content) VALUES ('stranded', 'normal1', 0, '2025-01-15T10:01:00', 'user', '/proj', 'zebra crossing')",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM messages WHERE message_uuid = 'stranded'", [])
+                .unwrap();
+            assert_eq!(
+                orphan_fts_rows(conn, "zeb"),
+                1,
+                "fixture must actually strand an entry"
+            );
+        }
+
+        indexer.prune_observer_sessions().unwrap();
+
+        assert_eq!(orphan_fts_rows(indexer.connection(), "zeb"), 0);
+    }
+
+    /// The rebuild must be reachable on a database that never held observer sessions --
+    /// stranded entries are a consequence of the old trigger, not of claude-mem.
+    #[test]
+    fn test_rebuild_fts_clears_stranded_rows_without_observers() {
+        let (_dir, mut indexer) = create_test_indexer();
+
+        {
+            let conn = indexer.connection();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS messages_ad;
+                 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                     DELETE FROM message_content_fts WHERE rowid = old.rowid;
+                 END;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content) VALUES ('m1', 'sess1', 0, '2025-01-15T10:00:00', 'user', '/proj', 'zebra crossing')",
+                [],
+            )
+            .unwrap();
+            conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
+                .unwrap();
+            assert_eq!(orphan_fts_rows(conn, "zeb"), 1);
+        }
+
+        assert_eq!(indexer.count_observer_sessions().unwrap(), 0);
+        indexer.rebuild_fts().unwrap();
+
+        assert_eq!(orphan_fts_rows(indexer.connection(), "zeb"), 0);
+    }
+
+    #[test]
+    fn test_prune_observer_is_noop_on_clean_index() {
+        let (_dir, mut indexer) = create_test_indexer();
+
+        assert_eq!(indexer.count_observer_sessions().unwrap(), 0);
+        assert_eq!(indexer.prune_observer_sessions().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_force_reindexes_unchanged_file() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "session1",
+            &[
+                r#"{"uuid":"f1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sessF","message":{"role":"user","content":"hello there"}}"#,
+            ],
+        );
+        indexer.index_conversation(&file).unwrap();
+
+        // Wipe the rows but keep sync_state: without --force the mtime check short
+        // circuits and nothing is restored.
+        indexer
+            .connection()
+            .execute("DELETE FROM messages", [])
+            .unwrap();
+        indexer.index_conversation(&file).unwrap();
+        assert_eq!(count_messages(&indexer), 0);
+
+        indexer.set_force(true);
+        indexer.index_conversation(&file).unwrap();
+        assert_eq!(count_messages(&indexer), 1);
     }
 }

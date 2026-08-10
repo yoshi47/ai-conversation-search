@@ -108,9 +108,18 @@ pub enum Commands {
         /// Index all conversations
         #[arg(long)]
         all: bool,
+        /// Re-read Claude Code transcripts even if unchanged since the last index
+        #[arg(long)]
+        force: bool,
         /// Minimal output
         #[arg(long)]
         quiet: bool,
+    },
+    /// Remove already-indexed claude-mem observer sessions
+    PruneObserver {
+        /// Report what would be removed without changing the database
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Show index status and health
     Status {
@@ -329,7 +338,13 @@ pub fn run(cli: Cli) -> Result<()> {
             std::process::exit(1);
         }
         Some(Commands::Init { days, force, quiet }) => cmd_init(days, force, quiet),
-        Some(Commands::Index { days, all, quiet }) => cmd_index(days, all, quiet),
+        Some(Commands::Index {
+            days,
+            all,
+            force,
+            quiet,
+        }) => cmd_index(days, all, force, quiet),
+        Some(Commands::PruneObserver { dry_run }) => cmd_prune_observer(dry_run),
         Some(Commands::Status { json }) => cmd_status(json),
         Some(Commands::Search {
             query,
@@ -485,8 +500,9 @@ fn cmd_init(days: i64, force: bool, quiet: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
+fn cmd_index(days: i64, all: bool, force: bool, quiet: bool) -> Result<()> {
     let mut indexer = ConversationIndexer::new(db::DEFAULT_DB_PATH, quiet)?;
+    indexer.set_force(force);
 
     // Self-heal any conversations rows left orphaned by the pre-0.12.1 bug
     // (message_count > 0 but no messages in DB). Cheap LEFT JOIN; in steady
@@ -549,6 +565,65 @@ fn cmd_index(days: i64, all: bool, quiet: bool) -> Result<()> {
         touch_stamp_at(&db::expand_path(FULL_STAMP_FILE_PATH));
     }
 
+    Ok(())
+}
+
+/// Remove claude-mem observer sessions that earlier versions indexed.
+///
+/// Deliberately a command rather than a schema migration: migrations run inside the
+/// detached indexer that `search` spawns, so a destructive one would fire silently on the
+/// first search after upgrading, before anyone could take a backup.
+fn cmd_prune_observer(dry_run: bool) -> Result<()> {
+    let mut indexer = ConversationIndexer::new(db::DEFAULT_DB_PATH, false)?;
+    let count = indexer.count_observer_sessions()?;
+
+    if dry_run {
+        eprintln!(
+            "Would remove {} claude-mem observer session(s) and rebuild the full-text index.",
+            count
+        );
+        for (session_id, project_path, first_message_at) in indexer.sample_observer_sessions(20)? {
+            eprintln!("  {}  {}  {}", first_message_at, session_id, project_path);
+        }
+        eprintln!("Re-run without --dry-run to apply.");
+        return Ok(());
+    }
+
+    if count == 0 {
+        eprintln!("No claude-mem observer sessions in the index.");
+        // Still rebuild. Databases created before 0.15.0 carry index entries stranded by
+        // the old delete trigger whether or not claude-mem was ever used, and this is the
+        // only command that clears them.
+        eprintln!("Rebuilding the full-text index to clear entries stranded by the pre-0.15.0 delete trigger.");
+        indexer.rebuild_fts()?;
+        eprintln!("\u{2713} Full-text index rebuilt.");
+        return Ok(());
+    }
+
+    eprintln!(
+        "Removing {} claude-mem observer session(s) and rebuilding the full-text index.",
+        count
+    );
+    eprintln!("This runs once and can take several minutes on a large index.");
+    eprintln!("Back up ~/.conversation-search/index.db first — this cannot be undone.");
+    eprintln!(
+        "The observations themselves stay in claude-mem's own database; only this index changes."
+    );
+
+    let removed = match indexer.prune_observer_sessions() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("Prune failed: {}", e);
+            eprintln!("Nothing was removed — the whole operation runs in one transaction and rolled back.");
+            eprintln!("If another ai-conversation-search process is indexing, wait for it to finish and re-run.");
+            return Err(e);
+        }
+    };
+
+    eprintln!("\u{2713} Removed {} observer session(s).", removed);
+    // The file does not shrink -- freed pages are reused instead. Saying so up front
+    // avoids a "nothing happened" reading of an unchanged file size.
+    eprintln!("Database file size is unchanged; the freed space is reused by future indexing.");
     Ok(())
 }
 
@@ -620,6 +695,22 @@ fn cmd_status(json_output: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Warn on stderr when `--limit` dropped matches.
+///
+/// Unconditional, not gated on --verbose: a caller who never sees this line reads a
+/// capped list as the complete answer, which is how "not found" gets confused with
+/// "not looked for". stderr keeps stdout's JSON contract intact.
+fn print_truncation_notice(truncated: bool, shown: usize, unit: &str) {
+    if truncated {
+        // "may exist": the FTS path reports truncation when candidates were left
+        // unscanned, and those can still all fail the filters.
+        eprintln!(
+            "Note: showing first {} {} (more matches may exist). Raise with --limit.",
+            shown, unit
+        );
+    }
 }
 
 fn print_unindexed_warning(search: &ConversationSearch) {
@@ -707,6 +798,7 @@ fn cmd_search(
         let mut localized = localize_timestamps(json_results);
         inject_resume_command(&mut localized);
         println!("{}", serde_json::to_string_pretty(&localized)?);
+        print_truncation_notice(stats.truncated, results.len(), "results");
         if verbose {
             eprintln!(
                 "Scanned {} sessions ({} messages), {} matched",
@@ -719,6 +811,9 @@ fn cmd_search(
 
     if results.is_empty() {
         println!("No results found for: {}", query);
+        // Before the diagnostics, because an empty list produced by `--limit 0` still has
+        // matches behind it and "No results found" reads as their absence.
+        print_truncation_notice(stats.truncated, results.len(), "results");
         eprintln!(
             "Scanned {} sessions ({} messages), 0 matched",
             stats.sessions_in_scope, stats.total_indexed_messages
@@ -734,6 +829,8 @@ fn cmd_search(
         );
         print_unindexed_warning(&search);
     }
+
+    print_truncation_notice(stats.truncated, results.len(), "results");
 
     println!(
         "\u{1f50d} Found {} matches for '{}':\n",
@@ -807,6 +904,7 @@ fn cmd_search_grouped(
         let mut localized = localize_timestamps(json_val);
         inject_resume_command(&mut localized);
         println!("{}", serde_json::to_string_pretty(&localized)?);
+        print_truncation_notice(stats.truncated, result.rows.len(), "sessions");
         if verbose {
             eprintln!(
                 "Scanned {} sessions ({} messages), {} matched",
@@ -819,6 +917,7 @@ fn cmd_search_grouped(
 
     if result.rows.is_empty() {
         println!("No results found for: {}", query);
+        print_truncation_notice(stats.truncated, result.rows.len(), "sessions");
         eprintln!(
             "Scanned {} sessions ({} messages), 0 matched",
             stats.sessions_in_scope, stats.total_indexed_messages
@@ -834,6 +933,8 @@ fn cmd_search_grouped(
         );
         print_unindexed_warning(search);
     }
+
+    print_truncation_notice(stats.truncated, result.rows.len(), "sessions");
 
     println!(
         "\u{1f50d} Found {} sessions matching '{}':\n",

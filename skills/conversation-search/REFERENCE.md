@@ -65,9 +65,9 @@ ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--un
 - `--project PROJECT`: Filter by project path
 - `--repo REPO`: Filter by repository root (partial match)
 - `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
-- `--limit LIMIT`: Max results (default: 20)
+- `--limit LIMIT`: Max results (default: 20). When the cap drops matches, `Note: showing first N results (more matches exist)` is printed to stderr regardless of `-v`
 - `--sort SORT`: Result order — `relevance` (bm25, default) or `recent` (newest first)
-- `--content`: Show full message content instead of summaries
+- `--content`: Show full message content instead of summaries (human output only; ignored with `--json`)
 - `--group-by-session`: Group results by session (show the top-ranked match per session with match count)
 - `-v, --verbose`: Show search diagnostics (sessions scanned, messages matched, unindexed warnings)
 - `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions)
@@ -242,16 +242,20 @@ ai-conversation-search tree SESSION_ID [--json]
 ```
 
 **Arguments:**
-- `SESSION_ID`: Session ID from list or search results
+- `SESSION_ID`: Session ID from list or search results. A unique prefix is accepted; an ambiguous prefix is reported as an error with the number of matches rather than resolved to one of them. Bare UUIDs also resolve to `oc:`/`codex:`-prefixed OpenCode and Codex sessions.
 
 **Options:**
 - `--json`: Output as JSON
 
 **Use case:** Visualize conversation branching and checkpoint structure.
 
+Each node's `summary` is the first non-empty line of the message (120 characters).
+Human output truncates it further to 80 characters; `--json` carries the full value.
+
 **Example:**
 ```bash
 ai-conversation-search tree session-abc-123
+ai-conversation-search tree session-     # unique prefix
 ```
 
 ---
@@ -267,7 +271,13 @@ ai-conversation-search index [--days DAYS] [--all] [--no-extract]
 **Options:**
 - `--days DAYS`: Index last N days (default: 1)
 - `--all`: Index all conversations
+- `--force`: Re-read files even if unchanged since the last run. `--all` only widens the date window, so files already recorded as processed need this to be revisited
 - `--no-extract`: Skip smart extraction
+
+**Not indexed:** claude-mem observer sessions. They mirror another session's tool calls
+and carry claude-mem's generated observations, both of which are stored elsewhere — the
+primary session and claude-mem's own database. Set
+`CONVERSATION_SEARCH_INDEX_OBSERVER=1` together with `--all --force` to index them anyway.
 
 **What it does:**
 - Scans for new/modified conversations
@@ -283,6 +293,28 @@ ai-conversation-search index --days 7
 # Reindex everything
 ai-conversation-search index --all
 ```
+
+---
+
+### ai-conversation-search prune-observer
+
+Remove claude-mem observer sessions that earlier versions put in the index.
+
+```bash
+ai-conversation-search prune-observer [--dry-run]
+```
+
+**Options:**
+- `--dry-run`: Report how many sessions would be removed, without changing anything
+
+**Notes:**
+- Irreversible, and can take several minutes on a large index (it rebuilds the FTS index
+  to clear entries stranded by the pre-0.15.0 delete trigger). Back up
+  `~/.conversation-search/index.db` first.
+- The database file does not shrink; freed pages are reused by later indexing.
+- Nothing is lost: the observations live in `~/.claude-mem/claude-mem.db`, and the mirrored
+  tool calls live in the primary sessions, which stay indexed.
+- New observer sessions are skipped at index time, so this only needs running once.
 
 ---
 

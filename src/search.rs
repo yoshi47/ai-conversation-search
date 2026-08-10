@@ -211,6 +211,9 @@ pub struct SearchStats {
     pub total_indexed_messages: i64,
     pub sessions_in_scope: i64,
     pub matched_messages: i64,
+    /// Whether `limit` cut off results that otherwise matched. A lower bound on the FTS
+    /// path, exact elsewhere -- see the assignment sites.
+    pub truncated: bool,
 }
 
 /// Search result with statistics.
@@ -575,20 +578,30 @@ impl ConversationSearch {
         let db_path = db::expand_path(&self.db_path);
         let db_size_bytes = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
 
+        // rank=1 makes the check compare the index against the content table. The
+        // argument-less form only validates the index's internal structure, which cannot
+        // see entries stranded by the pre-0.15.0 delete trigger -- the exact damage this
+        // check most needs to surface.
+        //
+        // eprintln rather than log::warn: env_logger defaults to Error level, so a warn
+        // would leave "CORRUPTED" on screen with no reason attached.
         let fts_healthy = match db::connect(&self.db_path, false) {
             Ok(rw_conn) => match rw_conn.execute(
-                "INSERT INTO message_content_fts(message_content_fts) VALUES('integrity-check')",
+                "INSERT INTO message_content_fts(message_content_fts, rank) VALUES('integrity-check', 1)",
                 [],
             ) {
                 Ok(_) => true,
                 Err(e) => {
-                    log::warn!("FTS integrity check failed: {}", e);
+                    eprintln!("FTS integrity check failed: {}", e);
+                    eprintln!("Run 'ai-conversation-search prune-observer' to rebuild the index.");
                     false
                 }
             },
             Err(e) => {
-                log::warn!("Failed to open rw connection for FTS check: {}", e);
-                false
+                // Not a corruption signal: the database just could not be opened for
+                // writing (permissions, another process holding it, read-only mount).
+                eprintln!("Could not verify FTS health (database not writable): {}", e);
+                true
             }
         };
 
@@ -608,7 +621,12 @@ impl ConversationSearch {
     }
 
     /// Gather search statistics (total indexed and in-scope counts).
-    fn gather_search_stats(&self, filter: &SearchFilter<'_>, matched: i64) -> Result<SearchStats> {
+    fn gather_search_stats(
+        &self,
+        filter: &SearchFilter<'_>,
+        matched: i64,
+        truncated: bool,
+    ) -> Result<SearchStats> {
         let total_indexed_sessions: i64 =
             self.conn
                 .query_row("SELECT COUNT(*) FROM conversations", [], |r| r.get(0))?;
@@ -637,6 +655,7 @@ impl ConversationSearch {
             total_indexed_messages,
             sessions_in_scope,
             matched_messages: matched,
+            truncated,
         })
     }
 
@@ -655,6 +674,17 @@ impl ConversationSearch {
             return Err(AppError::General(
                 "Cannot use --days with --since/--until/--date".to_string(),
             ));
+        }
+
+        // Rejected rather than clamped: a negative limit means two different wrong things
+        // depending on the path -- SQLite reads `LIMIT -2` and below as unbounded, while
+        // `truncate(limit as usize)` wraps to usize::MAX and drops nothing. Mirrors the
+        // guard in search_grouped_by_session.
+        if limit < 0 {
+            return Err(AppError::General(format!(
+                "limit must be >= 0, got {}",
+                limit
+            )));
         }
 
         let trimmed = query.trim();
@@ -677,12 +707,16 @@ impl ConversationSearch {
 
                 Self::append_filters(&mut sql, &mut params, filter)?;
 
+                // Over-fetch by one: SQL caps the result set, so the extra row is the only
+                // way to tell "exactly `limit` matches" from "more were cut off".
                 sql.push_str(" ORDER BY m.timestamp DESC LIMIT ?");
-                params.push(Box::new(limit));
+                params.push(Box::new(limit.saturating_add(1)));
 
-                let rows = self.execute_search_typed(&sql, &params)?;
+                let mut rows = self.execute_search_typed(&sql, &params)?;
+                let truncated = rows.len() as i64 > limit;
+                rows.truncate(limit as usize);
                 let matched = rows.len() as i64;
-                let stats = self.gather_search_stats(filter, matched)?;
+                let stats = self.gather_search_stats(filter, matched, truncated)?;
                 return Ok(SearchResult { rows, stats });
             }
             QueryPlan::Raw(q) => (q, Vec::new()),
@@ -700,7 +734,7 @@ impl ConversationSearch {
         let scored = self.query_fts_rowids(&fts_query)?;
 
         if scored.is_empty() {
-            let stats = self.gather_search_stats(filter, 0)?;
+            let stats = self.gather_search_stats(filter, 0, false)?;
             return Ok(SearchResult {
                 rows: Vec::new(),
                 stats,
@@ -712,8 +746,10 @@ impl ConversationSearch {
         // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
         const BATCH_SIZE: usize = 500;
         let mut all_results: Vec<SearchResultRow> = Vec::new();
+        let mut candidates_scanned = 0usize;
 
         for chunk in scored.chunks(BATCH_SIZE) {
+            candidates_scanned += chunk.len();
             let mut batch_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
@@ -783,6 +819,12 @@ impl ConversationSearch {
             }),
             SortOrder::Recent => all_results.sort_by(|a, b| b.timestamp.cmp(&a.timestamp)),
         }
+        // Collecting more than `limit` proves rows were dropped. The early stop can also
+        // land on exactly `limit` while candidates remain unscanned; those leftovers may
+        // all fail the filters, so warning there can overstate -- but the reverse mistake,
+        // staying silent about real matches, is what makes a caller read a capped list as
+        // "nothing else exists". Over-warn rather than under-warn.
+        let truncated = all_results.len() > limit as usize || candidates_scanned < scored.len();
         all_results.truncate(limit as usize);
 
         // Post-process: extract snippets with highlighting around match locations
@@ -791,7 +833,7 @@ impl ConversationSearch {
             row.context_snippet = extract_snippet(&row.context_snippet, &search_terms, 200);
         }
         let matched = all_results.len() as i64;
-        let stats = self.gather_search_stats(filter, matched)?;
+        let stats = self.gather_search_stats(filter, matched, truncated)?;
         Ok(SearchResult {
             rows: all_results,
             stats,
@@ -860,19 +902,22 @@ impl ConversationSearch {
                      ORDER BY timestamp DESC LIMIT ?",
                     inner_sql
                 );
-                params.push(Box::new(limit));
+                // Over-fetch by one to distinguish "exactly `limit` sessions" from "capped".
+                params.push(Box::new(limit.saturating_add(1)));
 
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| p.as_ref()).collect();
-                let rows = self.query_rows(&sql, &param_refs, |row| {
+                let mut rows = self.query_rows(&sql, &param_refs, |row| {
                     Ok(GroupedRow {
                         representative: SearchResultRow::from_row(row)?,
                         match_count: row.get("match_count")?,
                     })
                 })?;
 
+                let truncated = rows.len() as i64 > limit;
+                rows.truncate(limit_usize);
                 let matched_total: i64 = rows.iter().map(|g| g.match_count).sum();
-                let stats = self.gather_search_stats(filter, matched_total)?;
+                let stats = self.gather_search_stats(filter, matched_total, truncated)?;
                 return Ok(GroupedSearchResult { rows, stats });
             }
             QueryPlan::Raw(q) => (q, Vec::new()),
@@ -886,7 +931,7 @@ impl ConversationSearch {
         let scored = self.query_fts_rowids(&fts_query)?;
 
         if scored.is_empty() {
-            let stats = self.gather_search_stats(filter, 0)?;
+            let stats = self.gather_search_stats(filter, 0, false)?;
             return Ok(GroupedSearchResult {
                 rows: Vec::new(),
                 stats,
@@ -966,6 +1011,9 @@ impl ConversationSearch {
                 }
             }
         }
+        // No early stop on this path, so every matching session is in `order` and the
+        // comparison below is exact rather than a lower bound.
+        let truncated = order.len() > limit_usize;
         order.truncate(limit_usize);
         let rows: Vec<GroupedRow> = order
             .into_iter()
@@ -980,7 +1028,7 @@ impl ConversationSearch {
             })
             .collect();
 
-        let stats = self.gather_search_stats(filter, total_matched_messages)?;
+        let stats = self.gather_search_stats(filter, total_matched_messages, truncated)?;
         Ok(GroupedSearchResult { rows, stats })
     }
 
@@ -1157,7 +1205,76 @@ impl ConversationSearch {
         })
     }
 
-    pub fn get_conversation_tree(&self, session_id: &str) -> Result<ConversationTree> {
+    /// Resolve a possibly-abbreviated session id to the full stored value.
+    ///
+    /// Exact match wins, so an id that also prefixes another one still resolves to
+    /// itself. Failure is returned as the inner `Err(String)` rather than a hard
+    /// error because callers surface it in-band via `ConversationTree::error`.
+    fn resolve_session_id(&self, input: &str) -> Result<std::result::Result<String, String>> {
+        let exact = self.query_rows(
+            "SELECT session_id FROM conversations WHERE session_id = ?",
+            &[&input as &dyn rusqlite::types::ToSql],
+            |row| row.get::<_, String>(0),
+        )?;
+        if let Some(id) = exact.into_iter().next() {
+            return Ok(Ok(id));
+        }
+
+        // OpenCode / Codex ids are stored with a source prefix (indexer/opencode.rs,
+        // indexer/codex.rs), so a bare UUID copied from `search` output needs those
+        // variants tried too. Anchored at the start only -- a leading `%` would let a
+        // fragment match mid-UUID and silently pick an unrelated session.
+        let esc = escape_like(input);
+        let candidates = self.query_rows(
+            "SELECT session_id FROM conversations
+             WHERE session_id LIKE ?1 ESCAPE '\\'
+                OR session_id LIKE ?2 ESCAPE '\\'
+                OR session_id LIKE ?3 ESCAPE '\\'
+             ORDER BY session_id
+             LIMIT 11", // 10 to show a real count, plus one to detect "more than that"
+            &[
+                &format!("{}%", esc) as &dyn rusqlite::types::ToSql,
+                &format!("oc:{}%", esc),
+                &format!("codex:{}%", esc),
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+
+        match candidates.len() {
+            0 => Ok(Err(format!("Conversation {} not found", input))),
+            1 => Ok(Ok(candidates.into_iter().next().unwrap())),
+            n => Ok(Err(format!(
+                // `n` is capped by the LIMIT above, so past the cap report it as a floor
+                // rather than telling the user a number that is simply wrong.
+                "Ambiguous session id '{}' matches {}{} conversations: {}",
+                input,
+                n,
+                if n >= 11 { "+" } else { "" },
+                candidates
+                    .iter()
+                    .take(3)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    pub fn get_conversation_tree(&self, input_session_id: &str) -> Result<ConversationTree> {
+        let session_id = match self.resolve_session_id(input_session_id)? {
+            Ok(id) => id,
+            Err(message) => {
+                return Ok(ConversationTree {
+                    conversation: None,
+                    tree: Vec::new(),
+                    total_messages: 0,
+                    warning: None,
+                    error: Some(message),
+                })
+            }
+        };
+        let session_id = session_id.as_str();
+
         let messages = self.query_rows(
             "SELECT * FROM messages WHERE session_id = ? ORDER BY timestamp ASC",
             &[&session_id as &dyn rusqlite::types::ToSql],
@@ -1176,7 +1293,7 @@ impl ConversationSearch {
                 tree: Vec::new(),
                 total_messages: 0,
                 warning: None,
-                error: Some(format!("Conversation {} not found", session_id)),
+                error: Some(format!("Conversation {} not found", input_session_id)),
             });
         }
 
@@ -1369,7 +1486,14 @@ impl ConversationSearch {
                 timestamp: msg.timestamp.clone(),
                 message_type: msg.message_type.clone(),
                 project_path: msg.project_path.clone(),
-                summary: msg.summary.clone(),
+                // messages.summary is currently unpopulated by every indexer. Deriving
+                // from full_content keeps this path aligned with the raw-transcript
+                // fallback (build_tree_from_raw_messages) rather than rendering blank nodes.
+                summary: msg
+                    .summary
+                    .clone()
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| Some(summary_from_content(&msg.full_content))),
                 full_content: msg.full_content.clone(),
                 children,
             }
@@ -1872,19 +1996,199 @@ mod tests {
             0
         );
 
-        // Negative limit keeps its pre-existing (unvalidated) behavior: no panic.
+        // A negative limit is an input error, not "unlimited": rejected on both the
+        // grouped and non-grouped paths.
         let negative = SearchFilter {
             limit: -1,
             ..Default::default()
         };
-        assert_eq!(
-            searcher
-                .search_conversations("rustacean", &negative)
-                .unwrap()
-                .rows
-                .len(),
-            1
+        let err = searcher
+            .search_conversations("rustacean", &negative)
+            .expect_err("negative limit must be rejected");
+        assert!(
+            err.to_string().contains("limit must be >= 0"),
+            "unexpected error: {}",
+            err
         );
+    }
+
+    // ---- truncation reporting tests ----
+
+    /// Inserts `count` matching messages, one session each, so session-level and
+    /// message-level limits can both be exercised.
+    fn insert_matching_messages(conn: &Connection, count: usize, content: &str) {
+        for i in 0..count {
+            let sess = format!("sess{}", i);
+            insert_test_conversation(
+                conn,
+                &sess,
+                "/proj",
+                "summary",
+                "2025-01-15T09:00:00",
+                "2025-01-15T10:00:00",
+                "claude_code",
+            );
+            insert_test_message(
+                conn,
+                &format!("msg{}", i),
+                &sess,
+                content,
+                "user",
+                &format!("2025-01-15T10:0{}:00", i),
+                "/proj",
+            );
+        }
+    }
+
+    #[test]
+    fn test_grouped_search_negative_limit_is_rejected() {
+        let conn = setup_test_db();
+        insert_matching_messages(&conn, 2, "rustacean content");
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let negative = SearchFilter {
+            limit: -1,
+            ..Default::default()
+        };
+        let err = searcher
+            .search_grouped_by_session("rustacean", &negative)
+            .expect_err("negative limit must be rejected");
+        assert!(
+            err.to_string().contains("limit must be >= 0"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_search_reports_truncation_when_more_results_exist() {
+        let conn = setup_test_db();
+        insert_matching_messages(&conn, 5, "rustacean content");
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let filter = SearchFilter {
+            limit: 3,
+            ..Default::default()
+        };
+        let result = searcher.search_conversations("rustacean", &filter).unwrap();
+
+        assert_eq!(result.rows.len(), 3);
+        assert!(result.stats.truncated);
+    }
+
+    #[test]
+    fn test_search_no_truncation_flag_when_within_limit() {
+        let conn = setup_test_db();
+        insert_matching_messages(&conn, 3, "rustacean content");
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let filter = SearchFilter {
+            limit: 10,
+            ..Default::default()
+        };
+        let result = searcher.search_conversations("rustacean", &filter).unwrap();
+
+        assert_eq!(result.rows.len(), 3);
+        assert!(!result.stats.truncated);
+    }
+
+    #[test]
+    fn test_search_truncation_boundary_exact_limit() {
+        let conn = setup_test_db();
+        insert_matching_messages(&conn, 3, "rustacean content");
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        // Matches == limit and every candidate was scanned, so nothing was dropped.
+        let filter = SearchFilter {
+            limit: 3,
+            ..Default::default()
+        };
+        let result = searcher.search_conversations("rustacean", &filter).unwrap();
+
+        assert_eq!(result.rows.len(), 3);
+        assert!(!result.stats.truncated);
+    }
+
+    /// Matches == limit means nothing was dropped. Without this the notice would fire on
+    /// every query that happens to land exactly on the cap, training callers to ignore it.
+    #[test]
+    fn test_truncation_boundary_exact_limit_all_paths() {
+        let conn = setup_test_db();
+        insert_matching_messages(&conn, 3, "ab rustacean content");
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let filter = SearchFilter {
+            limit: 3,
+            ..Default::default()
+        };
+
+        for (label, truncated) in [
+            (
+                "fts grouped",
+                searcher
+                    .search_grouped_by_session("rustacean", &filter)
+                    .unwrap()
+                    .stats
+                    .truncated,
+            ),
+            (
+                "like-only",
+                searcher
+                    .search_conversations("ab", &filter)
+                    .unwrap()
+                    .stats
+                    .truncated,
+            ),
+            (
+                "like-only grouped",
+                searcher
+                    .search_grouped_by_session("ab", &filter)
+                    .unwrap()
+                    .stats
+                    .truncated,
+            ),
+        ] {
+            assert!(!truncated, "{} falsely reported truncation", label);
+        }
+    }
+
+    #[test]
+    fn test_grouped_search_reports_truncation() {
+        let conn = setup_test_db();
+        insert_matching_messages(&conn, 5, "rustacean content");
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let filter = SearchFilter {
+            limit: 2,
+            ..Default::default()
+        };
+        let result = searcher
+            .search_grouped_by_session("rustacean", &filter)
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.stats.truncated);
+    }
+
+    /// All-short queries bypass FTS and cap in SQL, so truncation has to be detected by
+    /// over-fetching rather than by inspecting a collected vector.
+    #[test]
+    fn test_like_only_search_reports_truncation() {
+        let conn = setup_test_db();
+        insert_matching_messages(&conn, 5, "ab cd content");
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let filter = SearchFilter {
+            limit: 2,
+            ..Default::default()
+        };
+        let result = searcher.search_conversations("ab", &filter).unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.stats.truncated);
+
+        let grouped = searcher.search_grouped_by_session("ab", &filter).unwrap();
+        assert_eq!(grouped.rows.len(), 2);
+        assert!(grouped.stats.truncated);
     }
 
     /// When NO term reaches 3 characters the query keeps AND semantics and recency
@@ -3873,6 +4177,192 @@ mod tests {
 
         // Child should have grandchild
         assert_eq!(result.tree[0].children[0].children.len(), 1);
+    }
+
+    /// Inserts a message with an explicit `summary` column value, which the
+    /// production indexers never write. Only the summary-fallback tests need it.
+    fn insert_test_message_with_summary(
+        conn: &Connection,
+        uuid: &str,
+        session_id: &str,
+        content: &str,
+        summary: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, summary, is_meta_conversation, is_tool_noise) VALUES (?, ?, NULL, FALSE, 0, '2025-01-15T10:00:00', 'user', '/proj', 'test.jsonl', ?, ?, FALSE, FALSE)",
+            rusqlite::params![uuid, session_id, content, summary],
+        )
+        .unwrap();
+    }
+
+    /// Registers a conversation plus one message so `tree` has something to return.
+    fn insert_tree_fixture(conn: &Connection, session_id: &str, content: &str) {
+        insert_test_conversation(
+            conn,
+            session_id,
+            "/proj",
+            "c",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message_with_summary(
+            conn,
+            &format!("msg-{}", session_id),
+            session_id,
+            content,
+            None,
+        );
+    }
+
+    #[test]
+    fn test_tree_resolves_unique_prefix() {
+        let conn = setup_test_db();
+        insert_tree_fixture(&conn, "1c538017-97e6-49d5-a5f2-5b062d6822de", "hello world");
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("1c538017").unwrap();
+
+        assert!(result.error.is_none(), "error: {:?}", result.error);
+        assert_eq!(result.total_messages, 1);
+        assert_eq!(result.tree[0].summary.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn test_tree_ambiguous_prefix_returns_inband_error() {
+        let conn = setup_test_db();
+        insert_tree_fixture(&conn, "abcd0001-aaaa", "first");
+        insert_tree_fixture(&conn, "abcd0002-bbbb", "second");
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("abcd").unwrap();
+
+        let error = result.error.expect("ambiguous prefix must report an error");
+        assert!(error.contains("Ambiguous"), "unexpected message: {}", error);
+        // Full phrase, not a bare "2": the fixture's session ids contain digits and would
+        // satisfy a substring check whatever count the code actually reported.
+        assert!(
+            error.contains("matches 2 conversations"),
+            "message must state the count: {}",
+            error
+        );
+        assert!(result.tree.is_empty());
+    }
+
+    /// The prefix search must anchor at the start. A `%…%` pattern would match the
+    /// fragment mid-UUID and hand back an unrelated conversation as if it were the one
+    /// asked for -- worse than reporting nothing.
+    #[test]
+    fn test_tree_prefix_does_not_match_mid_uuid() {
+        let conn = setup_test_db();
+        insert_tree_fixture(&conn, "aaaa1111-1c538017-bbbb", "unrelated session");
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("1c538017").unwrap();
+
+        let error = result.error.expect("mid-UUID fragment must not resolve");
+        assert!(error.contains("not found"), "unexpected message: {}", error);
+        assert!(result.tree.is_empty());
+    }
+
+    #[test]
+    fn test_tree_exact_match_wins_over_prefix() {
+        let conn = setup_test_db();
+        insert_tree_fixture(&conn, "abcd", "exact session");
+        insert_tree_fixture(&conn, "abcd-longer", "prefixed session");
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("abcd").unwrap();
+
+        assert!(result.error.is_none(), "error: {:?}", result.error);
+        assert_eq!(result.tree[0].summary.as_deref(), Some("exact session"));
+    }
+
+    #[test]
+    fn test_tree_resolves_prefixed_source_id() {
+        let conn = setup_test_db();
+        insert_tree_fixture(&conn, "oc:9f8e7d6c-1234", "opencode session");
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("9f8e7d6c").unwrap();
+
+        assert!(result.error.is_none(), "error: {:?}", result.error);
+        assert_eq!(result.tree[0].summary.as_deref(), Some("opencode session"));
+    }
+
+    #[test]
+    fn test_tree_summary_falls_back_to_content() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "c",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message_with_summary(
+            &conn,
+            "m1",
+            "sess1",
+            "first line of the message\nsecond line",
+            None,
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess1").unwrap();
+
+        assert_eq!(
+            result.tree[0].summary.as_deref(),
+            Some("first line of the message")
+        );
+    }
+
+    #[test]
+    fn test_tree_summary_prefers_stored_value() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "c",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message_with_summary(
+            &conn,
+            "m1",
+            "sess1",
+            "raw content line",
+            Some("stored summary"),
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess1").unwrap();
+
+        assert_eq!(result.tree[0].summary.as_deref(), Some("stored summary"));
+    }
+
+    #[test]
+    fn test_tree_summary_ignores_blank_stored_value() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "c",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message_with_summary(&conn, "m1", "sess1", "raw content line", Some("   "));
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess1").unwrap();
+
+        assert_eq!(result.tree[0].summary.as_deref(), Some("raw content line"));
     }
 
     #[test]

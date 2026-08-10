@@ -221,6 +221,9 @@ ai-conversation-search search "query" --repo myproject --json
 
 # Filter by source (claude_code, opencode, codex)
 ai-conversation-search search "query" --source opencode --json
+
+# Raise the result cap (default 20 — see below)
+ai-conversation-search search "query" --limit 50 --json
 ```
 
 **Date filter options:**
@@ -233,6 +236,8 @@ ai-conversation-search search "query" --source opencode --json
 
 **Other filter options:**
 - `--repo REPO`: Filter by git repository root (partial match). Matches conversations from the same repo including worktrees and subdirectories.
+- `--limit N`: Max results (**default: 20**). Results are capped at this value. When the cap drops matches, a `Note: showing first N results (more matches exist)` line is printed to stderr — do not read a capped list as "nothing else exists". Raise it before concluding a topic is absent.
+- `--content`: Show fuller message content instead of the 200-character snippet. Human output only; ignored with `--json`.
 
 ### List (for temporal queries)
 ```bash
@@ -257,7 +262,13 @@ ai-conversation-search status --json
 ```bash
 ai-conversation-search context <MESSAGE_UUID> --json
 ai-conversation-search tree <SESSION_ID> --json
+
+# SESSION_ID accepts a full UUID or any unique prefix
+ai-conversation-search tree 1c538017 --json
 ```
+
+`tree` reports an error instead of guessing when a prefix matches more than one
+session; pass more characters to disambiguate.
 
 **Always use `--json` for structured output.**
 

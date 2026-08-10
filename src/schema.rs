@@ -4,6 +4,30 @@ use crate::error::Result;
 
 const SCHEMA_SQL: &str = include_str!("../data/schema.sql");
 
+/// Trigger definitions that keep `message_content_fts` in sync with `messages`.
+///
+/// Must stay identical to the copy in data/schema.sql, which is what fresh databases
+/// get; `test_migration_triggers_match_schema_sql` enforces that. Migration 9 recreates
+/// the delete/update triggers from here, since `CREATE TRIGGER IF NOT EXISTS` cannot
+/// update an existing database.
+pub const FTS_SYNC_TRIGGERS: &str = "
+    CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
+        INSERT INTO message_content_fts(rowid, message_uuid, full_content)
+        VALUES (new.rowid, new.message_uuid, new.full_content);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
+        INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
+        VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
+    END;
+
+    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+        INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
+        VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
+        INSERT INTO message_content_fts(rowid, message_uuid, full_content)
+        VALUES (new.rowid, new.message_uuid, new.full_content);
+    END;";
+
 /// Migration kinds.
 enum MigrationKind {
     Sql(&'static str),
@@ -66,6 +90,11 @@ const MIGRATIONS: &[(i64, &str, MigrationKind)] = &[
         ),
     ),
     (8, "migrate FTS to trigram tokenizer", MigrationKind::Custom),
+    (
+        9,
+        "fix FTS delete/update triggers for external-content table",
+        MigrationKind::Custom,
+    ),
 ];
 
 /// Initialize the database schema and run migrations.
@@ -205,6 +234,20 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> bool {
                 .unwrap_or(None);
             fts_sql.is_none_or(|s| s.contains("trigram"))
         }
+        9 => {
+            // The fixed trigger issues a 'delete' command; the broken one issued a
+            // DELETE statement. Absent trigger means a fresh DB, where schema.sql
+            // already creates the correct form.
+            let trigger_sql: Option<String> = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='messages_ad'",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+            trigger_sql.is_none_or(|s| s.contains("'delete'"))
+        }
         v => unreachable!("unhandled custom migration version: {}", v),
     }
 }
@@ -288,8 +331,24 @@ fn parse_create_index(sql: &str) -> Option<String> {
 fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
     match version {
         8 => migrate_fts_to_trigram(conn),
+        9 => migrate_fix_fts_delete_triggers(conn),
         v => unreachable!("unhandled custom migration version: {}", v),
     }
+}
+
+/// Replace the FTS sync triggers with the external-content-safe form.
+///
+/// `CREATE TRIGGER IF NOT EXISTS` in schema.sql cannot update an existing database, so
+/// the old definitions have to be dropped explicitly. Orphaned index entries left behind
+/// by the previous triggers are not repaired here -- that needs a full rebuild, which
+/// `prune-observer` performs.
+fn migrate_fix_fts_delete_triggers(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
+    tx.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
+    tx.execute_batch(FTS_SYNC_TRIGGERS)?;
+    tx.commit()?;
+    Ok(())
 }
 
 /// Migrate the FTS5 table from unicode61 to trigram tokenizer.
@@ -331,22 +390,7 @@ fn migrate_fts_to_trigram(conn: &Connection) -> Result<()> {
         );",
     )?;
 
-    tx.execute_batch(
-        "CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
-            INSERT INTO message_content_fts(rowid, message_uuid, full_content)
-            VALUES (new.rowid, new.message_uuid, new.full_content);
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
-            DELETE FROM message_content_fts WHERE rowid = old.rowid;
-        END;
-
-        CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
-            DELETE FROM message_content_fts WHERE rowid = old.rowid;
-            INSERT INTO message_content_fts(rowid, message_uuid, full_content)
-            VALUES (new.rowid, new.message_uuid, new.full_content);
-        END;",
-    )?;
+    tx.execute_batch(FTS_SYNC_TRIGGERS)?;
 
     tx.execute(
         "INSERT INTO message_content_fts(message_content_fts) VALUES('rebuild')",
@@ -367,6 +411,158 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn
+    }
+
+    fn insert_message(conn: &Connection, uuid: &str, content: &str) {
+        conn.execute(
+            "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, full_content) VALUES (?, 'sess1', 0, '2025-01-15T10:00:00', 'user', ?)",
+            rusqlite::params![uuid, content],
+        )
+        .unwrap();
+    }
+
+    /// Counts index entries whose content row is gone. A plain
+    /// `SELECT ... FROM message_content_fts WHERE full_content LIKE ...` cannot see these
+    /// -- it reads through to the content table and errors on the missing row.
+    fn orphan_fts_rows(conn: &Connection, needle: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT rowid FROM message_content_fts WHERE message_content_fts MATCH ?) f
+             LEFT JOIN messages m ON m.rowid = f.rowid WHERE m.rowid IS NULL",
+            [needle],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_fts_delete_trigger_removes_index_entry() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "alphabet soup");
+
+        let before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_content_fts WHERE message_content_fts MATCH 'alp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, 1);
+
+        conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
+            .unwrap();
+
+        assert_eq!(orphan_fts_rows(&conn, "alp"), 0);
+    }
+
+    #[test]
+    fn test_fts_update_trigger_reindexes_content() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "alphabet soup");
+
+        conn.execute(
+            "UPDATE messages SET full_content = 'zebra crossing' WHERE message_uuid = 'm1'",
+            [],
+        )
+        .unwrap();
+
+        let stale: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_content_fts WHERE message_content_fts MATCH 'alp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "old terms must not survive an update");
+
+        let fresh: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_content_fts WHERE message_content_fts MATCH 'zeb'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh, 1);
+    }
+
+    /// `FTS_SYNC_TRIGGERS` is a second copy of what data/schema.sql defines, and only the
+    /// migration path uses it -- a fresh database never exercises it, so drift between the
+    /// two would go unnoticed until an upgraded database silently mis-indexed.
+    #[test]
+    fn test_migration_triggers_match_schema_sql() {
+        for trigger in ["messages_ai", "messages_ad", "messages_au"] {
+            let from_schema = setup_fresh_db();
+            init_schema(&from_schema).unwrap();
+            let expected: String = from_schema
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            let from_const = setup_fresh_db();
+            init_schema(&from_const).unwrap();
+            from_const
+                .execute_batch(&format!("DROP TRIGGER {};", trigger))
+                .unwrap();
+            from_const.execute_batch(FTS_SYNC_TRIGGERS).unwrap();
+            let actual: String = from_const
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?",
+                    [trigger],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert_eq!(
+                normalize_sql(&actual),
+                normalize_sql(&expected),
+                "{} differs between FTS_SYNC_TRIGGERS and data/schema.sql",
+                trigger
+            );
+        }
+    }
+
+    fn normalize_sql(sql: &str) -> String {
+        sql.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// A database still carrying the broken triggers must be repaired by migration 9.
+    #[test]
+    fn test_migration_9_replaces_legacy_delete_trigger() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+
+        // Reinstate the pre-0.15.0 trigger and rewind the recorded version.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS messages_ad;
+             CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                 DELETE FROM message_content_fts WHERE rowid = old.rowid;
+             END;",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM schema_version WHERE version = 9", [])
+            .unwrap();
+
+        // Confirm the legacy trigger really does strand an entry, so passing after the
+        // migration means something.
+        insert_message(&conn, "legacy", "alphabet soup");
+        conn.execute("DELETE FROM messages WHERE message_uuid = 'legacy'", [])
+            .unwrap();
+        assert_eq!(
+            orphan_fts_rows(&conn, "alp"),
+            1,
+            "legacy trigger should leave the index entry behind"
+        );
+
+        init_schema(&conn).unwrap();
+
+        insert_message(&conn, "m1", "zebra crossing");
+        conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
+            .unwrap();
+        assert_eq!(orphan_fts_rows(&conn, "zeb"), 0);
     }
 
     #[test]
