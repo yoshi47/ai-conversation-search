@@ -71,6 +71,14 @@ fn is_observer_project_dir_name(dir_name: &str) -> bool {
 /// timestamp, the Rust check takes transcript order. `message_uuid` breaks timestamp ties
 /// so at least the choice is stable rather than left to the query planner.
 ///
+/// On a transcript that is not timestamp-sorted -- resumed sessions, sidechains -- the two
+/// therefore reach different answers, in both directions. Confirmed by
+/// `test_observer_detectors_diverge_marker_earliest_by_timestamp_only`: a session whose
+/// earliest-by-timestamp user message carries the marker while its transcript-first one
+/// does not gets indexed as ordinary and then deleted here. Aligning them needs an
+/// insertion-order column and a backfill, so the divergence is pinned by tests rather than
+/// papered over; treat any change to either detector as a change to both.
+///
 /// Restricted to `claude_code` because observer transcripts are a claude-mem artifact and
 /// this SQL drives an irreversible delete; OpenCode and Codex sessions have no business
 /// being in range.
@@ -538,7 +546,17 @@ impl ConversationIndexer {
     /// Auto-discovers multiple profiles (e.g. ~/.claude, ~/.claude-personal).
     pub fn scan_conversations(&mut self, days_back: Option<i64>) -> Vec<PathBuf> {
         let project_dirs = self.discover_project_dirs();
+        self.scan_project_dirs(&project_dirs, days_back)
+    }
 
+    /// Split out from `scan_conversations` so the skip rules can be tested against a temp
+    /// directory. `discover_project_dirs` reads `$HOME`, which a test cannot supply without
+    /// mutating process-wide state.
+    fn scan_project_dirs(
+        &mut self,
+        project_dirs: &[PathBuf],
+        days_back: Option<i64>,
+    ) -> Vec<PathBuf> {
         if project_dirs.is_empty() {
             self.log("No Claude project directories found");
             return vec![];
@@ -558,7 +576,7 @@ impl ConversationIndexer {
 
         let mut conversation_files: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
 
-        for projects_dir in &project_dirs {
+        for projects_dir in project_dirs {
             // Reset cached summarizer hash for each profile directory
             self.summarizer_project_hash = None;
             let summarizer_hash = self.get_summarizer_project_hash(projects_dir);
@@ -2543,6 +2561,172 @@ mod tests {
         assert!(!is_observer_project_dir_name(
             "-Users-someone-observer-sessions"
         ));
+    }
+
+    const NORMAL_JSONL: &[&str] = &[
+        r#"{"uuid":"n1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess1","message":{"role":"user","content":"how do I fix the deploy"}}"#,
+    ];
+
+    /// Build a projects root holding one observer-named directory and one ordinary one.
+    /// The observer name is derived from the constant so a change to it cannot leave the
+    /// test passing vacuously.
+    fn projects_root_with_observer_dir(
+    ) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+
+        let observer_dir = root
+            .path()
+            .join(format!("-Users-x{}", OBSERVER_PROJECT_DIR_SUFFIX));
+        std::fs::create_dir_all(&observer_dir).unwrap();
+        let observer_file = write_jsonl_in_dir(&observer_dir, "obs1", OBSERVER_JSONL);
+
+        let normal_dir = root.path().join("-Users-x-myproject");
+        std::fs::create_dir_all(&normal_dir).unwrap();
+        let normal_file = write_jsonl_in_dir(&normal_dir, "sess1", NORMAL_JSONL);
+
+        (root, observer_file, normal_file)
+    }
+
+    /// The directory-name skip has to hold on its own.
+    ///
+    /// Asserting on the scan output rather than on what ends up in the database: the
+    /// per-file marker check in `do_index_conversation` would swallow these transcripts
+    /// anyway, so a database-level assertion passes even when this skip is broken. The
+    /// symptom of that breakage is not wrong data, it is parsing tens of thousands of
+    /// files for nothing -- a regression nothing else would catch.
+    #[test]
+    fn test_scan_skips_observer_project_directory() {
+        let (root, observer_file, normal_file) = projects_root_with_observer_dir();
+        let (_dir, mut indexer) = create_test_indexer();
+
+        let found = indexer.scan_project_dirs(&[root.path().to_path_buf()], None);
+
+        assert!(
+            found.contains(&normal_file),
+            "ordinary project must still be scanned, got {:?}",
+            found
+        );
+        assert!(
+            !found.contains(&observer_file),
+            "observer project directory must be skipped by name, got {:?}",
+            found
+        );
+    }
+
+    /// The escape hatch has to reach the directory skip too, not just the marker check.
+    #[test]
+    fn test_scan_includes_observer_directory_when_enabled() {
+        let (root, observer_file, _normal_file) = projects_root_with_observer_dir();
+        let (_dir, mut indexer) = create_test_indexer();
+        indexer.set_index_observer(true);
+
+        let found = indexer.scan_project_dirs(&[root.path().to_path_buf()], None);
+
+        assert!(found.contains(&observer_file));
+    }
+
+    /// Run both observer detectors over one transcript.
+    ///
+    /// Returns `(transcript_order_says, timestamp_order_says)`:
+    /// `is_observer_conversation` (scan time, first user message in transcript order) and
+    /// `OBSERVER_SESSION_SELECT_SQL` (prune time, earliest user message by timestamp).
+    fn both_observer_detectors(lines: &[&str]) -> (bool, bool) {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(dir.path(), "s1", lines);
+
+        let (_meta, messages) = indexer.parse_conversation_file(&file).unwrap();
+        let transcript_order = summarization::is_observer_conversation(&messages);
+
+        indexer.set_index_observer(true);
+        indexer.index_conversation(&file).unwrap();
+        let timestamp_order = indexer.count_observer_sessions().unwrap() == 1;
+
+        (transcript_order, timestamp_order)
+    }
+
+    const MARKER_CONTENT: &str =
+        "<observed_from_primary_session><what_happened>Read</what_happened></observed_from_primary_session>";
+
+    fn user_line(uuid: &str, parent: &str, ts: &str, content: &str) -> String {
+        format!(
+            r#"{{"uuid":"{}","parentUuid":{},"isSidechain":false,"timestamp":"{}","type":"user","sessionId":"s1","message":{{"role":"user","content":"{}"}}}}"#,
+            uuid, parent, ts, content
+        )
+    }
+
+    /// The two detectors disagree when a transcript is not timestamp-sorted, which is what
+    /// resumed sessions and sidechains produce. This characterises the *safe* direction.
+    ///
+    /// They cannot simply be aligned: `messages` stores `depth` (distance from root), not
+    /// insertion order, so teaching the SQL side transcript order needs a new column and a
+    /// backfill -- more risk than the divergence. Both directions are pinned here instead,
+    /// so a change to either detector has to confront what it does to the other.
+    #[test]
+    fn test_observer_detectors_diverge_marker_first_in_transcript_only() {
+        // Marker sits on the transcript-first user message, which has the LATER timestamp.
+        let lines = [
+            user_line("a1", "null", "2025-01-15T10:05:00Z", MARKER_CONTENT),
+            user_line("a2", "\"a1\"", "2025-01-15T10:00:00Z", "plain question"),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+        let (transcript_order, timestamp_order) = both_observer_detectors(&refs);
+
+        // Scan time skips it; prune time leaves it alone. Failing to delete is the
+        // harmless direction -- the row simply stays indexed.
+        assert!(
+            transcript_order,
+            "scan-time check should treat this as observer"
+        );
+        assert!(
+            !timestamp_order,
+            "prune SQL keys off the earliest timestamp, so it does not match here"
+        );
+    }
+
+    /// The *unsafe* direction: prune would delete a session that scan-time indexing
+    /// considered ordinary.
+    ///
+    /// Reaching it needs a non-observer session whose earliest-by-timestamp user message
+    /// contains the marker literally, on a transcript where that message is not first in
+    /// the file. A conversation *about* claude-mem's observer format can contain the
+    /// string, so this is not purely theoretical -- see the tech-debt note. Pinned rather
+    /// than fixed: changing what `prune-observer` deletes is not something to slip into a
+    /// release unreviewed.
+    #[test]
+    fn test_observer_detectors_diverge_marker_earliest_by_timestamp_only() {
+        let lines = [
+            user_line("a1", "null", "2025-01-15T10:05:00Z", "plain question"),
+            user_line("a2", "\"a1\"", "2025-01-15T10:00:00Z", MARKER_CONTENT),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+        let (transcript_order, timestamp_order) = both_observer_detectors(&refs);
+
+        assert!(
+            !transcript_order,
+            "scan-time check reads the transcript-first message, which is plain"
+        );
+        assert!(
+            timestamp_order,
+            "prune SQL reads the earliest timestamp, which carries the marker -- \
+             this is the direction that deletes a session indexing chose to keep"
+        );
+    }
+
+    /// Sanity anchor: on an ordinary timestamp-sorted transcript the two agree, which is
+    /// what makes the divergence above specifically about ordering.
+    #[test]
+    fn test_observer_detectors_agree_on_sorted_transcript() {
+        let lines = [
+            user_line("a1", "null", "2025-01-15T10:00:00Z", MARKER_CONTENT),
+            user_line("a2", "\"a1\"", "2025-01-15T10:05:00Z", "plain question"),
+        ];
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+
+        let (transcript_order, timestamp_order) = both_observer_detectors(&refs);
+        assert_eq!(transcript_order, timestamp_order);
+        assert!(transcript_order);
     }
 
     // ---- prune_observer_sessions tests ----
