@@ -223,6 +223,18 @@ pub struct SearchResult {
     pub stats: SearchStats,
 }
 
+/// `list` rows plus whether `--limit` cut off the tail.
+///
+/// Deliberately not `SearchStats`: `gather_search_stats` counts message-scoped totals via
+/// `append_filters`, which filters on `messages.timestamp`, while `list` filters on
+/// `conversations.last_message_at`. Reusing it would attach three extra COUNT queries whose
+/// numbers answer a different question.
+#[derive(Debug, Clone, Serialize)]
+pub struct ListResult {
+    pub rows: Vec<ConversationRow>,
+    pub truncated: bool,
+}
+
 /// One session's representative row plus its match count.
 #[derive(Debug, Clone, Serialize)]
 pub struct GroupedRow {
@@ -1592,10 +1604,7 @@ impl ConversationSearch {
             .collect()
     }
 
-    pub fn list_recent_conversations(
-        &self,
-        filter: &SearchFilter<'_>,
-    ) -> Result<Vec<ConversationRow>> {
+    pub fn list_recent_conversations(&self, filter: &SearchFilter<'_>) -> Result<ListResult> {
         let days_back = filter.days_back;
         let since = filter.since;
         let until = filter.until;
@@ -1651,12 +1660,29 @@ impl ConversationSearch {
             params.push(Box::new(s.to_string()));
         }
 
+        // Rejected rather than clamped, matching search_conversations: a negative limit
+        // means one thing to SQL (unlimited, by accident) and another to `truncate`.
+        if limit < 0 {
+            return Err(AppError::General(format!(
+                "limit must be >= 0, got {}",
+                limit
+            )));
+        }
+
+        // Over-fetch by one. SQL caps the set, so the extra row is the only thing that
+        // separates "exactly `limit` conversations exist" from "more were cut off".
         sql.push_str(" ORDER BY last_message_at DESC LIMIT ?");
-        params.push(Box::new(limit));
+        params.push(Box::new(limit.saturating_add(1)));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
-        self.query_rows(&sql, &param_refs, ConversationRow::from_row)
+        // Known limitation, shared with the search paths: query_rows drops rows whose
+        // mapping fails with a log::warn, so a failure on the over-fetched row would
+        // under-report truncation rather than over-report it.
+        let mut rows = self.query_rows(&sql, &param_refs, ConversationRow::from_row)?;
+        let truncated = rows.len() as i64 > limit;
+        rows.truncate(limit as usize);
+        Ok(ListResult { rows, truncated })
     }
 
     pub fn get_full_message_content(&self, message_uuid: &str) -> Option<String> {
@@ -4634,7 +4660,7 @@ mod tests {
                 ..default_filter()
             })
             .unwrap();
-        assert_eq!(results.len(), 2);
+        assert_eq!(results.rows.len(), 2);
 
         // Filter by project
         let results = searcher
@@ -4644,8 +4670,8 @@ mod tests {
                 ..default_filter()
             })
             .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].project_path.as_deref(), Some("/proj_a"));
+        assert_eq!(results.rows.len(), 1);
+        assert_eq!(results.rows[0].project_path.as_deref(), Some("/proj_a"));
 
         // Filter by source
         let results = searcher
@@ -4655,8 +4681,76 @@ mod tests {
                 ..default_filter()
             })
             .unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].source.as_deref(), Some("opencode"));
+        assert_eq!(results.rows.len(), 1);
+        assert_eq!(results.rows[0].source.as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn test_list_recent_conversations_reports_truncation() {
+        let conn = setup_test_db();
+        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        for session in ["sess1", "sess2", "sess3"] {
+            insert_test_conversation(&conn, session, "/proj", "summary", &ts, &ts, "claude_code");
+        }
+        let searcher = ConversationSearch::from_connection(conn);
+
+        let capped = searcher
+            .list_recent_conversations(&SearchFilter {
+                days_back: Some(1),
+                limit: 2,
+                ..default_filter()
+            })
+            .unwrap();
+        assert_eq!(capped.rows.len(), 2);
+        assert!(capped.truncated);
+
+        // Exactly `limit` matches is not truncation. This is the case the over-fetched
+        // row exists to distinguish, and the one a naive `rows.len() == limit` check
+        // would get wrong.
+        let exact = searcher
+            .list_recent_conversations(&SearchFilter {
+                days_back: Some(1),
+                limit: 3,
+                ..default_filter()
+            })
+            .unwrap();
+        assert_eq!(exact.rows.len(), 3);
+        assert!(!exact.truncated);
+    }
+
+    #[test]
+    fn test_list_recent_conversations_limit_zero_still_reports_truncation() {
+        // `--limit 0` returns nothing while conversations exist; without the flag this
+        // reads as "no conversations found".
+        let conn = setup_test_db();
+        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", &ts, &ts, "claude_code");
+        let searcher = ConversationSearch::from_connection(conn);
+
+        let result = searcher
+            .list_recent_conversations(&SearchFilter {
+                days_back: Some(1),
+                limit: 0,
+                ..default_filter()
+            })
+            .unwrap();
+        assert!(result.rows.is_empty());
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn test_list_recent_conversations_rejects_negative_limit() {
+        let conn = setup_test_db();
+        let searcher = ConversationSearch::from_connection(conn);
+
+        let err = searcher
+            .list_recent_conversations(&SearchFilter {
+                days_back: Some(1),
+                limit: -1,
+                ..default_filter()
+            })
+            .expect_err("negative limit must be rejected");
+        assert!(err.to_string().contains("limit must be >= 0"));
     }
 
     // ---- query sanitization tests ----

@@ -1138,25 +1138,32 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool) ->
 fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
     maybe_background_index();
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
-    let convs = search.list_recent_conversations(filter)?;
+    let result = search.list_recent_conversations(filter)?;
+    let convs = &result.rows;
 
     if json_output {
-        let json_val = serde_json::to_value(&convs)?;
+        let json_val = serde_json::to_value(convs)?;
         let mut localized = localize_timestamps(json_val);
         inject_resume_command(&mut localized);
         println!("{}", serde_json::to_string_pretty(&localized)?);
+        print_truncation_notice(result.truncated, convs.len(), "conversations");
         return Ok(());
     }
 
     if convs.is_empty() {
         println!("No conversations found");
+        // Before the reader concludes there is nothing here: `--limit 0` produces an empty
+        // list that still has conversations behind it.
+        print_truncation_notice(result.truncated, convs.len(), "conversations");
         return Ok(());
     }
+
+    print_truncation_notice(result.truncated, convs.len(), "conversations");
 
     let display_days = filter.days_back.unwrap_or(7);
     println!("Recent conversations (last {} days):\n", display_days);
 
-    for conv in &convs {
+    for conv in convs {
         let last_at = conv.last_message_at.as_deref().unwrap_or("");
         let timestamp = format_timestamp(last_at, true, false);
         let source_str = conv.source.as_deref().unwrap_or("claude_code");
