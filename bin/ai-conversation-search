@@ -219,21 +219,20 @@ acs_pick() {
 
     TAB=$(printf '\t')
 
-    # Preview: unchanged semantics — {1} is the session_id column.
-    PREVIEW_CMD="$BINARY tree {1} --json 2>/dev/null | jq -r '
+    # Preview: same output as before, but the filtering, flattening and body truncation
+    # that used to be hand-written jq are now CLI flags (0.16.0+). {1} is the session_id
+    # column. Note --content is required for bodies at all: tree no longer emits
+    # full_content by default.
+    PREVIEW_CMD="$BINARY tree {1} --json --no-tools --flat --content --content-chars 150 2>/dev/null | jq -r '
       \"📁 \" + (.conversation.project_path // \"unknown\"),
       \"💬 \" + (.total_messages | tostring) + \" messages\",
       \"🕐 \" + ((.conversation.first_message_at // \"\")[0:16] | gsub(\"T\"; \" \")) + \" → \" + ((.conversation.last_message_at // \"\")[0:16] | gsub(\"T\"; \" \")),
       \"\",
-      ([.tree[] | recurse(.children[]?)]
-       | map(select(
-           .full_content != null and .full_content != \"\"
-           and (.full_content | startswith(\"[Tool\") | not)
-         ))
+      (.tree
        | .[-12:]
        | .[]
        | (if .message_type == \"user\" then \"👤 \" else \"🤖 \" end)
-         + (.full_content | gsub(\"[\\\\n\\\\r]+\"; \" \") | .[0:150])
+         + (.full_content | gsub(\"[\\\\n\\\\r]+\"; \" \"))
       )
     ' 2>/dev/null || echo '[Preview unavailable]'"
 

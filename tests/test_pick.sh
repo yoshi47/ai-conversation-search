@@ -9,7 +9,10 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WRAPPER="$SCRIPT_DIR/bin/ai-conversation-search"
-BINARY="${HOME}/.conversation-search/bin/ai-conversation-search-$(grep '^ACS_WRAPPER_VERSION=' "$WRAPPER" | cut -d'"' -f2)"
+# Defaults to the cached binary the wrapper would run, so the suite tests the released
+# pair. ACS_TEST_BINARY overrides it, which is the only way to exercise a build whose
+# version has not been published yet -- flags added this cycle do not exist in the cache.
+BINARY="${ACS_TEST_BINARY:-${HOME}/.conversation-search/bin/ai-conversation-search-$(grep '^ACS_WRAPPER_VERSION=' "$WRAPPER" | cut -d'"' -f2)}"
 
 PASS=0
 FAIL=0
@@ -306,6 +309,41 @@ if echo "$PREVIEW_OUTPUT" | grep -q "🕐"; then
     pass "preview shows time range"
 else
     fail "preview shows time range"
+fi
+
+# The message list, which the header assertions above never covered. As of 0.16.0 the
+# filtering and truncation live in the CLI, so this checks the flags the preview relies on
+# actually produce bodies -- `tree` alone no longer emits any.
+MSG_OUTPUT=$("$BINARY" tree "$FIRST_SESSION" --json --no-tools --flat --content --content-chars 150 2>/dev/null | jq -r '
+  .tree | .[-12:] | .[]
+  | (if .message_type == "user" then "👤 " else "🤖 " end)
+    + (.full_content | gsub("[\n\r]+"; " "))
+' 2>/dev/null || echo "")
+
+if echo "$MSG_OUTPUT" | grep -qE "👤|🤖"; then
+    pass "preview lists messages with a role marker"
+else
+    fail "preview lists messages with a role marker" "Got: $MSG_OUTPUT"
+fi
+
+if echo "$MSG_OUTPUT" | grep -q "\[Tool"; then
+    fail "preview drops tool nodes" "Tool node leaked into the preview"
+else
+    pass "preview drops tool nodes"
+fi
+
+if [ -z "$(echo "$MSG_OUTPUT" | awk 'length > 200')" ]; then
+    pass "preview truncates long bodies"
+else
+    fail "preview truncates long bodies"
+fi
+
+# Bodies must be opt-in: the default shape is what keeps a long session out of an agent's
+# context window.
+if [ "$("$BINARY" tree "$FIRST_SESSION" --json 2>/dev/null | jq '[.. | objects | select(has("full_content"))] | length')" = "0" ]; then
+    pass "tree omits message bodies unless --content is given"
+else
+    fail "tree omits message bodies unless --content is given"
 fi
 fi
 echo ""
