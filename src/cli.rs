@@ -489,7 +489,11 @@ fn transcript_lookup_key(session_id: &str) -> Option<String> {
 /// The bool means "one file was handed to the indexer without error", NOT "rows were
 /// added": `index_conversation` also returns `Ok(())` for observer, summarizer and empty
 /// transcripts. The caller only uses it to decide whether one extra query is worth issuing.
-fn index_single_session(db_path: &str, session_id: &str) -> bool {
+fn index_single_session(
+    db_path: &str,
+    session_id: &str,
+    project_roots: Option<&[std::path::PathBuf]>,
+) -> bool {
     let Some(id) = transcript_lookup_key(session_id) else {
         return false;
     };
@@ -514,8 +518,18 @@ fn index_single_session(db_path: &str, session_id: &str) -> bool {
     // transcripts sit two levels below the discovered roots, and it carries the observer,
     // summarizer and agent-* skips. No date cutoff -- a session old enough to have missed
     // the window is precisely one that was never indexed.
-    let dirs = indexer.discover_project_dirs();
-    let files = indexer.scan_project_dirs(&dirs, None);
+    // `project_roots` exists so a test can point this at a temp tree instead of $HOME.
+    // Discovery reads the home directory, which a test cannot supply without mutating
+    // process-wide state -- the same reason `scan_project_dirs` is a separate function.
+    let discovered;
+    let roots = match project_roots {
+        Some(roots) => roots,
+        None => {
+            discovered = indexer.discover_project_dirs();
+            &discovered
+        }
+    };
+    let files = indexer.scan_project_dirs(roots, None);
     let Some(path) = crate::indexer::claude_code::find_session_transcript(&files, &id) else {
         return false;
     };
@@ -1421,10 +1435,43 @@ fn tree_exit_code(tree: &crate::search::ConversationTree) -> i32 {
     }
 }
 
-fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
-    maybe_background_index();
-    let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
+/// Look up a session's tree, indexing its transcript on the spot if it is not in the index.
+///
+/// The retry is what makes "read the session that just ended" work without the user running
+/// `index` by hand; `maybe_background_index` cannot cover it, being detached and debounced.
+fn lookup_tree(
+    db_path: &str,
+    session_id: &str,
+    project_roots: Option<&[std::path::PathBuf]>,
+) -> Result<crate::search::ConversationTree> {
+    let search = ConversationSearch::new(db_path)?;
     let tree = search.get_conversation_tree(session_id)?;
+
+    // `conversation: None` alongside an error is exactly the two not-found shapes: an id
+    // that would not resolve, and one that resolved to no conversation row. Reading the
+    // struct rather than the error text keeps this independent of the message wording.
+    // Both raw-transcript fallbacks keep `conversation: Some(..)`, so a session whose file
+    // is merely unreadable never triggers a pointless re-index.
+    if tree.conversation.is_some() || tree.error.is_none() {
+        return Ok(tree);
+    }
+
+    // Released before the indexer opens the same database read-write.
+    drop(search);
+    if !index_single_session(db_path, session_id, project_roots) {
+        return Ok(tree);
+    }
+    ConversationSearch::new(db_path)?.get_conversation_tree(session_id)
+}
+
+fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
+    let tree = lookup_tree(db::DEFAULT_DB_PATH, session_id, None)?;
+
+    // Below the lookup, not above it: on top, the detached indexer it spawns would race
+    // this command's own synchronous write for the same file against a 30s busy_timeout.
+    // The lookup already handles the only case that needed fresher data.
+    maybe_background_index();
+
     let code = tree_exit_code(&tree);
 
     if json_output {
@@ -1945,7 +1992,9 @@ mod tests {
 
 #[cfg(test)]
 mod index_single_session_tests {
-    use super::{index_single_session, transcript_lookup_key};
+    use super::{index_single_session, lookup_tree, transcript_lookup_key};
+    use crate::indexer::ConversationIndexer;
+    use crate::search::ConversationSearch;
 
     #[test]
     fn rejects_non_claude_code_sources() {
@@ -1985,13 +2034,139 @@ mod index_single_session_tests {
         );
     }
 
+    /// The one test that proves the retry actually works end to end.
+    ///
+    /// Every other assertion here checks that some input is *rejected*, which a lookup that
+    /// silently finds nothing would also satisfy -- an earlier draft of this feature scanned
+    /// one directory level too high and would have passed all of them.
+    #[test]
+    fn indexes_a_missing_session_and_returns_its_tree() {
+        let home = tempfile::tempdir().unwrap();
+        let roots = vec![home.path().join("projects")];
+        let project = roots[0].join("-tmp-someproject");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let session = "deadbeef-1111-2222-3333-444444444444";
+        std::fs::write(
+            project.join(format!("{}.jsonl", session)),
+            format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"uuid":"m1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"{session}","cwd":"/tmp/someproject","message":{{"role":"user","content":"how do I widen the search window"}}}}"#
+                ),
+                format_args!(
+                    r#"{{"uuid":"m2","parentUuid":"m1","isSidechain":false,"timestamp":"2026-01-15T10:01:00Z","type":"assistant","sessionId":"{session}","cwd":"/tmp/someproject","message":{{"role":"assistant","content":[{{"type":"text","text":"pass --days to widen it"}}]}}}}"#
+                ),
+            ),
+        )
+        .unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        let db_path = db_path.to_str().unwrap();
+        // The DB must already exist: a read path is never allowed to create one.
+        ConversationIndexer::new(db_path, true).unwrap();
+
+        let before = ConversationSearch::new(db_path)
+            .unwrap()
+            .get_conversation_tree(session)
+            .unwrap();
+        assert!(before.error.is_some(), "precondition: session is unindexed");
+
+        let tree = lookup_tree(db_path, session, Some(&roots)).unwrap();
+        assert!(tree.error.is_none(), "unexpected error: {:?}", tree.error);
+        assert_eq!(tree.total_messages, 2);
+        assert_eq!(tree.tree.len(), 1, "one root message");
+        assert_eq!(tree.tree[0].children.len(), 1, "one reply under it");
+    }
+
+    /// A prefix has to work too: an agent copying a short id out of `search` output is the
+    /// common case, and `resolve_session_id` accepts prefixes on the indexed path already.
+    #[test]
+    fn indexes_a_missing_session_given_only_a_prefix() {
+        let home = tempfile::tempdir().unwrap();
+        let roots = vec![home.path().join("projects")];
+        let project = roots[0].join("-tmp-someproject");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let session = "abcdef01-2222-3333-4444-555555555555";
+        std::fs::write(
+            project.join(format!("{}.jsonl", session)),
+            format!(
+                "{}\n",
+                format_args!(
+                    r#"{{"uuid":"p1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"{session}","cwd":"/tmp/someproject","message":{{"role":"user","content":"only message"}}}}"#
+                )
+            ),
+        )
+        .unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        let db_path = db_path.to_str().unwrap();
+        ConversationIndexer::new(db_path, true).unwrap();
+
+        let tree = lookup_tree(db_path, "abcdef01", Some(&roots)).unwrap();
+        assert!(tree.error.is_none(), "unexpected error: {:?}", tree.error);
+        assert_eq!(tree.total_messages, 1);
+    }
+
+    /// `prune-observer` (and any interrupted run) can leave a `claude_code_sync_state` row
+    /// behind with no conversation rows. Without `set_force`, the mtime check would then
+    /// short-circuit the re-read and the retry would be a silent no-op.
+    #[test]
+    fn reindexes_a_session_whose_sync_state_outlived_its_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let roots = vec![home.path().join("projects")];
+        let project = roots[0].join("-tmp-someproject");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let session = "feedface-9999-8888-7777-666666666666";
+        let file = project.join(format!("{}.jsonl", session));
+        std::fs::write(
+            &file,
+            format!(
+                "{}\n",
+                format_args!(
+                    r#"{{"uuid":"s1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"{session}","cwd":"/tmp/someproject","message":{{"role":"user","content":"still recoverable"}}}}"#
+                )
+            ),
+        )
+        .unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        let db_path = db_path.to_str().unwrap();
+
+        let mut indexer = ConversationIndexer::new(db_path, true).unwrap();
+        indexer.index_conversation(&file).unwrap();
+        // Drop the content but keep sync_state, exactly what prune leaves behind.
+        indexer
+            .connection()
+            .execute_batch("DELETE FROM messages; DELETE FROM conversations;")
+            .unwrap();
+        let stamped: i64 = indexer
+            .connection()
+            .query_row("SELECT COUNT(*) FROM claude_code_sync_state", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(stamped, 1, "precondition: the file is still stamped");
+        drop(indexer);
+
+        let tree = lookup_tree(db_path, session, Some(&roots)).unwrap();
+        assert!(tree.error.is_none(), "unexpected error: {:?}", tree.error);
+        assert_eq!(tree.total_messages, 1);
+    }
+
     #[test]
     fn refuses_to_create_a_database_from_a_read_path() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.db");
         assert!(!index_single_session(
             missing.to_str().unwrap(),
-            "deadbeef-1111-2222-3333-444444444444"
+            "deadbeef-1111-2222-3333-444444444444",
+            None
         ));
         assert!(!missing.exists(), "tree must never build an index database");
     }
