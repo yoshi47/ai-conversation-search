@@ -13,6 +13,7 @@ const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")
 
 const AUTO_INDEX_TTL_SECS: u64 = 300;
 const FULL_INDEX_TTL_SECS: u64 = 86400;
+const HOOK_INDEX_TTL_SECS: u64 = 0;
 const STAMP_FILE_PATH: &str = "~/.conversation-search/.last-auto-index";
 const FULL_STAMP_FILE_PATH: &str = "~/.conversation-search/.last-full-index";
 
@@ -413,17 +414,28 @@ fn is_stamp_stale(stamp_path: &std::path::Path, ttl_secs: u64) -> bool {
 /// Spawn a background index process if the stamp file is stale.
 /// All errors are silently ignored — this must never block or fail the caller.
 fn maybe_background_index() {
-    let _ = try_background_index();
+    let _ = try_background_index(None);
 }
 
-fn try_background_index() -> Option<()> {
+/// TTL for the Stop-hook trigger, defaulting to 0 (always index).
+///
+/// Takes the raw value rather than reading the environment so it stays assertable without
+/// mutating process-wide state, which parallel tests share.
+fn hook_index_ttl_secs(raw: Option<String>) -> u64 {
+    raw.and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(HOOK_INDEX_TTL_SECS)
+}
+
+fn try_background_index(incremental_ttl_override: Option<u64>) -> Option<()> {
     let stamp_path = db::expand_path(STAMP_FILE_PATH);
     let full_stamp_path = db::expand_path(FULL_STAMP_FILE_PATH);
 
-    let ttl_secs = std::env::var("CONVERSATION_SEARCH_INDEX_TTL")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(AUTO_INDEX_TTL_SECS);
+    let ttl_secs = incremental_ttl_override.unwrap_or_else(|| {
+        std::env::var("CONVERSATION_SEARCH_INDEX_TTL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(AUTO_INDEX_TTL_SECS)
+    });
 
     let full_ttl_secs = std::env::var("CONVERSATION_SEARCH_FULL_INDEX_TTL")
         .ok()
@@ -1545,7 +1557,11 @@ fn cmd_resume(uuid: &str) -> Result<()> {
 }
 
 fn cmd_hook() -> Result<()> {
-    maybe_background_index();
+    // Own TTL, not the shared one: search/tree/list all touch the same stamp, so at the
+    // shared 300s an agent that searched during the session would leave this a no-op --
+    // and that session's transcript is the one most likely to be asked about next.
+    let ttl = hook_index_ttl_secs(std::env::var("CONVERSATION_SEARCH_HOOK_TTL").ok());
+    let _ = try_background_index(Some(ttl));
     Ok(())
 }
 
@@ -1934,6 +1950,24 @@ mod tests {
         let path = unique_stamp_path("missing");
         let _ = std::fs::remove_file(&path);
         assert!(is_stamp_stale(&path, 300));
+    }
+
+    #[test]
+    fn test_hook_ttl_defaults_to_zero() {
+        // The Stop hook shares its stamp with search/tree/list. At the shared 300s TTL an
+        // agent that ran any of them during the session would leave the hook a no-op --
+        // which is precisely the session whose transcript most needs indexing.
+        assert_eq!(hook_index_ttl_secs(None), 0);
+        assert_eq!(hook_index_ttl_secs(Some("120".into())), 120);
+        // Unparseable falls back to the default rather than to the shared 300s.
+        assert_eq!(hook_index_ttl_secs(Some("soon".into())), 0);
+    }
+
+    #[test]
+    fn test_zero_ttl_treats_a_fresh_stamp_as_stale() {
+        let path = unique_stamp_path("zero-ttl");
+        touch_stamp_at(&path);
+        assert!(is_stamp_stale(&path, 0));
     }
 
     #[test]

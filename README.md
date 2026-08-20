@@ -227,10 +227,18 @@ eval "$(ai-conversation-search pick)"
 Requires `fzf` (0.28+) and `jq`. Only available via the wrapper script (plugin install or manual wrapper download).
 
 ### `ai-conversation-search setup-hooks` *(wrapper only)*
-Install a Claude Code Stop hook for automatic background indexing
+Install a Claude Code Stop hook for automatic background indexing.
+
+**Plugin users do not need this** — the plugin registers the Stop hook itself. Run it only
+after a manual wrapper install.
+
 ```bash
 ai-conversation-search setup-hooks
 ```
+
+If you ran it before v0.16.0 and have since installed the plugin, remove the
+`ai-conversation-search hook` entry from your `settings.json`: the plugin's entry spells the
+command differently, so `setup-hooks` cannot recognise it and the hook fires twice.
 
 ## Supported Sources
 

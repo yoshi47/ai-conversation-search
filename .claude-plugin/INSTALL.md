@@ -17,16 +17,16 @@ Verify everything is working:
 ai-conversation-search search "test" --json
 ```
 
-## Enable Automatic Indexing (Recommended)
+## Automatic Indexing
 
-Keep your search index always up-to-date by installing a Claude Code Stop hook:
+Already on. The plugin ships a Claude Code Stop hook that triggers background indexing when
+a session ends, so a conversation is searchable as soon as it finishes. The hook exits in
+under 50ms and never blocks your session.
 
-```bash
-ai-conversation-search setup-hooks
-```
-
-This adds a lightweight hook that triggers background indexing after each conversation turn.
-The hook exits in under 50ms and never blocks your session.
+`ai-conversation-search setup-hooks` exists for manual (non-plugin) installs. If you ran it
+before v0.16.0, remove the `ai-conversation-search hook` entry from your `settings.json` —
+the plugin's entry spells the command differently, so `setup-hooks` cannot recognise it and
+the hook would fire twice.
 
 ## You're Ready!
 
