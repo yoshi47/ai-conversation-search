@@ -350,6 +350,21 @@ pub enum Commands {
     Tree {
         /// Session ID
         session_id: String,
+        /// Only show messages from this role
+        #[arg(long, value_parser = ["user", "assistant"])]
+        role: Option<String>,
+        /// Drop tool-call and tool-result nodes
+        #[arg(long)]
+        no_tools: bool,
+        /// Return a flat list instead of a nested tree
+        #[arg(long)]
+        flat: bool,
+        /// Show message bodies instead of summaries only
+        #[arg(long)]
+        content: bool,
+        /// Max characters of each message body to show
+        #[arg(long, default_value_t = 300, requires = "content")]
+        content_chars: usize,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -654,7 +669,25 @@ pub fn run(cli: Cli) -> Result<()> {
             };
             cmd_list(&filter, json)
         }
-        Some(Commands::Tree { session_id, json }) => cmd_tree(&session_id, json),
+        Some(Commands::Tree {
+            session_id,
+            role,
+            no_tools,
+            flat,
+            content,
+            content_chars,
+            json,
+        }) => cmd_tree(
+            &session_id,
+            TreeOpts {
+                role,
+                no_tools,
+                flat,
+                content,
+                content_chars,
+                json,
+            },
+        ),
         Some(Commands::Resume { uuid }) => cmd_resume(&uuid),
         Some(Commands::Hook) => cmd_hook(),
     }
@@ -1476,7 +1509,69 @@ fn lookup_tree(
     ConversationSearch::new(db_path)?.get_conversation_tree(session_id)
 }
 
-fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
+/// Display-level tool noise, deliberately NOT `summarization::is_tool_noise`.
+///
+/// Why not reuse it: that predicate is tuned for search ranking and deliberately keeps
+/// short tool nodes (anything under 50 characters returns false), plus tool calls carrying
+/// enough surrounding prose. Here the whole point is to drop them, matching the jq filter
+/// this replaces in the fzf preview.
+fn is_tool_node(node: &TreeNode) -> bool {
+    let body = node.full_content.trim_start();
+    body.is_empty() || body.starts_with("[Tool") || body.starts_with("[Request interrupted")
+}
+
+/// Drop nodes failing `keep`, lifting a dropped node's surviving descendants into its place
+/// and repointing them at the nearest surviving ancestor.
+///
+/// Why not drop the whole subtree: a kept reply sitting under a filtered tool result would
+/// disappear, and surfacing exactly those replies is the reason the filter exists. Why
+/// rewrite `parent_uuid`: left alone it names a node no longer in the tree, so a consumer
+/// cannot rebuild the structure.
+fn prune_tree(
+    nodes: Vec<TreeNode>,
+    surviving_parent: Option<&str>,
+    keep: &impl Fn(&TreeNode) -> bool,
+) -> Vec<TreeNode> {
+    let mut out = Vec::new();
+    for mut node in nodes {
+        let children = std::mem::take(&mut node.children);
+        if keep(&node) {
+            node.parent_uuid = surviving_parent.map(str::to_string);
+            let uuid = node.message_uuid.clone();
+            node.children = prune_tree(children, Some(&uuid), keep);
+            out.push(node);
+        } else {
+            out.extend(prune_tree(children, surviving_parent, keep));
+        }
+    }
+    out
+}
+
+/// Depth-first flatten preserving transcript order.
+///
+/// `depth` keeps its original value: after flattening it is the only remaining record of
+/// where the message sat in the conversation.
+fn flatten_tree(nodes: Vec<TreeNode>) -> Vec<TreeNode> {
+    let mut out = Vec::new();
+    for mut node in nodes {
+        let children = std::mem::take(&mut node.children);
+        out.push(node);
+        out.extend(flatten_tree(children));
+    }
+    out
+}
+
+/// Display options for `tree`, grouped so `cmd_tree` keeps a readable signature.
+struct TreeOpts {
+    role: Option<String>,
+    no_tools: bool,
+    flat: bool,
+    content: bool,
+    content_chars: usize,
+    json: bool,
+}
+
+fn cmd_tree(session_id: &str, opts: TreeOpts) -> Result<()> {
     let tree = lookup_tree(db::DEFAULT_DB_PATH, session_id, None)?;
 
     // Below the lookup, not above it: on top, the detached indexer it spawns would race
@@ -1486,7 +1581,7 @@ fn cmd_tree(session_id: &str, json_output: bool) -> Result<()> {
 
     let code = tree_exit_code(&tree);
 
-    if json_output {
+    if opts.json {
         // The JSON body is unchanged, error key and all: the fzf preview and any existing
         // reader of `.error` keep working, and only the exit status becomes honest.
         let json_val = serde_json::to_value(&tree)?;
@@ -2203,5 +2298,99 @@ mod index_single_session_tests {
             None
         ));
         assert!(!missing.exists(), "tree must never build an index database");
+    }
+}
+
+#[cfg(test)]
+mod tree_filter_tests {
+    use super::{flatten_tree, is_tool_node, prune_tree};
+    use crate::search::TreeNode;
+
+    fn node(uuid: &str, parent: Option<&str>, role: &str, body: &str, depth: i64) -> TreeNode {
+        TreeNode {
+            message_uuid: uuid.to_string(),
+            session_id: "s1".to_string(),
+            parent_uuid: parent.map(str::to_string),
+            is_sidechain: false,
+            depth,
+            timestamp: "2026-01-15T10:00:00Z".to_string(),
+            message_type: role.to_string(),
+            project_path: Some("/tmp/p".to_string()),
+            summary: Some(body.chars().take(20).collect()),
+            full_content: body.to_string(),
+            children: Vec::new(),
+        }
+    }
+
+    /// user -> [Tool result] -> user, so pruning the middle must not take the leaf with it.
+    fn sandwich() -> Vec<TreeNode> {
+        let mut root = node("u1", None, "user", "please read the file", 0);
+        let mut tool = node("t1", Some("u1"), "user", "[Tool result]", 1);
+        let leaf = node("u2", Some("t1"), "user", "thanks, now explain it", 2);
+        tool.children = vec![leaf];
+        root.children = vec![tool];
+        vec![root]
+    }
+
+    #[test]
+    fn pruning_lifts_survivors_into_the_dropped_nodes_place() {
+        let kept = prune_tree(sandwich(), None, &|n| !is_tool_node(n));
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].message_uuid, "u1");
+        // The leaf must survive its filtered parent, not vanish with the subtree.
+        assert_eq!(kept[0].children.len(), 1);
+        assert_eq!(kept[0].children[0].message_uuid, "u2");
+    }
+
+    #[test]
+    fn pruning_repoints_parent_uuid_at_the_nearest_survivor() {
+        let kept = prune_tree(sandwich(), None, &|n| !is_tool_node(n));
+        // Left pointing at "t1" the JSON would name a node that is no longer in the tree.
+        assert_eq!(kept[0].children[0].parent_uuid.as_deref(), Some("u1"));
+        assert_eq!(kept[0].parent_uuid, None);
+    }
+
+    #[test]
+    fn role_filter_drops_only_the_other_role() {
+        let mut root = node("u1", None, "user", "a question worth keeping", 0);
+        root.children = vec![node("a1", Some("u1"), "assistant", "an answer", 1)];
+        let kept = prune_tree(vec![root], None, &|n| n.message_type == "user");
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].children.is_empty());
+    }
+
+    #[test]
+    fn tool_nodes_are_recognised_by_their_placeholder_bodies() {
+        assert!(is_tool_node(&node("x", None, "user", "[Tool result]", 0)));
+        // Short [Tool: Read] nodes must be dropped too. summarization::is_tool_noise keeps
+        // them (it returns false under 50 chars), which is why this predicate is separate.
+        assert!(is_tool_node(&node(
+            "x",
+            None,
+            "assistant",
+            "[Tool: Read]",
+            0
+        )));
+        assert!(is_tool_node(&node(
+            "x",
+            None,
+            "user",
+            "[Request interrupted by user]",
+            0
+        )));
+        assert!(is_tool_node(&node("x", None, "user", "   ", 0)));
+        assert!(!is_tool_node(&node("x", None, "user", "a real message", 0)));
+    }
+
+    #[test]
+    fn flattening_preserves_transcript_order_and_depth() {
+        let flat = flatten_tree(sandwich());
+        let ids: Vec<&str> = flat.iter().map(|n| n.message_uuid.as_str()).collect();
+        assert_eq!(ids, vec!["u1", "t1", "u2"]);
+        assert_eq!(
+            flat.iter().map(|n| n.depth).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert!(flat.iter().all(|n| n.children.is_empty()));
     }
 }
