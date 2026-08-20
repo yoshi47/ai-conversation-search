@@ -249,14 +249,44 @@ ai-conversation-search list --limit 50 --json
 Show the conversation tree structure for a session.
 
 ```bash
-ai-conversation-search tree SESSION_ID [--json]
+ai-conversation-search tree SESSION_ID [--role ROLE] [--no-tools] [--flat] [--content] [--content-chars N] [--json]
 ```
 
 **Arguments:**
 - `SESSION_ID`: Session ID from list or search results. A unique prefix is accepted; an ambiguous prefix is reported as an error with the number of matches rather than resolved to one of them. Bare UUIDs also resolve to `oc:`/`codex:`-prefixed OpenCode and Codex sessions.
 
 **Options:**
+- `--role user|assistant`: Keep only messages from that side
+- `--no-tools`: Drop tool-call, tool-result and interrupt nodes
+- `--flat`: Return a flat list instead of nested `children`
+- `--content`: Include message bodies (omitted by default)
+- `--content-chars N`: Cap each body at N characters (default: 300, requires `--content`)
 - `--json`: Output as JSON
+
+**Automatic indexing:** when `SESSION_ID` resolves to nothing, `tree` indexes that
+session's transcript and retries once, so a conversation that just ended is readable
+without running `index` first. This covers Claude Code sessions only — OpenCode and Codex
+ids are not stored in that layout — and it will not resurrect a claude-mem observer
+session, which stays excluded (see `index`).
+
+**Filtering and counts:** `total_messages` always means "messages in the session".
+`returned_messages` is how many survived the filters. When a filter matches nothing,
+`.warning` says so and the exit status stays `0` — filtered-to-empty is not the same as an
+empty conversation, and the exit status alone cannot tell you which you have.
+
+**Message bodies are opt-in** (since 0.16.0). Without `--content` no `full_content` is
+emitted at all: a long session serialises to hundreds of KB, which is worth avoiding unless
+the text is actually needed. With `--content`, every node carries
+`full_content_truncated` so a capped body is distinguishable from a complete one.
+
+`depth` is the message's depth in the original transcript. With `--role` or `--no-tools`,
+surviving nodes are lifted into a filtered parent's place and their `parent_uuid` is
+repointed at the nearest surviving ancestor, so `depth` may exceed the nesting you see.
+
+**Agent notifications:** subagent completion notices are indexed as user messages prefixed
+`[Task notification] `. They are tagged rather than suppressed because the body carries the
+agent's actual result. Transcripts indexed before 0.16.0 keep the untagged form until
+`index --all --force` re-reads them.
 
 **Exit status:** `1` when no tree came back — the session id could not be resolved (not
 found, or an ambiguous prefix), *or* it resolved but its transcript could not be read. The

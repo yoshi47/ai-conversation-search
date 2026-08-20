@@ -196,8 +196,17 @@ ai-conversation-search tree SESSION_ID [--json]
 
 # A unique prefix works too
 ai-conversation-search tree 1c538017
+
+# Just what the human said, bodies included
+ai-conversation-search tree 1c538017 --json --role user --no-tools --flat --content
 ```
 An ambiguous prefix is reported as an error rather than resolved to one of the matches.
+
+A session id that is not in the index yet is indexed on the spot and retried, so a
+conversation that just ended is readable without running `index` first.
+
+`--role`, `--no-tools` and `--flat` narrow the tree; `--content` adds message bodies, which
+are omitted by default so a long session does not serialise to hundreds of KB.
 
 ### `ai-conversation-search prune-observer`
 Remove claude-mem observer sessions indexed by earlier versions

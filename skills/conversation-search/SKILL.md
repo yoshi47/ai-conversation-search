@@ -14,6 +14,7 @@ Find past conversations across Claude Code, OpenCode, and Codex CLI and get the 
 
 ```
 - Ensure ai-conversation-search tool is installed and upgraded
+- Check for a session ID in the prompt (Level 0: read it directly, skip the rest)
 - Classify query type (temporal/topic/hybrid)
 - Execute Level 1: focused search with ai-conversation-search
 - Execute Level 2: broader search if Level 1 fails
@@ -25,7 +26,10 @@ Find past conversations across Claude Code, OpenCode, and Codex CLI and get the 
 - DO NOT use grep, find, cat, or any manual file operations on .jsonl files
 - DO NOT skip the todo creation step
 - DO NOT jump to Level 3 without attempting Levels 1 and 2
-- ONLY use ai-conversation-search commands for all search operations
+- ONLY use ai-conversation-search commands to *locate and read* conversations
+- Piping this tool's own `--json` output through `jq` is fine and expected — but reach for
+  the built-in flags first (`--role`, `--no-tools`, `--flat`, `--content-chars`), which
+  cover the common filters and return far less text
 
 Mark each todo as `in_progress` when starting it, `completed` when done.
 
@@ -73,10 +77,13 @@ ai-conversation-search --version
 If the command is not found, the plugin may not be properly installed.
 Guide the user: reinstall the plugin or visit https://github.com/yoshi47/ai-conversation-search
 
-**The reported version must be 0.15.0 or newer.** Below that, `--json` returns a bare
-array instead of the `{"results": [...]}` envelope this skill assumes, so `.results[]`
-yields nothing and every search looks like "no matches" — a wrong answer, not an error.
-Stop and tell the user to upgrade rather than reporting an empty result.
+**The reported version must be 0.16.0 or newer.** Two things break below it. Before 0.15.0,
+`--json` returns a bare array instead of the `{"results": [...]}` envelope this skill
+assumes, so `.results[]` yields nothing and every search looks like "no matches" — a wrong
+answer, not an error. Before 0.16.0, the `tree` flags used throughout this skill
+(`--role`, `--no-tools`, `--flat`, `--content`) are rejected, and `tree` will not
+auto-index a session that just ended. Stop and tell the user to upgrade rather than
+reporting an empty result.
 
 Do not rely on a command being *rejected* to notice a stale binary: the envelope change
 rejects nothing. Check `command -v ai-conversation-search` — a manually installed binary
@@ -115,11 +122,30 @@ User asks about TOPIC + TIME:
 
 **Action:** Use `search "topic"` with date filters
 
-## Three-Level Search Workflow
+## Search Workflow
 
-**Execute in order. Do not skip levels.**
+**Check Level 0 first. If it does not apply, execute Levels 1-3 in order without skipping.**
 
-### Level 1: Focused Search (ALWAYS START HERE)
+### Level 0: A Session ID Was Given (SKIP THE SEARCH ENTIRELY)
+
+If the prompt contains a session UUID — or any prefix of one of 8+ characters — you already
+know which conversation to read. Searching for it is pointless; go straight to the
+transcript:
+
+```bash
+ai-conversation-search tree <SESSION_ID> --json --role user --no-tools --flat --content --content-chars 500
+```
+
+That returns just the human's messages, in order, with bodies. Drop `--role user` to see
+the assistant's replies too, and raise `--content-chars` when you need full text.
+
+**A session that just ended is fine.** `tree` indexes the transcript on the spot when the
+id is not in the index yet, so there is no need to run `index` first — and no reason to
+conclude the session does not exist from a single `not found`.
+
+Go to Level 4 with what you find.
+
+### Level 1: Focused Search (START HERE WHEN NO SESSION ID WAS GIVEN)
 
 Based on query classification:
 
@@ -157,7 +183,7 @@ For temporal queries:
 
 1. List conversations: `ai-conversation-search list --days 30 --json`
 2. Review conversation summaries in JSON
-3. For promising sessions: `ai-conversation-search tree <SESSION_ID> --json`
+3. For promising sessions: `ai-conversation-search tree <SESSION_ID> --json --no-tools --flat`
 4. Read message summaries to locate content
 
 ### Level 4: Present Results
@@ -189,7 +215,7 @@ For counting/analysis queries:
 - Count matches
 - Present clear answer with evidence
 
-**If not found after all 3 levels:**
+**If not found after Levels 1-3:**
 - "No matching conversations found after exhaustive search"
 - Suggest: `ai-conversation-search index --days 90` to reindex older history
 - "The conversation may not exist or may be older than indexed range"
@@ -275,7 +301,37 @@ ai-conversation-search tree 1c538017 --json
 ```
 
 `tree` reports an error instead of guessing when a prefix matches more than one
-session; pass more characters to disambiguate.
+session; pass more characters to disambiguate. When the id resolves to nothing, `tree`
+indexes that session's transcript and retries once, so a conversation that ended moments
+ago is readable without running `index`.
+
+**`tree` options** — use these instead of post-processing the tree yourself:
+
+| Flag | Effect |
+|---|---|
+| `--role user` / `--role assistant` | Keep only that side of the conversation |
+| `--no-tools` | Drop `[Tool: X]` / `[Tool result]` / interrupt nodes |
+| `--flat` | Return a flat list instead of nested `children` |
+| `--content` | Include message bodies (omitted by default) |
+| `--content-chars N` | Cap each body at N characters (default 300) |
+
+Read what the human actually said in one command:
+
+```bash
+ai-conversation-search tree <SESSION_ID> --json --role user --no-tools --flat --content --content-chars 500
+```
+
+Filtering keeps `total_messages` at the session total and adds `returned_messages` for the
+count you got back. If a filter matches nothing, `.warning` says so — that is not the same
+as an empty conversation.
+
+Bodies are opt-in on purpose: a long session serialises to hundreds of KB, which is worth
+avoiding unless you need the text. Nodes carry `full_content_truncated` so you can tell a
+capped body from a complete one.
+
+Agent completion notices appear as user messages prefixed `[Task notification] `. They are
+often worth reading — that is where a subagent's findings live — but the prefix lets you
+skip them when you only want what the human typed.
 
 **Always use `--json` for structured output.**
 
