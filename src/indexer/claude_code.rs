@@ -180,6 +180,38 @@ struct SessionsIndexEntry {
 
 /// Count conversation files on disk without needing a DB connection.
 /// Used by `status` command and unindexed file warnings.
+/// Pick the transcript belonging to `session_id` out of an already-scanned path list.
+///
+/// Takes the paths rather than discovering them so it stays a pure function: the real
+/// discovery reads `$HOME`, which a test cannot supply without mutating process-wide state
+/// (the same reason `scan_project_dirs` was split out of `scan_conversations`).
+///
+/// A prefix is honoured only when exactly one file matches. Resolving an ambiguous prefix
+/// to one of its candidates would hand the caller a session the user never asked for.
+pub(crate) fn find_session_transcript(paths: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+    let mut prefix_match: Option<&PathBuf> = None;
+    let mut prefix_count = 0usize;
+
+    for path in paths {
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if stem == session_id {
+            return Some(path.clone());
+        }
+        if stem.starts_with(session_id) {
+            prefix_count += 1;
+            prefix_match = Some(path);
+        }
+    }
+
+    if prefix_count == 1 {
+        prefix_match.cloned()
+    } else {
+        None
+    }
+}
+
 pub fn count_conversation_files_on_disk() -> usize {
     let projects_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("projects"),
@@ -484,7 +516,7 @@ impl ConversationIndexer {
     /// Discover all Claude project directories to scan.
     /// Auto-discovers ~/.claude/projects and ~/.claude-*/projects,
     /// plus any directories specified in CONVERSATION_SEARCH_EXTRA_DIRS (colon-separated).
-    fn discover_project_dirs(&self) -> Vec<PathBuf> {
+    pub(crate) fn discover_project_dirs(&self) -> Vec<PathBuf> {
         let home = match dirs::home_dir() {
             Some(h) => h,
             None => {
@@ -567,7 +599,7 @@ impl ConversationIndexer {
     /// Split out from `scan_conversations` so the skip rules can be tested against a temp
     /// directory. `discover_project_dirs` reads `$HOME`, which a test cannot supply without
     /// mutating process-wide state.
-    fn scan_project_dirs(
+    pub(crate) fn scan_project_dirs(
         &mut self,
         project_dirs: &[PathBuf],
         days_back: Option<i64>,
@@ -3130,5 +3162,81 @@ mod tests {
         indexer.set_force(true);
         indexer.index_conversation(&file).unwrap();
         assert_eq!(count_messages(&indexer), 1);
+    }
+}
+
+#[cfg(test)]
+mod find_session_transcript_tests {
+    use super::find_session_transcript;
+    use std::path::PathBuf;
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|n| PathBuf::from(format!("/projects/some-project/{}.jsonl", n)))
+            .collect()
+    }
+
+    #[test]
+    fn resolves_an_exact_session_id() {
+        let files = paths(&[
+            "deadbeef-1111-2222-3333-444444444444",
+            "cafebabe-1111-2222-3333-444444444444",
+        ]);
+        let found = find_session_transcript(&files, "deadbeef-1111-2222-3333-444444444444");
+        assert_eq!(
+            found,
+            Some(PathBuf::from(
+                "/projects/some-project/deadbeef-1111-2222-3333-444444444444.jsonl"
+            ))
+        );
+    }
+
+    #[test]
+    fn resolves_a_unique_prefix() {
+        let files = paths(&[
+            "deadbeef-1111-2222-3333-444444444444",
+            "cafebabe-1111-2222-3333-444444444444",
+        ]);
+        let found = find_session_transcript(&files, "deadbeef");
+        assert_eq!(
+            found,
+            Some(PathBuf::from(
+                "/projects/some-project/deadbeef-1111-2222-3333-444444444444.jsonl"
+            ))
+        );
+    }
+
+    #[test]
+    fn refuses_an_ambiguous_prefix() {
+        // Indexing a guess is worse than reporting nothing: the caller would then show the
+        // user a tree belonging to a session they did not ask for.
+        let files = paths(&[
+            "deadbeef-1111-2222-3333-444444444444",
+            "deadbeef-5555-6666-7777-888888888888",
+        ]);
+        assert_eq!(find_session_transcript(&files, "deadbeef"), None);
+    }
+
+    #[test]
+    fn returns_none_when_nothing_matches() {
+        let files = paths(&["deadbeef-1111-2222-3333-444444444444"]);
+        assert_eq!(find_session_transcript(&files, "0badcafe"), None);
+    }
+
+    #[test]
+    fn prefers_an_exact_match_over_a_longer_sibling() {
+        // A full id that is also a prefix of another file must not read as ambiguous.
+        let files = paths(&[
+            "deadbeef-1111-2222-3333-444444444444",
+            "deadbeef-1111-2222-3333-444444444444-resumed",
+        ]);
+        let found = find_session_transcript(&files, "deadbeef-1111-2222-3333-444444444444");
+        assert_eq!(
+            found,
+            Some(PathBuf::from(
+                "/projects/some-project/deadbeef-1111-2222-3333-444444444444.jsonl"
+            ))
+        );
     }
 }
