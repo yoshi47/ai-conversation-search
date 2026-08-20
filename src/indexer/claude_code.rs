@@ -147,6 +147,16 @@ struct JsonlEntry {
     leaf_uuid: Option<String>,
     #[serde(rename = "customTitle")]
     custom_title: Option<String>,
+    origin: Option<EntryOrigin>,
+}
+
+/// Claude Code's own classification of where a `user` entry came from.
+///
+/// Agent completion notices arrive as ordinary `type: "user"` entries; this is the only
+/// first-party signal distinguishing them from something the human typed.
+#[derive(Debug, Deserialize)]
+struct EntryOrigin {
+    kind: Option<String>,
 }
 
 /// Content block types in assistant messages.
@@ -878,8 +888,25 @@ impl ConversationIndexer {
                 _ => String::new(),
             };
 
-            // Capture first user message for summary fallback
-            if first_user_message.is_none() && message_type == "user" && !msg_content.is_empty() {
+            // Tag rather than suppress: the body carries the agent's actual result, often
+            // the most useful thing in the session. Keyed on Claude Code's own `origin`
+            // field, so this never has to sniff the body for a marker string.
+            let is_task_notification =
+                entry.origin.as_ref().and_then(|o| o.kind.as_deref()) == Some("task-notification");
+            let msg_content = if is_task_notification && !msg_content.is_empty() {
+                format!("[Task notification] {}", msg_content)
+            } else {
+                msg_content
+            };
+
+            // Capture first user message for summary fallback. Notifications are excluded:
+            // their first 100 characters are `<task-notification>` envelope boilerplate,
+            // which would make the conversation summary useless in `list` and `search`.
+            if first_user_message.is_none()
+                && message_type == "user"
+                && !is_task_notification
+                && !msg_content.is_empty()
+            {
                 first_user_message = Some(msg_content.chars().take(100).collect());
             }
 
@@ -3162,6 +3189,55 @@ mod tests {
         indexer.set_force(true);
         indexer.index_conversation(&file).unwrap();
         assert_eq!(count_messages(&indexer), 1);
+    }
+}
+
+#[cfg(test)]
+mod task_notification_tests {
+    use super::ConversationIndexer;
+    use std::io::Write;
+
+    const NOTIFY_JSONL: &[&str] = &[
+        r#"{"uuid":"n1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"tn1","cwd":"/tmp/p","promptSource":"system","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<summary>Agent finished</summary>\n<result>the review found nothing</result>\n</task-notification>"}}"#,
+        r#"{"uuid":"n2","parentUuid":"n1","isSidechain":false,"timestamp":"2026-01-15T10:01:00Z","type":"user","cwd":"/tmp/p","sessionId":"tn1","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"good, ship it"}}"#,
+    ];
+
+    fn parse(lines: &[&str]) -> (Option<super::ConversationMeta>, Vec<super::Message>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tn1.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        for line in lines {
+            writeln!(f, "{}", line).unwrap();
+        }
+        f.flush().unwrap();
+        let (meta, messages, _) = ConversationIndexer::parse_conversation_file_raw(&path).unwrap();
+        (meta, messages)
+    }
+
+    #[test]
+    fn tags_agent_notifications_and_leaves_typed_messages_alone() {
+        let (_, messages) = parse(NOTIFY_JSONL);
+        assert_eq!(messages.len(), 2);
+        assert!(
+            messages[0].content.starts_with("[Task notification] "),
+            "got: {}",
+            messages[0].content
+        );
+        // The body survives the tagging -- the point is to label it, not to suppress it.
+        assert!(messages[0].content.contains("the review found nothing"));
+        assert_eq!(messages[1].content, "good, ship it");
+    }
+
+    #[test]
+    fn a_leading_notification_does_not_become_the_conversation_summary() {
+        // Otherwise `list` and `search` would show `<task-notification>` envelope XML as
+        // the title of every session that opened with an agent completing.
+        let (meta, _) = parse(NOTIFY_JSONL);
+        let summary = meta
+            .and_then(|m| m.first_user_message)
+            .expect("a summary fallback should still be captured");
+        assert_eq!(summary, "good, ship it");
+        assert!(!summary.contains("task-notification"));
     }
 }
 
