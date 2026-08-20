@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.16.1] - 2026-08-20
+
+0.16.0 のリリースノートと `REFERENCE.md` に載せた遡及手順が誤っていたため、その訂正のみ。コードに変更はない。
+
+### Fixed
+
+- **「`index --all --force` で `[Task notification]` を既存インデックスに遡及できる」という記述を訂正した**。実際には遡及しない。`--force` が外すのは `claude_code_sync_state` の mtime によるファイル単位のスキップだけで、その先の `do_index_conversation` には「インデックス済みセッションでは未登録 UUID のメッセージしか INSERT しない」という second-level のスキップがある。本文の導出ロジックを変えても既存行は書き換わらない。正しい遡及手順（SQL の直接適用）を `REFERENCE.md` と 0.16.0 の Migration 節に載せた
+
+  ドキュメントのみの変更だが patch を上げているのは、`REFERENCE.md` がプラグインの同梱物で、`claude plugin update` がバージョン番号でしか更新を判定しないため。番号を上げないと訂正が誰にも届かない
+
 ## [0.16.0] - 2026-08-20
 
 セッション UUID を直接渡されたときの摩擦への対応。直前に終わったセッションが引けない点と、`tree` に絞り込みが一切なく利用側が jq を書く羽目になっていた点が主。
