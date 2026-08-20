@@ -33,7 +33,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Migration
 
-- **既存インデックスへの `[Task notification]` の遡及には `index --all --force` が要る**。mtime スキップにより、変更のない transcript は再パースされないため
+- **既存インデックスには `[Task notification]` が付かない。再インデックスでも遡及しない**。`--force` が外すのは mtime スキップだけで、既にインデックス済みのセッションでは未登録 UUID のメッセージしか挿入されないため（`src/indexer/claude_code.rs` の `do_index_conversation`）。本文の導出ロジックを変えても既存行は書き換わらない。遡及したい場合は SQL を直接当てる（`messages_au` トリガが FTS を同期するので索引は保たれる）:
+
+  ```sql
+  UPDATE messages SET full_content = '[Task notification] ' || full_content
+  WHERE message_type = 'user' AND full_content LIKE '<task-notification>%';
+  ```
 - **0.16.0 より前に `setup-hooks` を実行していてプラグインも導入している場合、`settings.json` 側の `ai-conversation-search hook` を削除してよい**。`setup-hooks` の冪等性チェックは `settings.json` しか見ないためプラグイン側のフックを検出できず、警告も出ないまま Stop が 2 回発火する。WAL なので破損はしないが索引プロセスが二重に走る
 - スキルの最低バージョン要件が 0.16.0 に上がった
 

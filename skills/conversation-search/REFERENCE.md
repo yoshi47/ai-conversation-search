@@ -285,8 +285,17 @@ repointed at the nearest surviving ancestor, so `depth` may exceed the nesting y
 
 **Agent notifications:** subagent completion notices are indexed as user messages prefixed
 `[Task notification] `. They are tagged rather than suppressed because the body carries the
-agent's actual result. Transcripts indexed before 0.16.0 keep the untagged form until
-`index --all --force` re-reads them.
+agent's actual result.
+
+Messages indexed before 0.16.0 keep the untagged form permanently — re-indexing does not
+backfill them. `--force` only bypasses the file-level mtime skip; for a session already in
+the index, only messages whose UUID is not yet stored get inserted, so a change to how
+content is derived never reaches existing rows. Backfill with SQL if you need it:
+
+```sql
+UPDATE messages SET full_content = '[Task notification] ' || full_content
+WHERE message_type = 'user' AND full_content LIKE '<task-notification>%';
+```
 
 **Exit status:** `1` when no tree came back — the session id could not be resolved (not
 found, or an ambiguous prefix), *or* it resolved but its transcript could not be read. The
