@@ -13,6 +13,9 @@ WRAPPER="$SCRIPT_DIR/bin/ai-conversation-search"
 # pair. ACS_TEST_BINARY overrides it, which is the only way to exercise a build whose
 # version has not been published yet -- flags added this cycle do not exist in the cache.
 BINARY="${ACS_TEST_BINARY:-${HOME}/.conversation-search/bin/ai-conversation-search-$(grep '^ACS_WRAPPER_VERSION=' "$WRAPPER" | cut -d'"' -f2)}"
+# The wrapper resolves its own binary; without this it would try to download the released
+# build for its version, which does not exist while that version is still in development.
+export ACS_BINARY="$BINARY"
 
 PASS=0
 FAIL=0
@@ -169,7 +172,10 @@ LINES=$(jq -r '.results[] |
   ((.conversation_summary // "[no summary]") | gsub("[\\n\\r]"; " ") | .[0:60])
 ' "$TMPFILE")
 
-if [ -n "$LINES" ]; then
+if [ "$COUNT" -eq 0 ]; then
+    # Honours the promise made at the empty-index skip above: this needs a real row.
+    echo "  SKIP: jq transformation (empty index)"
+elif [ -n "$LINES" ]; then
     pass "jq transformation produces output"
 else
     fail "jq transformation produces output"
@@ -311,9 +317,8 @@ else
     fail "preview shows time range"
 fi
 
-# The message list, which the header assertions above never covered. As of 0.16.0 the
-# filtering and truncation live in the CLI, so this checks the flags the preview relies on
-# actually produce bodies -- `tree` alone no longer emits any.
+# The message list, which the header assertions above never covered. Checks that the flags
+# the preview depends on actually produce bodies -- `tree` alone emits none.
 MSG_OUTPUT=$("$BINARY" tree "$FIRST_SESSION" --json --no-tools --flat --content --content-chars 150 2>/dev/null | jq -r '
   .tree | .[-12:] | .[]
   | (if .message_type == "user" then "👤 " else "🤖 " end)
@@ -332,10 +337,14 @@ else
     pass "preview drops tool nodes"
 fi
 
-if [ -z "$(echo "$MSG_OUTPUT" | awk 'length > 200')" ]; then
+# Character count, not bytes: awk's length() counts bytes in this locale, so a Japanese
+# body capped at 150 characters is ~450 bytes and would read as untruncated.
+LONGEST=$("$BINARY" tree "$FIRST_SESSION" --json --no-tools --flat --content --content-chars 150 2>/dev/null \
+    | jq '[.tree[].full_content | length] | max // 0')
+if [ "$LONGEST" -le 150 ]; then
     pass "preview truncates long bodies"
 else
-    fail "preview truncates long bodies"
+    fail "preview truncates long bodies" "Longest body was $LONGEST characters"
 fi
 
 # Bodies must be opt-in: the default shape is what keeps a long session out of an agent's

@@ -152,8 +152,8 @@ struct JsonlEntry {
 
 /// Claude Code's own classification of where a `user` entry came from.
 ///
-/// Agent completion notices arrive as ordinary `type: "user"` entries; this is the only
-/// first-party signal distinguishing them from something the human typed.
+/// Agent completion notices arrive as ordinary `type: "user"` entries. Keyed on this rather
+/// than the sibling `promptSource` field, which is absent on some notification entries.
 #[derive(Debug, Deserialize)]
 struct EntryOrigin {
     kind: Option<String>,
@@ -188,8 +188,17 @@ struct SessionsIndexEntry {
     project_path: Option<String>,
 }
 
-/// Count conversation files on disk without needing a DB connection.
-/// Used by `status` command and unindexed file warnings.
+/// Outcome of matching a session id against a list of transcript paths.
+///
+/// Ambiguity is a distinct variant rather than a `None`: an id one character short of
+/// unique is something the caller can tell the user to fix, and collapsing it into
+/// "not found" sends them looking for a session that is right there on disk.
+pub(crate) enum TranscriptLookup {
+    Found(PathBuf),
+    NotFound,
+    Ambiguous(usize),
+}
+
 /// Pick the transcript belonging to `session_id` out of an already-scanned path list.
 ///
 /// Takes the paths rather than discovering them so it stays a pure function: the real
@@ -198,7 +207,7 @@ struct SessionsIndexEntry {
 ///
 /// A prefix is honoured only when exactly one file matches. Resolving an ambiguous prefix
 /// to one of its candidates would hand the caller a session the user never asked for.
-pub(crate) fn find_session_transcript(paths: &[PathBuf], session_id: &str) -> Option<PathBuf> {
+pub(crate) fn find_session_transcript(paths: &[PathBuf], session_id: &str) -> TranscriptLookup {
     let mut prefix_match: Option<&PathBuf> = None;
     let mut prefix_count = 0usize;
 
@@ -207,7 +216,7 @@ pub(crate) fn find_session_transcript(paths: &[PathBuf], session_id: &str) -> Op
             continue;
         };
         if stem == session_id {
-            return Some(path.clone());
+            return TranscriptLookup::Found(path.clone());
         }
         if stem.starts_with(session_id) {
             prefix_count += 1;
@@ -215,13 +224,15 @@ pub(crate) fn find_session_transcript(paths: &[PathBuf], session_id: &str) -> Op
         }
     }
 
-    if prefix_count == 1 {
-        prefix_match.cloned()
-    } else {
-        None
+    match (prefix_count, prefix_match) {
+        (1, Some(path)) => TranscriptLookup::Found(path.clone()),
+        (0, _) => TranscriptLookup::NotFound,
+        (n, _) => TranscriptLookup::Ambiguous(n),
     }
 }
 
+/// Count conversation files on disk without needing a DB connection.
+/// Used by `status` command and unindexed file warnings.
 pub fn count_conversation_files_on_disk() -> usize {
     let projects_dir = match dirs::home_dir() {
         Some(h) => h.join(".claude").join("projects"),
@@ -3198,7 +3209,7 @@ mod task_notification_tests {
     use std::io::Write;
 
     const NOTIFY_JSONL: &[&str] = &[
-        r#"{"uuid":"n1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"tn1","cwd":"/tmp/p","promptSource":"system","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<summary>Agent finished</summary>\n<result>the review found nothing</result>\n</task-notification>"}}"#,
+        r#"{"uuid":"n1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"tn1","cwd":"/tmp/p","promptSource":"system","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<task-id>a514c921992797f51</task-id>\n<tool-use-id>toolu_01HAdF76aiLv559jhXdH43Xj</tool-use-id>\n<summary>Agent finished</summary>\n<result>the review found nothing</result>\n</task-notification>"}}"#,
         r#"{"uuid":"n2","parentUuid":"n1","isSidechain":false,"timestamp":"2026-01-15T10:01:00Z","type":"user","cwd":"/tmp/p","sessionId":"tn1","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"good, ship it"}}"#,
     ];
 
@@ -3228,6 +3239,16 @@ mod task_notification_tests {
         assert_eq!(messages[1].content, "good, ship it");
     }
 
+    /// Consequence of the exclusion above, made explicit: a session whose every user entry
+    /// is a notification has no summary at all. `[no summary]` in `list` is a worse title
+    /// than a real one but a better one than `<task-notification><task-id>...`.
+    #[test]
+    fn a_notification_only_session_falls_back_to_no_summary() {
+        let (meta, messages) = parse(&NOTIFY_JSONL[..1]);
+        assert_eq!(messages.len(), 1);
+        assert!(meta.and_then(|m| m.first_user_message).is_none());
+    }
+
     #[test]
     fn a_leading_notification_does_not_become_the_conversation_summary() {
         // Otherwise `list` and `search` would show `<task-notification>` envelope XML as
@@ -3243,8 +3264,15 @@ mod task_notification_tests {
 
 #[cfg(test)]
 mod find_session_transcript_tests {
-    use super::find_session_transcript;
+    use super::{find_session_transcript, TranscriptLookup};
     use std::path::PathBuf;
+
+    fn found(files: &[PathBuf], id: &str) -> Option<PathBuf> {
+        match find_session_transcript(files, id) {
+            TranscriptLookup::Found(path) => Some(path),
+            _ => None,
+        }
+    }
 
     fn paths(names: &[&str]) -> Vec<PathBuf> {
         names
@@ -3259,7 +3287,7 @@ mod find_session_transcript_tests {
             "deadbeef-1111-2222-3333-444444444444",
             "cafebabe-1111-2222-3333-444444444444",
         ]);
-        let found = find_session_transcript(&files, "deadbeef-1111-2222-3333-444444444444");
+        let found = found(&files, "deadbeef-1111-2222-3333-444444444444");
         assert_eq!(
             found,
             Some(PathBuf::from(
@@ -3274,7 +3302,7 @@ mod find_session_transcript_tests {
             "deadbeef-1111-2222-3333-444444444444",
             "cafebabe-1111-2222-3333-444444444444",
         ]);
-        let found = find_session_transcript(&files, "deadbeef");
+        let found = found(&files, "deadbeef");
         assert_eq!(
             found,
             Some(PathBuf::from(
@@ -3291,13 +3319,19 @@ mod find_session_transcript_tests {
             "deadbeef-1111-2222-3333-444444444444",
             "deadbeef-5555-6666-7777-888888888888",
         ]);
-        assert_eq!(find_session_transcript(&files, "deadbeef"), None);
+        assert!(matches!(
+            find_session_transcript(&files, "deadbeef"),
+            TranscriptLookup::Ambiguous(2)
+        ));
     }
 
     #[test]
     fn returns_none_when_nothing_matches() {
         let files = paths(&["deadbeef-1111-2222-3333-444444444444"]);
-        assert_eq!(find_session_transcript(&files, "0badcafe"), None);
+        assert!(matches!(
+            find_session_transcript(&files, "0badcafe"),
+            TranscriptLookup::NotFound
+        ));
     }
 
     #[test]
@@ -3307,7 +3341,7 @@ mod find_session_transcript_tests {
             "deadbeef-1111-2222-3333-444444444444",
             "deadbeef-1111-2222-3333-444444444444-resumed",
         ]);
-        let found = find_session_transcript(&files, "deadbeef-1111-2222-3333-444444444444");
+        let found = found(&files, "deadbeef-1111-2222-3333-444444444444");
         assert_eq!(
             found,
             Some(PathBuf::from(

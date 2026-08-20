@@ -1,0 +1,235 @@
+diff --git a/src/indexer/claude_code.rs b/src/indexer/claude_code.rs
+index 37bd51f..fb2c0d5 100644
+--- a/src/indexer/claude_code.rs
++++ b/src/indexer/claude_code.rs
+@@ -147,6 +147,16 @@ struct JsonlEntry {
+     leaf_uuid: Option<String>,
+     #[serde(rename = "customTitle")]
+     custom_title: Option<String>,
++    origin: Option<EntryOrigin>,
++}
++
++/// Claude Code's own classification of where a `user` entry came from.
++///
++/// Agent completion notices arrive as ordinary `type: "user"` entries; this is the only
++/// first-party signal distinguishing them from something the human typed.
++#[derive(Debug, Deserialize)]
++struct EntryOrigin {
++    kind: Option<String>,
+ }
+ 
+ /// Content block types in assistant messages.
+@@ -180,6 +190,38 @@ struct SessionsIndexEntry {
+ 
+ /// Count conversation files on disk without needing a DB connection.
+ /// Used by `status` command and unindexed file warnings.
++/// Pick the transcript belonging to `session_id` out of an already-scanned path list.
++///
++/// Takes the paths rather than discovering them so it stays a pure function: the real
++/// discovery reads `$HOME`, which a test cannot supply without mutating process-wide state
++/// (the same reason `scan_project_dirs` was split out of `scan_conversations`).
++///
++/// A prefix is honoured only when exactly one file matches. Resolving an ambiguous prefix
++/// to one of its candidates would hand the caller a session the user never asked for.
++pub(crate) fn find_session_transcript(paths: &[PathBuf], session_id: &str) -> Option<PathBuf> {
++    let mut prefix_match: Option<&PathBuf> = None;
++    let mut prefix_count = 0usize;
++
++    for path in paths {
++        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
++            continue;
++        };
++        if stem == session_id {
++            return Some(path.clone());
++        }
++        if stem.starts_with(session_id) {
++            prefix_count += 1;
++            prefix_match = Some(path);
++        }
++    }
++
++    if prefix_count == 1 {
++        prefix_match.cloned()
++    } else {
++        None
++    }
++}
++
+ pub fn count_conversation_files_on_disk() -> usize {
+     let projects_dir = match dirs::home_dir() {
+         Some(h) => h.join(".claude").join("projects"),
+@@ -484,7 +526,7 @@ impl ConversationIndexer {
+     /// Discover all Claude project directories to scan.
+     /// Auto-discovers ~/.claude/projects and ~/.claude-*/projects,
+     /// plus any directories specified in CONVERSATION_SEARCH_EXTRA_DIRS (colon-separated).
+-    fn discover_project_dirs(&self) -> Vec<PathBuf> {
++    pub(crate) fn discover_project_dirs(&self) -> Vec<PathBuf> {
+         let home = match dirs::home_dir() {
+             Some(h) => h,
+             None => {
+@@ -567,7 +609,7 @@ impl ConversationIndexer {
+     /// Split out from `scan_conversations` so the skip rules can be tested against a temp
+     /// directory. `discover_project_dirs` reads `$HOME`, which a test cannot supply without
+     /// mutating process-wide state.
+-    fn scan_project_dirs(
++    pub(crate) fn scan_project_dirs(
+         &mut self,
+         project_dirs: &[PathBuf],
+         days_back: Option<i64>,
+@@ -846,8 +888,25 @@ impl ConversationIndexer {
+                 _ => String::new(),
+             };
+ 
+-            // Capture first user message for summary fallback
+-            if first_user_message.is_none() && message_type == "user" && !msg_content.is_empty() {
++            // Tag rather than suppress: the body carries the agent's actual result, often
++            // the most useful thing in the session. Keyed on Claude Code's own `origin`
++            // field, so this never has to sniff the body for a marker string.
++            let is_task_notification =
++                entry.origin.as_ref().and_then(|o| o.kind.as_deref()) == Some("task-notification");
++            let msg_content = if is_task_notification && !msg_content.is_empty() {
++                format!("[Task notification] {}", msg_content)
++            } else {
++                msg_content
++            };
++
++            // Capture first user message for summary fallback. Notifications are excluded:
++            // their first 100 characters are `<task-notification>` envelope boilerplate,
++            // which would make the conversation summary useless in `list` and `search`.
++            if first_user_message.is_none()
++                && message_type == "user"
++                && !is_task_notification
++                && !msg_content.is_empty()
++            {
+                 first_user_message = Some(msg_content.chars().take(100).collect());
+             }
+ 
+@@ -3132,3 +3191,128 @@ mod tests {
+         assert_eq!(count_messages(&indexer), 1);
+     }
+ }
++
++#[cfg(test)]
++mod task_notification_tests {
++    use super::ConversationIndexer;
++    use std::io::Write;
++
++    const NOTIFY_JSONL: &[&str] = &[
++        r#"{"uuid":"n1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"tn1","cwd":"/tmp/p","promptSource":"system","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<summary>Agent finished</summary>\n<result>the review found nothing</result>\n</task-notification>"}}"#,
++        r#"{"uuid":"n2","parentUuid":"n1","isSidechain":false,"timestamp":"2026-01-15T10:01:00Z","type":"user","cwd":"/tmp/p","sessionId":"tn1","promptSource":"typed","origin":{"kind":"human"},"message":{"role":"user","content":"good, ship it"}}"#,
++    ];
++
++    fn parse(lines: &[&str]) -> (Option<super::ConversationMeta>, Vec<super::Message>) {
++        let dir = tempfile::tempdir().unwrap();
++        let path = dir.path().join("tn1.jsonl");
++        let mut f = std::fs::File::create(&path).unwrap();
++        for line in lines {
++            writeln!(f, "{}", line).unwrap();
++        }
++        f.flush().unwrap();
++        let (meta, messages, _) = ConversationIndexer::parse_conversation_file_raw(&path).unwrap();
++        (meta, messages)
++    }
++
++    #[test]
++    fn tags_agent_notifications_and_leaves_typed_messages_alone() {
++        let (_, messages) = parse(NOTIFY_JSONL);
++        assert_eq!(messages.len(), 2);
++        assert!(
++            messages[0].content.starts_with("[Task notification] "),
++            "got: {}",
++            messages[0].content
++        );
++        // The body survives the tagging -- the point is to label it, not to suppress it.
++        assert!(messages[0].content.contains("the review found nothing"));
++        assert_eq!(messages[1].content, "good, ship it");
++    }
++
++    #[test]
++    fn a_leading_notification_does_not_become_the_conversation_summary() {
++        // Otherwise `list` and `search` would show `<task-notification>` envelope XML as
++        // the title of every session that opened with an agent completing.
++        let (meta, _) = parse(NOTIFY_JSONL);
++        let summary = meta
++            .and_then(|m| m.first_user_message)
++            .expect("a summary fallback should still be captured");
++        assert_eq!(summary, "good, ship it");
++        assert!(!summary.contains("task-notification"));
++    }
++}
++
++#[cfg(test)]
++mod find_session_transcript_tests {
++    use super::find_session_transcript;
++    use std::path::PathBuf;
++
++    fn paths(names: &[&str]) -> Vec<PathBuf> {
++        names
++            .iter()
++            .map(|n| PathBuf::from(format!("/projects/some-project/{}.jsonl", n)))
++            .collect()
++    }
++
++    #[test]
++    fn resolves_an_exact_session_id() {
++        let files = paths(&[
++            "deadbeef-1111-2222-3333-444444444444",
++            "cafebabe-1111-2222-3333-444444444444",
++        ]);
++        let found = find_session_transcript(&files, "deadbeef-1111-2222-3333-444444444444");
++        assert_eq!(
++            found,
++            Some(PathBuf::from(
++                "/projects/some-project/deadbeef-1111-2222-3333-444444444444.jsonl"
++            ))
++        );
++    }
++
++    #[test]
++    fn resolves_a_unique_prefix() {
++        let files = paths(&[
++            "deadbeef-1111-2222-3333-444444444444",
++            "cafebabe-1111-2222-3333-444444444444",
++        ]);
++        let found = find_session_transcript(&files, "deadbeef");
++        assert_eq!(
++            found,
++            Some(PathBuf::from(
++                "/projects/some-project/deadbeef-1111-2222-3333-444444444444.jsonl"
++            ))
++        );
++    }
++
++    #[test]
++    fn refuses_an_ambiguous_prefix() {
++        // Indexing a guess is worse than reporting nothing: the caller would then show the
++        // user a tree belonging to a session they did not ask for.
++        let files = paths(&[
++            "deadbeef-1111-2222-3333-444444444444",
++            "deadbeef-5555-6666-7777-888888888888",
++        ]);
++        assert_eq!(find_session_transcript(&files, "deadbeef"), None);
++    }
++
++    #[test]
++    fn returns_none_when_nothing_matches() {
++        let files = paths(&["deadbeef-1111-2222-3333-444444444444"]);
++        assert_eq!(find_session_transcript(&files, "0badcafe"), None);
++    }
++
++    #[test]
++    fn prefers_an_exact_match_over_a_longer_sibling() {
++        // A full id that is also a prefix of another file must not read as ambiguous.
++        let files = paths(&[
++            "deadbeef-1111-2222-3333-444444444444",
++            "deadbeef-1111-2222-3333-444444444444-resumed",
++        ]);
++        let found = find_session_transcript(&files, "deadbeef-1111-2222-3333-444444444444");
++        assert_eq!(
++            found,
++            Some(PathBuf::from(
++                "/projects/some-project/deadbeef-1111-2222-3333-444444444444.jsonl"
++            ))
++        );
++    }
++}

@@ -310,8 +310,8 @@ ago is readable without running `index`.
 | Flag | Effect |
 |---|---|
 | `--role user` / `--role assistant` | Keep only that side of the conversation |
-| `--no-tools` | Drop `[Tool: X]` / `[Tool result]` / interrupt nodes |
-| `--flat` | Return a flat list instead of nested `children` |
+| `--no-tools` | Drop `[Tool: X]` / `[Tool result]` / interrupt nodes, and empty bodies |
+| `--flat` | Return a flat list instead of nested `children`, in timestamp order |
 | `--content` | Include message bodies (omitted by default) |
 | `--content-chars N` | Cap each body at N characters (default 300) |
 

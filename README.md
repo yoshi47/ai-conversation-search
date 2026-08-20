@@ -203,7 +203,8 @@ ai-conversation-search tree 1c538017 --json --role user --no-tools --flat --cont
 An ambiguous prefix is reported as an error rather than resolved to one of the matches.
 
 A session id that is not in the index yet is indexed on the spot and retried, so a
-conversation that just ended is readable without running `index` first.
+conversation that just ended is readable without running `index` first. Claude Code sessions
+only — OpenCode (`oc:`) and Codex (`codex:`) ids are not stored in that layout.
 
 `--role`, `--no-tools` and `--flat` narrow the tree; `--content` adds message bodies, which
 are omitted by default so a long session does not serialise to hundreds of KB.
@@ -246,8 +247,9 @@ ai-conversation-search setup-hooks
 ```
 
 If you ran it before v0.16.0 and have since installed the plugin, remove the
-`ai-conversation-search hook` entry from your `settings.json`: the plugin's entry spells the
-command differently, so `setup-hooks` cannot recognise it and the hook fires twice.
+`ai-conversation-search hook` entry from your `settings.json`. `setup-hooks` only ever looks
+inside `settings.json`, so it cannot see the plugin's own hook and will not warn you; left
+in place, both fire and two indexers run at once.
 
 ## Supported Sources
 
@@ -326,7 +328,8 @@ off, so an empty or short list is not proof that nothing matched. `tree`, `conte
 | Environment Variable | Description |
 |---------------------|-------------|
 | `CONVERSATION_SEARCH_EXTRA_DIRS` | Additional project directories to scan (colon-separated, `~` expansion supported) |
-| `CONVERSATION_SEARCH_INDEX_TTL` | Auto-index cooldown in seconds (default: 300) |
+| `CONVERSATION_SEARCH_INDEX_TTL` | Auto-index cooldown in seconds for `search`/`tree`/`list` (default: 300) |
+| `CONVERSATION_SEARCH_HOOK_TTL` | Cooldown in seconds for the `hook` subcommand only (default: 60) |
 | `CONVERSATION_SEARCH_FULL_INDEX_TTL` | Full index cooldown in seconds (default: 86400) |
 | `OPENCODE_HOME` | Override OpenCode data directory |
 

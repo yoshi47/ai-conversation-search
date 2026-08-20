@@ -11,25 +11,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `tree --role user|assistant`: 片側の発言だけに絞る
-- `tree --no-tools`: `[Tool: X]` / `[Tool result]` / 中断ノードを落とす
+- `tree --no-tools`: `[Tool: X]` / `[Tool result]` / 中断ノード、および本文が空になったノードを落とす
 - `tree --flat`: 入れ子をやめて平坦な一覧を返す
 - `tree --content` / `--content-chars N`: 本文を出す（既定 300 字）。`search` と同じ契約
 - `tree` の JSON に `returned_messages` が付いた。`total_messages` は「セッション内の件数」の意味を保つ。絞り込みが 1 件も拾わなかった場合は `.warning` に出る（exit は 0 のまま。フィルタで空になった木と、本当に空の会話は別物）
 - **プラグインが Stop フックを同梱するようになった**。従来は `setup-hooks` の手動実行に依存しており、実行していない利用者では自動インデックスがほとんど走っていなかった
-- `CONVERSATION_SEARCH_HOOK_TTL`: `hook` サブコマンド専用の TTL（既定 0 = 毎回実行）
+- `CONVERSATION_SEARCH_HOOK_TTL`: `hook` サブコマンド専用の TTL（既定 60 秒）。`search`/`tree`/`list` と同じ 300 秒のスタンプを共有していたため、セッション中に一度でも検索していると Stop フックが no-op になっていた。0 にしないのは、Stop がターン毎に発火するため常に stale だと毎ターン全ディレクトリを走査してしまうから
 
 ### Changed
 
 - **破壊的変更: `tree --json` が既定で `full_content` を返さなくなった**。`--content` で復帰し、`--content-chars` で長さを制御する。従来は全ノードの本文を無条件に出しており、265 メッセージのセッションで数百 KB がエージェントの文脈に流れ込んでいた。`search` の `--content` オプトインと契約を揃える
 - **`tree` が未インデックスのセッションを自動で索引するようになった**。ID が解決できないとき、そのセッションの transcript だけを同期で索引して 1 回引き直す。従来の自動インデックスはデタッチした別プロセスかつ 300 秒デバウンスのため、直前に終了したセッションには構造的に間に合わなかった。Claude Code のセッションのみが対象で、observer セッションは従来どおり除外される
 - **サブエージェントの完了通知に `[Task notification] ` の接頭辞が付くようになった**。判定は Claude Code 自身の `origin.kind` による。潰さずタグ付けなのは、本文にエージェントの実際の結果が入っており有用なため。会話サマリの候補からは除外する（先頭 100 字が XML の定型部で、見出しが無意味になるため）
-- `hook` の TTL を `search` / `tree` / `list` と分離した。スタンプが共有だったため、セッション中に一度でも検索していると Stop フックが 300 秒デバウンスで no-op になっていた
+- `tree --flat` が時系列順に並ぶようになった。深さ優先のままだと、ルートが複数あるセッション（resume・sidechain・親が刈られた場合。実インデックスで 5,649 件）で古いメッセージが新しいものの後に来る。末尾 N 件を「直近」として読む使い方が壊れるため
 - fzf プレビューが新フラグを使うようになった。従来は同等の処理を jq で手書きしていた
 
 ### Migration
 
 - **既存インデックスへの `[Task notification]` の遡及には `index --all --force` が要る**。mtime スキップにより、変更のない transcript は再パースされないため
-- **0.16.0 より前に `setup-hooks` を実行していてプラグインも導入している場合、`settings.json` 側の `ai-conversation-search hook` を削除してよい**。プラグイン側は同じコマンドを別の文字列（`${CLAUDE_PLUGIN_ROOT}` 経由）で書くため `setup-hooks` の冪等性チェックが検出できず、Stop が 2 回発火する。WAL なので破損はしないが索引プロセスが二重に走る
+- **0.16.0 より前に `setup-hooks` を実行していてプラグインも導入している場合、`settings.json` 側の `ai-conversation-search hook` を削除してよい**。`setup-hooks` の冪等性チェックは `settings.json` しか見ないためプラグイン側のフックを検出できず、警告も出ないまま Stop が 2 回発火する。WAL なので破損はしないが索引プロセスが二重に走る
 - スキルの最低バージョン要件が 0.16.0 に上がった
 
 ## [0.15.0] - 2026-08-10

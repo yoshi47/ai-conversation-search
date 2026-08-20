@@ -37,6 +37,22 @@ git push origin v<version>
 
 This builds binaries for macOS (arm64/x86_64) and Linux (x86_64) and uploads them to GitHub Releases.
 
+## Pre-release manual check (wrapper tests)
+
+`tests/test_pick.sh` covers the wrapper: the `pick` picker, the fzf preview command, and the
+`tree` flags that preview depends on. It is not in CI — several assertions need a populated
+index, which a CI runner does not have.
+
+Run it against the build you are about to release, not the cached one:
+
+```bash
+cargo build --release
+ACS_TEST_BINARY="$PWD/target/release/ai-conversation-search" sh tests/test_pick.sh
+```
+
+Without `ACS_TEST_BINARY` the script resolves the binary the wrapper would download for its
+version, which does not exist until the release is published — so it would skip everything.
+
 ## Pre-release manual check (skill discoverability)
 
 Before pushing a release tag, run at least one scenario from

@@ -8,7 +8,10 @@ set -e
 ACS_WRAPPER_VERSION="0.16.0"
 VERSION="${ACS_VERSION:-$ACS_WRAPPER_VERSION}"
 CACHE_DIR="${HOME}/.conversation-search/bin"
-BINARY="${CACHE_DIR}/ai-conversation-search-${VERSION}"
+# ACS_BINARY points the wrapper at an existing binary instead of the versioned cache entry
+# it would otherwise download. Needed to exercise the wrapper against a build whose version
+# has not been released yet -- the download would 404 and abort under `set -e`.
+BINARY="${ACS_BINARY:-${CACHE_DIR}/ai-conversation-search-${VERSION}}"
 REPO="yoshi47/ai-conversation-search"
 
 detect_target() {
@@ -219,10 +222,8 @@ acs_pick() {
 
     TAB=$(printf '\t')
 
-    # Preview: same output as before, but the filtering, flattening and body truncation
-    # that used to be hand-written jq are now CLI flags (0.16.0+). {1} is the session_id
-    # column. Note --content is required for bodies at all: tree no longer emits
-    # full_content by default.
+    # Preview: {1} is the session_id column. --content is not optional here -- tree omits
+    # full_content unless asked, so without it the message list below renders empty.
     PREVIEW_CMD="$BINARY tree {1} --json --no-tools --flat --content --content-chars 150 2>/dev/null | jq -r '
       \"📁 \" + (.conversation.project_path // \"unknown\"),
       \"💬 \" + (.total_messages | tostring) + \" messages\",

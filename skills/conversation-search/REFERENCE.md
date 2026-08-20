@@ -257,8 +257,8 @@ ai-conversation-search tree SESSION_ID [--role ROLE] [--no-tools] [--flat] [--co
 
 **Options:**
 - `--role user|assistant`: Keep only messages from that side
-- `--no-tools`: Drop tool-call, tool-result and interrupt nodes
-- `--flat`: Return a flat list instead of nested `children`
+- `--no-tools`: Drop tool-call, tool-result and interrupt nodes, plus any message whose body extracted to nothing (thinking-only assistant turns)
+- `--flat`: Return a flat list instead of nested `children`, ordered by timestamp. Sessions with more than one tree root (resume, sidechain, pruned parent) interleave in time, so the nested order is not chronological — take the last N entries of a `--flat` result when you want the most recent messages
 - `--content`: Include message bodies (omitted by default)
 - `--content-chars N`: Cap each body at N characters (default: 300, requires `--content`)
 - `--json`: Output as JSON
@@ -381,7 +381,11 @@ ai-conversation-search hook
 ```
 
 **Behavior:**
-- Checks stamp file TTL (default: 300s, configurable via `CONVERSATION_SEARCH_INDEX_TTL`)
+- Checks stamp file TTL (default: 60s, configurable via `CONVERSATION_SEARCH_HOOK_TTL`).
+  This is the hook's own TTL — `CONVERSATION_SEARCH_INDEX_TTL` (300s) governs the
+  auto-index that `search`, `tree` and `list` trigger, and does not apply here. The two are
+  separate because all of those commands touch the same stamp, so at 300s a session in
+  which the agent searched would leave the hook a no-op
 - If fresh: exits immediately (< 1ms, two stat() calls)
 - If stale: spawns background `index --days 1` and exits immediately
 - Always exits 0 — never fails or blocks the caller

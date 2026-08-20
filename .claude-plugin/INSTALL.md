@@ -20,13 +20,14 @@ ai-conversation-search search "test" --json
 ## Automatic Indexing
 
 Already on. The plugin ships a Claude Code Stop hook that triggers background indexing when
-a session ends, so a conversation is searchable as soon as it finishes. The hook exits in
-under 50ms and never blocks your session.
+a session ends, so a conversation is searchable as soon as it finishes. Indexing runs in a
+detached process and the hook is capped at a 5 second timeout, so it never blocks your
+session.
 
 `ai-conversation-search setup-hooks` exists for manual (non-plugin) installs. If you ran it
 before v0.16.0, remove the `ai-conversation-search hook` entry from your `settings.json` —
-the plugin's entry spells the command differently, so `setup-hooks` cannot recognise it and
-the hook would fire twice.
+`setup-hooks` only ever looks inside `settings.json`, so it cannot see the plugin's own hook
+and will not warn you; left in place, both fire and two indexers run at once.
 
 ## You're Ready!
 

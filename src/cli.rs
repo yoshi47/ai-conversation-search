@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 use crate::db;
 use crate::error::{AppError, Result};
+use crate::indexer::claude_code::TranscriptLookup;
 use crate::indexer::codex::CodexIndexer;
 use crate::indexer::count_conversation_files_on_disk;
 use crate::indexer::opencode::{get_opencode_db_path, OpenCodeIndexer};
@@ -13,7 +14,7 @@ const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")
 
 const AUTO_INDEX_TTL_SECS: u64 = 300;
 const FULL_INDEX_TTL_SECS: u64 = 86400;
-const HOOK_INDEX_TTL_SECS: u64 = 0;
+const HOOK_INDEX_TTL_SECS: u64 = 60;
 const STAMP_FILE_PATH: &str = "~/.conversation-search/.last-auto-index";
 const FULL_STAMP_FILE_PATH: &str = "~/.conversation-search/.last-full-index";
 
@@ -363,8 +364,8 @@ pub enum Commands {
         #[arg(long)]
         content: bool,
         /// Max characters of each message body to show
-        #[arg(long, default_value_t = 300, requires = "content")]
-        content_chars: usize,
+        #[arg(long, default_value_t = 300, requires = "content", value_parser = clap::value_parser!(u64).range(1..))]
+        content_chars: u64,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -432,7 +433,13 @@ fn maybe_background_index() {
     let _ = try_background_index(None);
 }
 
-/// TTL for the Stop-hook trigger, defaulting to 0 (always index).
+/// TTL for the Stop-hook trigger.
+///
+/// Shorter than the shared 300s because `search`, `tree` and `list` all touch the same
+/// stamp: at 300s, an agent that searched during the session leaves the hook a no-op for
+/// the session it most needs to index. Not 0, though -- Stop fires on every turn, not only
+/// at session end, so an always-stale stamp would sweep every project directory each turn
+/// and leave overlapping indexers contending for one SQLite file.
 ///
 /// Takes the raw value rather than reading the environment so it stays assertable without
 /// mutating process-wide state, which parallel tests share.
@@ -507,35 +514,49 @@ fn transcript_lookup_key(session_id: &str) -> Option<String> {
     Some(id)
 }
 
+/// Why a targeted index did not produce a readable session.
+///
+/// Distinct variants rather than a bool: every one of these used to surface as
+/// "Conversation X not found", so a corrupt database, a locked index and a mistyped id were
+/// indistinguishable -- and only the last of those is the user's fault.
+enum TargetedIndex {
+    /// The transcript was handed to the indexer without error. This does NOT promise rows
+    /// were written: observer, summarizer and empty transcripts are skipped inside.
+    Handed,
+    /// Not an id this layout can hold (wrong shape, or an OpenCode/Codex source prefix).
+    NotAClaudeCodeId,
+    /// No transcript on disk carries that id.
+    TranscriptNotFound,
+    /// Several transcripts share the prefix; guessing one would show the wrong session.
+    AmbiguousPrefix(usize),
+    /// The index or the transcript could not be read or written.
+    Failed(String),
+}
+
 /// Index just the transcript for `session_id`, synchronously, into `db_path`.
 ///
 /// Why not reuse `maybe_background_index`: that path spawns a detached process and is
 /// TTL-debounced, so it can never satisfy a lookup happening in this same process -- which
 /// is exactly the "session that ended a minute ago" case this exists for.
 ///
-/// The bool means "one file was handed to the indexer without error", NOT "rows were
-/// added": `index_conversation` also returns `Ok(())` for observer, summarizer and empty
-/// transcripts. The caller only uses it to decide whether one extra query is worth issuing.
 fn index_single_session(
     db_path: &str,
     session_id: &str,
     project_roots: Option<&[std::path::PathBuf]>,
-) -> bool {
+) -> TargetedIndex {
     let Some(id) = transcript_lookup_key(session_id) else {
-        return false;
+        return TargetedIndex::NotAClaudeCodeId;
     };
-    // Never create or migrate a database from a read path: ConversationIndexer::new opens
-    // read-write and runs init_schema, so on a missing DB `tree` would silently build one.
+    // Never *create* a database from a read path: ConversationIndexer::new opens read-write
+    // and runs init_schema, so on a missing DB `tree` would silently build a whole index.
+    // Migrating an existing one is accepted -- any other command would have done it anyway.
     if !db::expand_path(db_path).exists() {
-        return false;
+        return TargetedIndex::Failed(format!("no index database at {}", db_path));
     }
 
     let mut indexer = match ConversationIndexer::new(db_path, true) {
         Ok(indexer) => indexer,
-        Err(e) => {
-            log::warn!("targeted index could not open {}: {}", db_path, e);
-            return false;
-        }
+        Err(e) => return TargetedIndex::Failed(e.to_string()),
     };
     // A stale claude_code_sync_state row would otherwise short-circuit the re-read and
     // leave this a silent no-op. One file is sub-second, so re-reading is affordable.
@@ -557,15 +578,16 @@ fn index_single_session(
         }
     };
     let files = indexer.scan_project_dirs(roots, None);
-    let Some(path) = crate::indexer::claude_code::find_session_transcript(&files, &id) else {
-        return false;
+    let path = match crate::indexer::claude_code::find_session_transcript(&files, &id) {
+        TranscriptLookup::Found(path) => path,
+        TranscriptLookup::NotFound => return TargetedIndex::TranscriptNotFound,
+        TranscriptLookup::Ambiguous(n) => return TargetedIndex::AmbiguousPrefix(n),
     };
 
-    if let Err(e) = indexer.index_conversation(&path) {
-        log::warn!("targeted index of {} failed: {}", path.display(), e);
-        return false;
+    match indexer.index_conversation(&path) {
+        Ok(()) => TargetedIndex::Handed,
+        Err(e) => TargetedIndex::Failed(format!("{}: {}", path.display(), e)),
     }
-    true
 }
 
 pub fn run(cli: Cli) -> Result<()> {
@@ -679,12 +701,12 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
         }) => cmd_tree(
             &session_id,
-            TreeOpts {
+            &TreeOpts {
                 role,
                 no_tools,
                 flat,
                 content,
-                content_chars,
+                content_chars: content_chars as usize,
                 json,
             },
         ),
@@ -1480,6 +1502,18 @@ fn tree_exit_code(tree: &crate::search::ConversationTree) -> i32 {
     }
 }
 
+/// Replace a tree's error, keeping the rest. Turns the generic "not found" into a
+/// description of what actually went wrong.
+fn tree_with_error(
+    tree: crate::search::ConversationTree,
+    error: String,
+) -> crate::search::ConversationTree {
+    crate::search::ConversationTree {
+        error: Some(error),
+        ..tree
+    }
+}
+
 /// Look up a session's tree, indexing its transcript on the spot if it is not in the index.
 ///
 /// The retry is what makes "read the session that just ended" work without the user running
@@ -1495,26 +1529,62 @@ fn lookup_tree(
     // `conversation: None` alongside an error is exactly the two not-found shapes: an id
     // that would not resolve, and one that resolved to no conversation row. Reading the
     // struct rather than the error text keeps this independent of the message wording.
-    // Both raw-transcript fallbacks keep `conversation: Some(..)`, so a session whose file
-    // is merely unreadable never triggers a pointless re-index.
+    // The raw-transcript fallbacks all keep `conversation: Some(..)`, so a session whose
+    // file is merely unreadable never triggers a pointless re-index.
     if tree.conversation.is_some() || tree.error.is_none() {
         return Ok(tree);
     }
 
     // Released before the indexer opens the same database read-write.
     drop(search);
-    if !index_single_session(db_path, session_id, project_roots) {
-        return Ok(tree);
+    match index_single_session(db_path, session_id, project_roots) {
+        TargetedIndex::Handed => {
+            let retried = ConversationSearch::new(db_path)?.get_conversation_tree(session_id)?;
+            if retried.conversation.is_some() || retried.error.is_none() {
+                return Ok(retried);
+            }
+            // The file exists and the indexer accepted it, yet nothing landed. The only
+            // ways that happens are the deliberate skips -- claude-mem observer,
+            // summarizer, empty transcript -- and each has a documented way in.
+            Ok(tree_with_error(
+                retried,
+                format!(
+                    "Session {} has a transcript on disk but is excluded from the index \
+                     (claude-mem observer, summarizer, or an empty transcript). For an \
+                     observer session, set CONVERSATION_SEARCH_INDEX_OBSERVER=1 and run \
+                     `index --all --force`.",
+                    session_id
+                ),
+            ))
+        }
+        TargetedIndex::AmbiguousPrefix(n) => Ok(tree_with_error(
+            tree,
+            format!(
+                "Session id '{}' is not indexed and matches {} transcripts on disk. \
+                 Pass more characters of the id.",
+                session_id, n
+            ),
+        )),
+        TargetedIndex::Failed(why) => Ok(tree_with_error(
+            tree,
+            format!(
+                "Session {} is not indexed and could not be indexed now: {}. \
+                 Run `ai-conversation-search index --all` once the cause is cleared.",
+                session_id, why
+            ),
+        )),
+        // Nothing to add: the id names no transcript at all, which is what the original
+        // error already says.
+        TargetedIndex::NotAClaudeCodeId | TargetedIndex::TranscriptNotFound => Ok(tree),
     }
-    ConversationSearch::new(db_path)?.get_conversation_tree(session_id)
 }
 
 /// Display-level tool noise, deliberately NOT `summarization::is_tool_noise`.
 ///
-/// Why not reuse it: that predicate is tuned for search ranking and deliberately keeps
-/// short tool nodes (anything under 50 characters returns false), plus tool calls carrying
-/// enough surrounding prose. Here the whole point is to drop them, matching the jq filter
-/// this replaces in the fzf preview.
+/// Why not reuse it: that predicate is tuned for search ranking, so it keeps `[Tool: X]`
+/// bodies when they are short or carry enough surrounding prose. Here the whole point is to
+/// drop them, matching the jq filter this replaces in the fzf preview. (The two agree on
+/// `[Tool result]`, interrupts and empty bodies; `[Tool: X]` is where they part.)
 fn is_tool_node(node: &TreeNode) -> bool {
     let body = node.full_content.trim_start();
     body.is_empty() || body.starts_with("[Tool") || body.starts_with("[Request interrupted")
@@ -1547,31 +1617,44 @@ fn prune_tree(
     out
 }
 
-/// Depth-first flatten preserving transcript order.
+/// Flatten to a chronological list.
 ///
-/// `depth` keeps its original value: after flattening it is the only remaining record of
-/// where the message sat in the conversation.
+/// Sorted by timestamp rather than left as the depth-first walk: a session with more than
+/// one tree root -- resumes, sidechains, a parent pruned away -- interleaves its subtrees in
+/// time, so depth-first order puts an older message after a newer one. 5,649 sessions in a
+/// real index have multiple roots, and `--flat` exists precisely so a caller can take the
+/// last N messages and get the most recent ones.
+///
+/// The sort is stable, so siblings recorded in the same second keep their structural order.
+/// `depth` keeps its original value: once flattened it is the only remaining record of where
+/// the message sat in the conversation.
 fn flatten_tree(nodes: Vec<TreeNode>) -> Vec<TreeNode> {
-    let mut out = Vec::new();
-    for mut node in nodes {
-        let children = std::mem::take(&mut node.children);
-        out.push(node);
-        out.extend(flatten_tree(children));
+    fn walk(nodes: Vec<TreeNode>, out: &mut Vec<TreeNode>) {
+        for mut node in nodes {
+            let children = std::mem::take(&mut node.children);
+            out.push(node);
+            walk(children, out);
+        }
     }
+    let mut out = Vec::new();
+    walk(nodes, &mut out);
+    out.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
     out
 }
 
 /// Drop or truncate every `full_content` in a serialized tree.
 ///
-/// `tree --json` used to serialize every body unconditionally while `search` kept them
-/// behind `--content`; on a long session that is hundreds of KB flowing into an agent's
-/// context. This brings the two commands to the same opt-in contract, and like
-/// `inject_full_content` it writes `full_content_truncated` on every node it keeps so
-/// consumers never face two shapes for one field.
+/// Bodies are opt-in so the default stays small enough for an agent's context window; a
+/// long session serializes to hundreds of KB otherwise. `full_content_truncated` is written
+/// beside every body that survives, so a consumer never has to handle a body with no flag.
 fn apply_tree_content(val: &mut serde_json::Value, opts: &TreeOpts) {
     fn walk(node: &mut serde_json::Value, opts: &TreeOpts) {
         if let Some(map) = node.as_object_mut() {
             match map.get("full_content").and_then(|b| b.as_str()) {
+                // Only a present string body can be capped. A missing or non-string one
+                // falls through to removal rather than being left as-is: leaving it would
+                // produce a node carrying a body with no `full_content_truncated` beside
+                // it, the two-shapes-for-one-field problem this function exists to avoid.
                 Some(body) if opts.content => {
                     let (text, dropped) = truncate_chars(body, opts.content_chars);
                     map.insert("full_content".to_string(), serde_json::Value::String(text));
@@ -1638,27 +1721,46 @@ fn filter_tree(tree: &mut crate::search::ConversationTree, opts: &TreeOpts) -> u
     returned
 }
 
-fn cmd_tree(session_id: &str, opts: TreeOpts) -> Result<()> {
-    let mut tree = lookup_tree(db::DEFAULT_DB_PATH, session_id, None)?;
+/// Say so when the filters matched nothing, without losing whatever the tree already warned
+/// about.
+///
+/// Appended rather than assigned: the raw-transcript fallback puts its "run index --all to
+/// repair the DB" instruction in this same field, and overwriting it would hide a broken
+/// index behind what reads as nothing worse than an over-eager filter.
+fn note_empty_filter(tree: &mut crate::search::ConversationTree, returned: usize) {
+    if returned > 0 || tree.total_messages == 0 {
+        return;
+    }
+    let note = format!("0 of {} messages matched the filters", tree.total_messages);
+    tree.warning = Some(match tree.warning.take() {
+        Some(existing) => format!("{} {}", existing, note),
+        None => note,
+    });
+}
 
+fn cmd_tree(session_id: &str, opts: &TreeOpts) -> Result<()> {
     // Below the lookup, not above it: on top, the detached indexer it spawns would race
     // this command's own synchronous write for the same file against a 30s busy_timeout.
     // The lookup already handles the only case that needed fresher data.
+    //
+    // The error path still has to spawn it. `lookup_tree` fails outright when no database
+    // exists yet, and on `main` the spawn above that call is what built one -- without this,
+    // `tree` on a fresh install would say "run init" forever while `search` and `list`
+    // quietly heal themselves, and SKILL.md now sends agents to `tree` first.
+    let mut tree = match lookup_tree(db::DEFAULT_DB_PATH, session_id, None) {
+        Ok(tree) => tree,
+        Err(e) => {
+            maybe_background_index();
+            return Err(e);
+        }
+    };
     maybe_background_index();
 
     let code = tree_exit_code(&tree);
     let filtered = tree.error.is_none();
     let returned = if filtered {
-        let returned = filter_tree(&mut tree, &opts);
-        // Without this, a filter that matched nothing is indistinguishable from an empty
-        // conversation -- the exact ambiguity `tree_exit_code` documents avoiding. A
-        // warning says so while leaving the exit status at 0, since data was returned.
-        if returned == 0 && tree.total_messages > 0 {
-            tree.warning = Some(format!(
-                "0 of {} messages matched the filters",
-                tree.total_messages
-            ));
-        }
+        let returned = filter_tree(&mut tree, opts);
+        note_empty_filter(&mut tree, returned);
         Some(returned)
     } else {
         None
@@ -1669,7 +1771,7 @@ fn cmd_tree(session_id: &str, opts: TreeOpts) -> Result<()> {
         // reader of `.error` keep working, and only the exit status becomes honest.
         let json_val = serde_json::to_value(&tree)?;
         let mut localized = localize_timestamps(json_val);
-        apply_tree_content(&mut localized, &opts);
+        apply_tree_content(&mut localized, opts);
         if let (Some(returned), Some(map)) = (returned, localized.as_object_mut()) {
             map.insert(
                 "returned_messages".to_string(),
@@ -1688,7 +1790,7 @@ fn cmd_tree(session_id: &str, opts: TreeOpts) -> Result<()> {
             if let Some(ref warning) = tree.warning {
                 eprintln!("Warning: {}", warning);
             }
-            print_tree_nodes(&tree.tree, 0, &opts);
+            print_tree_nodes(&tree.tree, 0, opts);
             if let Some(returned) = returned {
                 if returned != tree.total_messages {
                     println!("\n{} of {} messages shown", returned, tree.total_messages);
@@ -1756,9 +1858,7 @@ fn cmd_resume(uuid: &str) -> Result<()> {
 }
 
 fn cmd_hook() -> Result<()> {
-    // Own TTL, not the shared one: search/tree/list all touch the same stamp, so at the
-    // shared 300s an agent that searched during the session would leave this a no-op --
-    // and that session's transcript is the one most likely to be asked about next.
+    // Own TTL, not the shared one -- see `hook_index_ttl_secs` for why.
     let ttl = hook_index_ttl_secs(std::env::var("CONVERSATION_SEARCH_HOOK_TTL").ok());
     let _ = try_background_index(Some(ttl));
     Ok(())
@@ -2152,14 +2252,18 @@ mod tests {
     }
 
     #[test]
-    fn test_hook_ttl_defaults_to_zero() {
-        // The Stop hook shares its stamp with search/tree/list. At the shared 300s TTL an
-        // agent that ran any of them during the session would leave the hook a no-op --
-        // which is precisely the session whose transcript most needs indexing.
-        assert_eq!(hook_index_ttl_secs(None), 0);
+    fn test_hook_ttl_is_shorter_than_the_shared_one_but_not_zero() {
+        // Well under the shared 300s so the hook is not a no-op for the session that just
+        // produced a turn, but not 0: Stop fires every turn, and an always-stale stamp
+        // would sweep every project directory each time.
+        assert!(hook_index_ttl_secs(None) > 0);
+        assert!(hook_index_ttl_secs(None) < AUTO_INDEX_TTL_SECS);
         assert_eq!(hook_index_ttl_secs(Some("120".into())), 120);
         // Unparseable falls back to the default rather than to the shared 300s.
-        assert_eq!(hook_index_ttl_secs(Some("soon".into())), 0);
+        assert_eq!(
+            hook_index_ttl_secs(Some("soon".into())),
+            HOOK_INDEX_TTL_SECS
+        );
     }
 
     #[test]
@@ -2225,7 +2329,7 @@ mod tests {
 
 #[cfg(test)]
 mod index_single_session_tests {
-    use super::{index_single_session, lookup_tree, transcript_lookup_key};
+    use super::{index_single_session, lookup_tree, transcript_lookup_key, TargetedIndex};
     use crate::indexer::ConversationIndexer;
     use crate::search::ConversationSearch;
 
@@ -2270,8 +2374,8 @@ mod index_single_session_tests {
     /// The one test that proves the retry actually works end to end.
     ///
     /// Every other assertion here checks that some input is *rejected*, which a lookup that
-    /// silently finds nothing would also satisfy -- an earlier draft of this feature scanned
-    /// one directory level too high and would have passed all of them.
+    /// silently finds nothing would also satisfy. Without this one, a discovery bug that
+    /// matched no files at all would leave the whole module green.
     #[test]
     fn indexes_a_missing_session_and_returns_its_tree() {
         let home = tempfile::tempdir().unwrap();
@@ -2396,18 +2500,99 @@ mod index_single_session_tests {
     fn refuses_to_create_a_database_from_a_read_path() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("absent.db");
-        assert!(!index_single_session(
-            missing.to_str().unwrap(),
-            "deadbeef-1111-2222-3333-444444444444",
-            None
+        assert!(matches!(
+            index_single_session(
+                missing.to_str().unwrap(),
+                "deadbeef-1111-2222-3333-444444444444",
+                None
+            ),
+            TargetedIndex::Failed(_)
         ));
         assert!(!missing.exists(), "tree must never build an index database");
+    }
+
+    /// A prefix that names several transcripts is something the user can fix by typing more
+    /// characters. Reporting it as "not found" sends them looking for a session that is on
+    /// disk the whole time.
+    #[test]
+    fn an_ambiguous_prefix_is_reported_as_such_not_as_missing() {
+        let home = tempfile::tempdir().unwrap();
+        let roots = vec![home.path().join("projects")];
+        let project = roots[0].join("-tmp-someproject");
+        std::fs::create_dir_all(&project).unwrap();
+        for suffix in ["1111", "2222"] {
+            let id = format!("beefcafe-{}-3333-4444-555555555555", suffix);
+            std::fs::write(
+                project.join(format!("{}.jsonl", id)),
+                format!(
+                    "{}\n",
+                    format_args!(
+                        r#"{{"uuid":"x{suffix}","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"{id}","cwd":"/tmp/someproject","message":{{"role":"user","content":"hello"}}}}"#
+                    )
+                ),
+            )
+            .unwrap();
+        }
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        let db_path = db_path.to_str().unwrap();
+        ConversationIndexer::new(db_path, true).unwrap();
+
+        let tree = lookup_tree(db_path, "beefcafe", Some(&roots)).unwrap();
+        let error = tree
+            .error
+            .expect("an unresolvable prefix is still an error");
+        assert!(
+            error.contains("matches 2 transcripts"),
+            "expected an ambiguity message, got: {}",
+            error
+        );
+    }
+
+    /// An observer transcript is skipped by design, so the retry cannot help. Saying "not
+    /// found" hides both that the file exists and that there is an env var to include it.
+    #[test]
+    fn an_excluded_transcript_says_so_rather_than_reporting_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        let roots = vec![home.path().join("projects")];
+        // Not the observer *directory* name -- that is skipped before this code sees it.
+        // This is the content backstop inside do_index_conversation.
+        let project = roots[0].join("-tmp-someproject");
+        std::fs::create_dir_all(&project).unwrap();
+        let id = "0bbe0bbe-1111-2222-3333-444444444444";
+        std::fs::write(
+            project.join(format!("{}.jsonl", id)),
+            format!(
+                "{}\n{}\n",
+                format_args!(
+                    r#"{{"uuid":"ob1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"{id}","cwd":"/tmp/someproject","message":{{"role":"user","content":"<observed_from_primary_session>   <what_happened>Read</what_happened> </observed_from_primary_session>"}}}}"#
+                ),
+                format_args!(
+                    r#"{{"uuid":"ob2","parentUuid":"ob1","isSidechain":false,"timestamp":"2026-01-15T10:01:00Z","type":"assistant","sessionId":"{id}","cwd":"/tmp/someproject","message":{{"role":"assistant","content":"<observation><type>discovery</type></observation>"}}}}"#
+                ),
+            ),
+        )
+        .unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        let db_path = db_path.to_str().unwrap();
+        ConversationIndexer::new(db_path, true).unwrap();
+
+        let tree = lookup_tree(db_path, id, Some(&roots)).unwrap();
+        let error = tree.error.expect("an excluded session is still an error");
+        assert!(
+            error.contains("excluded from the index"),
+            "expected an exclusion message, got: {}",
+            error
+        );
     }
 }
 
 #[cfg(test)]
 mod tree_filter_tests {
-    use super::{filter_tree, flatten_tree, is_tool_node, prune_tree, TreeOpts};
+    use super::{filter_tree, flatten_tree, is_tool_node, note_empty_filter, prune_tree, TreeOpts};
     use crate::search::{ConversationTree, TreeNode};
 
     fn node(uuid: &str, parent: Option<&str>, role: &str, body: &str, depth: i64) -> TreeNode {
@@ -2430,7 +2615,9 @@ mod tree_filter_tests {
     fn sandwich() -> Vec<TreeNode> {
         let mut root = node("u1", None, "user", "please read the file", 0);
         let mut tool = node("t1", Some("u1"), "user", "[Tool result]", 1);
-        let leaf = node("u2", Some("t1"), "user", "thanks, now explain it", 2);
+        let mut leaf = node("u2", Some("t1"), "user", "thanks, now explain it", 2);
+        tool.timestamp = "2026-01-15T10:01:00Z".to_string();
+        leaf.timestamp = "2026-01-15T10:02:00Z".to_string();
         tool.children = vec![leaf];
         root.children = vec![tool];
         vec![root]
@@ -2467,7 +2654,7 @@ mod tree_filter_tests {
     fn tool_nodes_are_recognised_by_their_placeholder_bodies() {
         assert!(is_tool_node(&node("x", None, "user", "[Tool result]", 0)));
         // Short [Tool: Read] nodes must be dropped too. summarization::is_tool_noise keeps
-        // them (it returns false under 50 chars), which is why this predicate is separate.
+        // those, which is why this predicate is separate.
         assert!(is_tool_node(&node(
             "x",
             None,
@@ -2526,11 +2713,58 @@ mod tree_filter_tests {
     }
 
     #[test]
+    fn an_empty_filter_result_keeps_an_existing_repair_warning() {
+        // The raw-transcript fallback puts "run index --all to repair the DB" here. Losing
+        // it would leave a broken index looking like nothing more than a strict filter.
+        let tool_only = vec![node("t1", None, "user", "[Tool result]", 0)];
+        let mut tree = conversation(tool_only, 1);
+        tree.warning = Some("Indexed messages are missing; run index --all.".to_string());
+        let returned = filter_tree(&mut tree, &opts(None, true, false));
+        note_empty_filter(&mut tree, returned);
+        let warning = tree.warning.expect("both notes should be present");
+        assert!(warning.contains("run index --all"), "got: {}", warning);
+        assert!(warning.contains("0 of 1 messages"), "got: {}", warning);
+    }
+
+    /// The combination the fzf preview ships with. Flattening before pruning compiles and
+    /// returns the same count, but sets every `parent_uuid` to None -- silently undoing the
+    /// reconstruction guarantee `pruning_repoints_parent_uuid_at_the_nearest_survivor` pins.
+    #[test]
+    fn filtering_and_flattening_together_keep_the_repointed_parents() {
+        let mut tree = conversation(sandwich(), 3);
+        let returned = filter_tree(&mut tree, &opts(None, true, true));
+        assert_eq!(returned, 2);
+        assert_eq!(tree.tree.len(), 2, "flat: both nodes are top level");
+        assert!(tree.tree.iter().all(|n| n.children.is_empty()));
+        assert_eq!(tree.tree[0].parent_uuid, None);
+        assert_eq!(tree.tree[1].parent_uuid.as_deref(), Some("u1"));
+    }
+
+    #[test]
     fn an_unfiltered_tree_is_returned_untouched() {
         let mut tree = conversation(sandwich(), 3);
         let returned = filter_tree(&mut tree, &opts(None, false, false));
         assert_eq!(returned, 3);
         assert_eq!(tree.tree[0].message_uuid, "u1");
+    }
+
+    /// Multi-root sessions (resume, sidechain, pruned parent) interleave in time. The fzf
+    /// preview takes `.[-12:]` as "the most recent messages", so a depth-first order would
+    /// hand it the tail of the last subtree instead.
+    #[test]
+    fn flattening_orders_interleaved_roots_by_time() {
+        let mut r1 = node("r1", None, "user", "first root", 0);
+        r1.timestamp = "2026-01-15T10:00:00Z".to_string();
+        let mut c1 = node("c1", Some("r1"), "assistant", "reply under first root", 1);
+        c1.timestamp = "2026-01-15T10:02:00Z".to_string();
+        r1.children = vec![c1];
+
+        let mut r2 = node("r2", None, "user", "second root", 0);
+        r2.timestamp = "2026-01-15T10:01:00Z".to_string();
+
+        let flat = flatten_tree(vec![r1, r2]);
+        let ids: Vec<&str> = flat.iter().map(|n| n.message_uuid.as_str()).collect();
+        assert_eq!(ids, vec!["r1", "r2", "c1"]);
     }
 
     #[test]
@@ -2593,9 +2827,47 @@ mod tree_json_tests {
         out
     }
 
+    /// Anchored on the real type, not a hand-written literal: renaming `tree`, `children`
+    /// or `full_content` would make `apply_tree_content` a silent no-op -- `get_mut("tree")`
+    /// returns None and every body ships -- while the literal-based tests below stay green.
+    #[test]
+    fn bodies_are_stripped_from_a_real_serialized_tree() {
+        use crate::search::{ConversationTree, TreeNode};
+
+        fn node(uuid: &str, children: Vec<TreeNode>) -> TreeNode {
+            TreeNode {
+                message_uuid: uuid.to_string(),
+                session_id: "s1".to_string(),
+                parent_uuid: None,
+                is_sidechain: false,
+                depth: 0,
+                timestamp: "2026-01-15T10:00:00Z".to_string(),
+                message_type: "user".to_string(),
+                project_path: None,
+                summary: Some("s".to_string()),
+                full_content: "a body that must not ship by default".to_string(),
+                children,
+            }
+        }
+
+        let tree = ConversationTree {
+            conversation: None,
+            tree: vec![node("root", vec![node("child", vec![])])],
+            total_messages: 2,
+            warning: None,
+            error: None,
+        };
+        let mut value = serde_json::to_value(&tree).unwrap();
+        apply_tree_content(&mut value, &opts(false, 300));
+
+        let bodies = value.to_string().matches("full_content").count();
+        assert_eq!(bodies, 0, "serialized tree still carries bodies: {}", value);
+    }
+
     #[test]
     fn without_content_every_body_is_dropped() {
-        // The default has to stay small: a 265-message session used to serialise in full.
+        // The default has to stay small enough that a long session does not swamp an
+        // agent's context window.
         let mut v = tree_json();
         apply_tree_content(&mut v, &opts(false, 300));
         assert_eq!(bodies(&v), vec![None, None]);
