@@ -459,6 +459,74 @@ fn try_background_index() -> Option<()> {
     Some(())
 }
 
+/// Normalise `session_id` into the stem a Claude Code transcript would carry, or `None`
+/// when it cannot name one.
+///
+/// Split out from `index_single_session` so the rejection rules are directly assertable:
+/// inside that function every rejected input merely produces `false`, which a broken guard
+/// would also produce, making the guard untestable through the return value alone.
+///
+/// Lowercased because SQLite `LIKE` resolves ids case-insensitively while the filenames on
+/// disk are lowercase -- an uppercase id would resolve in the DB but never match here.
+fn transcript_lookup_key(session_id: &str) -> Option<String> {
+    let id = session_id.to_ascii_lowercase();
+    // Guards the directory sweep, which is far too expensive to run on arbitrary input.
+    // This also covers OpenCode (`oc:`) and Codex (`codex:`) ids, which carry a source
+    // prefix and do not live in the ~/.claude*/projects/<project>/<uuid>.jsonl layout at
+    // all: their `:` is neither a hex digit nor a dash, so they never reach the sweep.
+    if id.len() < 8 || !id.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+        return None;
+    }
+    Some(id)
+}
+
+/// Index just the transcript for `session_id`, synchronously, into `db_path`.
+///
+/// Why not reuse `maybe_background_index`: that path spawns a detached process and is
+/// TTL-debounced, so it can never satisfy a lookup happening in this same process -- which
+/// is exactly the "session that ended a minute ago" case this exists for.
+///
+/// The bool means "one file was handed to the indexer without error", NOT "rows were
+/// added": `index_conversation` also returns `Ok(())` for observer, summarizer and empty
+/// transcripts. The caller only uses it to decide whether one extra query is worth issuing.
+fn index_single_session(db_path: &str, session_id: &str) -> bool {
+    let Some(id) = transcript_lookup_key(session_id) else {
+        return false;
+    };
+    // Never create or migrate a database from a read path: ConversationIndexer::new opens
+    // read-write and runs init_schema, so on a missing DB `tree` would silently build one.
+    if !db::expand_path(db_path).exists() {
+        return false;
+    }
+
+    let mut indexer = match ConversationIndexer::new(db_path, true) {
+        Ok(indexer) => indexer,
+        Err(e) => {
+            log::warn!("targeted index could not open {}: {}", db_path, e);
+            return false;
+        }
+    };
+    // A stale claude_code_sync_state row would otherwise short-circuit the re-read and
+    // leave this a silent no-op. One file is sub-second, so re-reading is affordable.
+    indexer.set_force(true);
+
+    // Reuse the real scanner rather than walking directories here: it already knows the
+    // transcripts sit two levels below the discovered roots, and it carries the observer,
+    // summarizer and agent-* skips. No date cutoff -- a session old enough to have missed
+    // the window is precisely one that was never indexed.
+    let dirs = indexer.discover_project_dirs();
+    let files = indexer.scan_project_dirs(&dirs, None);
+    let Some(path) = crate::indexer::claude_code::find_session_transcript(&files, &id) else {
+        return false;
+    };
+
+    if let Err(e) = indexer.index_conversation(&path) {
+        log::warn!("targeted index of {} failed: {}", path.display(), e);
+        return false;
+    }
+    true
+}
+
 pub fn run(cli: Cli) -> Result<()> {
     // Before anything spawns the detached indexer, whose stderr goes to /dev/null. The
     // indexer is the process that reads this variable, so a warning raised there is
@@ -1872,5 +1940,59 @@ mod tests {
         assert!(!is_stamp_stale(&path, u64::MAX));
         // TTL=0 means always stale
         assert!(is_stamp_stale(&path, 0));
+    }
+}
+
+#[cfg(test)]
+mod index_single_session_tests {
+    use super::{index_single_session, transcript_lookup_key};
+
+    #[test]
+    fn rejects_non_claude_code_sources() {
+        // OpenCode and Codex sessions do not live in ~/.claude*/projects/<project>/<id>.jsonl.
+        assert_eq!(
+            transcript_lookup_key("oc:abcdef12-3456-7890-abcd-ef1234567890"),
+            None
+        );
+        assert_eq!(
+            transcript_lookup_key("codex:abcdef12-3456-7890-abcd-ef1234567890"),
+            None
+        );
+    }
+
+    #[test]
+    fn rejects_ids_too_short_to_identify_a_session() {
+        assert_eq!(transcript_lookup_key("abc"), None);
+        assert_eq!(transcript_lookup_key("deadbee"), None);
+    }
+
+    #[test]
+    fn rejects_ids_that_cannot_be_a_uuid() {
+        // Guards the directory sweep. tests/test_pick.sh passes exactly this kind of value.
+        assert_eq!(transcript_lookup_key("definitely-no-such-session-id"), None);
+        assert_eq!(transcript_lookup_key("../../etc/passwd"), None);
+    }
+
+    #[test]
+    fn accepts_a_uuid_and_a_prefix_of_one_lowercased() {
+        assert_eq!(
+            transcript_lookup_key("DEADBEEF-1111-2222-3333-444444444444"),
+            Some("deadbeef-1111-2222-3333-444444444444".to_string())
+        );
+        assert_eq!(
+            transcript_lookup_key("deadbeef"),
+            Some("deadbeef".to_string())
+        );
+    }
+
+    #[test]
+    fn refuses_to_create_a_database_from_a_read_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("absent.db");
+        assert!(!index_single_session(
+            missing.to_str().unwrap(),
+            "deadbeef-1111-2222-3333-444444444444"
+        ));
+        assert!(!missing.exists(), "tree must never build an index database");
     }
 }
