@@ -1561,6 +1561,46 @@ fn flatten_tree(nodes: Vec<TreeNode>) -> Vec<TreeNode> {
     out
 }
 
+/// Drop or truncate every `full_content` in a serialized tree.
+///
+/// `tree --json` used to serialize every body unconditionally while `search` kept them
+/// behind `--content`; on a long session that is hundreds of KB flowing into an agent's
+/// context. This brings the two commands to the same opt-in contract, and like
+/// `inject_full_content` it writes `full_content_truncated` on every node it keeps so
+/// consumers never face two shapes for one field.
+fn apply_tree_content(val: &mut serde_json::Value, opts: &TreeOpts) {
+    fn walk(node: &mut serde_json::Value, opts: &TreeOpts) {
+        if let Some(map) = node.as_object_mut() {
+            match map.get("full_content").and_then(|b| b.as_str()) {
+                Some(body) if opts.content => {
+                    let (text, dropped) = truncate_chars(body, opts.content_chars);
+                    map.insert("full_content".to_string(), serde_json::Value::String(text));
+                    map.insert(
+                        "full_content_truncated".to_string(),
+                        serde_json::Value::Bool(dropped),
+                    );
+                }
+                _ => {
+                    map.remove("full_content");
+                }
+            }
+            if let Some(children) = map.get_mut("children") {
+                walk_all(children, opts);
+            }
+        }
+    }
+    fn walk_all(nodes: &mut serde_json::Value, opts: &TreeOpts) {
+        if let Some(arr) = nodes.as_array_mut() {
+            for node in arr.iter_mut() {
+                walk(node, opts);
+            }
+        }
+    }
+    if let Some(tree) = val.get_mut("tree") {
+        walk_all(tree, opts);
+    }
+}
+
 /// Display options for `tree`, grouped so `cmd_tree` keeps a readable signature.
 struct TreeOpts {
     role: Option<String>,
@@ -1571,8 +1611,35 @@ struct TreeOpts {
     json: bool,
 }
 
+/// Apply `--role` / `--no-tools` / `--flat` and report how many nodes survived.
+///
+/// Returns the surviving count separately: `total_messages` keeps meaning "messages in the
+/// session", so without this a filtered result gives no way to tell an empty answer from a
+/// filter that matched nothing.
+fn filter_tree(tree: &mut crate::search::ConversationTree, opts: &TreeOpts) -> usize {
+    let nodes = std::mem::take(&mut tree.tree);
+    let role = opts.role.clone();
+    let no_tools = opts.no_tools;
+    let kept = if role.is_some() || no_tools {
+        prune_tree(nodes, None, &|node: &TreeNode| {
+            role.as_deref().is_none_or(|r| node.message_type == r)
+                && !(no_tools && is_tool_node(node))
+        })
+    } else {
+        nodes
+    };
+    let kept = if opts.flat { flatten_tree(kept) } else { kept };
+
+    fn count(nodes: &[TreeNode]) -> usize {
+        nodes.iter().map(|n| 1 + count(&n.children)).sum()
+    }
+    let returned = count(&kept);
+    tree.tree = kept;
+    returned
+}
+
 fn cmd_tree(session_id: &str, opts: TreeOpts) -> Result<()> {
-    let tree = lookup_tree(db::DEFAULT_DB_PATH, session_id, None)?;
+    let mut tree = lookup_tree(db::DEFAULT_DB_PATH, session_id, None)?;
 
     // Below the lookup, not above it: on top, the detached indexer it spawns would race
     // this command's own synchronous write for the same file against a 30s busy_timeout.
@@ -1580,12 +1647,35 @@ fn cmd_tree(session_id: &str, opts: TreeOpts) -> Result<()> {
     maybe_background_index();
 
     let code = tree_exit_code(&tree);
+    let filtered = tree.error.is_none();
+    let returned = if filtered {
+        let returned = filter_tree(&mut tree, &opts);
+        // Without this, a filter that matched nothing is indistinguishable from an empty
+        // conversation -- the exact ambiguity `tree_exit_code` documents avoiding. A
+        // warning says so while leaving the exit status at 0, since data was returned.
+        if returned == 0 && tree.total_messages > 0 {
+            tree.warning = Some(format!(
+                "0 of {} messages matched the filters",
+                tree.total_messages
+            ));
+        }
+        Some(returned)
+    } else {
+        None
+    };
 
     if opts.json {
         // The JSON body is unchanged, error key and all: the fzf preview and any existing
         // reader of `.error` keep working, and only the exit status becomes honest.
         let json_val = serde_json::to_value(&tree)?;
-        let localized = localize_timestamps(json_val);
+        let mut localized = localize_timestamps(json_val);
+        apply_tree_content(&mut localized, &opts);
+        if let (Some(returned), Some(map)) = (returned, localized.as_object_mut()) {
+            map.insert(
+                "returned_messages".to_string(),
+                serde_json::Value::from(returned),
+            );
+        }
         println!("{}", serde_json::to_string_pretty(&localized)?);
     } else {
         println!("Conversation tree: {}\n", session_id);
@@ -1598,7 +1688,12 @@ fn cmd_tree(session_id: &str, opts: TreeOpts) -> Result<()> {
             if let Some(ref warning) = tree.warning {
                 eprintln!("Warning: {}", warning);
             }
-            print_tree_nodes(&tree.tree, 0);
+            print_tree_nodes(&tree.tree, 0, &opts);
+            if let Some(returned) = returned {
+                if returned != tree.total_messages {
+                    println!("\n{} of {} messages shown", returned, tree.total_messages);
+                }
+            }
         }
     }
 
@@ -1613,7 +1708,7 @@ fn cmd_tree(session_id: &str, opts: TreeOpts) -> Result<()> {
     Ok(())
 }
 
-fn print_tree_nodes(nodes: &[TreeNode], indent: usize) {
+fn print_tree_nodes(nodes: &[TreeNode], indent: usize, opts: &TreeOpts) {
     for node in nodes {
         let icon = if node.message_type == "user" {
             "\u{1f464}"
@@ -1624,7 +1719,16 @@ fn print_tree_nodes(nodes: &[TreeNode], indent: usize) {
         let truncated: String = summary.chars().take(80).collect();
         let prefix = "  ".repeat(indent);
         println!("{}{} {}", prefix, icon, truncated);
-        print_tree_nodes(&node.children, indent + 1);
+        if opts.content {
+            let (body, dropped) = truncate_chars(&node.full_content, opts.content_chars);
+            for line in body.lines() {
+                println!("{}    {}", prefix, line);
+            }
+            if dropped {
+                println!("{}    ...", prefix);
+            }
+        }
+        print_tree_nodes(&node.children, indent + 1, opts);
     }
 }
 
@@ -2303,8 +2407,8 @@ mod index_single_session_tests {
 
 #[cfg(test)]
 mod tree_filter_tests {
-    use super::{flatten_tree, is_tool_node, prune_tree};
-    use crate::search::TreeNode;
+    use super::{filter_tree, flatten_tree, is_tool_node, prune_tree, TreeOpts};
+    use crate::search::{ConversationTree, TreeNode};
 
     fn node(uuid: &str, parent: Option<&str>, role: &str, body: &str, depth: i64) -> TreeNode {
         TreeNode {
@@ -2382,6 +2486,53 @@ mod tree_filter_tests {
         assert!(!is_tool_node(&node("x", None, "user", "a real message", 0)));
     }
 
+    fn opts(role: Option<&str>, no_tools: bool, flat: bool) -> TreeOpts {
+        TreeOpts {
+            role: role.map(str::to_string),
+            no_tools,
+            flat,
+            content: false,
+            content_chars: 300,
+            json: true,
+        }
+    }
+
+    fn conversation(nodes: Vec<TreeNode>, total: usize) -> ConversationTree {
+        ConversationTree {
+            conversation: None,
+            tree: nodes,
+            total_messages: total,
+            warning: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn filtering_counts_only_the_surviving_nodes() {
+        let mut tree = conversation(sandwich(), 3);
+        let returned = filter_tree(&mut tree, &opts(None, true, false));
+        assert_eq!(returned, 2, "the [Tool result] node is gone");
+        // total_messages keeps meaning "messages in the session", not "rows returned".
+        assert_eq!(tree.total_messages, 3);
+    }
+
+    #[test]
+    fn filtering_everything_away_is_reported_rather_than_looking_empty() {
+        let tool_only = vec![node("t1", None, "user", "[Tool result]", 0)];
+        let mut tree = conversation(tool_only, 1);
+        let returned = filter_tree(&mut tree, &opts(None, true, false));
+        assert_eq!(returned, 0);
+        assert!(tree.tree.is_empty());
+    }
+
+    #[test]
+    fn an_unfiltered_tree_is_returned_untouched() {
+        let mut tree = conversation(sandwich(), 3);
+        let returned = filter_tree(&mut tree, &opts(None, false, false));
+        assert_eq!(returned, 3);
+        assert_eq!(tree.tree[0].message_uuid, "u1");
+    }
+
     #[test]
     fn flattening_preserves_transcript_order_and_depth() {
         let flat = flatten_tree(sandwich());
@@ -2392,5 +2543,87 @@ mod tree_filter_tests {
             vec![0, 1, 2]
         );
         assert!(flat.iter().all(|n| n.children.is_empty()));
+    }
+}
+
+#[cfg(test)]
+mod tree_json_tests {
+    use super::{apply_tree_content, TreeOpts};
+
+    fn opts(content: bool, content_chars: usize) -> TreeOpts {
+        TreeOpts {
+            role: None,
+            no_tools: false,
+            flat: false,
+            content,
+            content_chars,
+            json: true,
+        }
+    }
+
+    fn tree_json() -> serde_json::Value {
+        serde_json::json!({
+            "tree": [{
+                "message_uuid": "u1",
+                "full_content": "abcdefghij",
+                "children": [{
+                    "message_uuid": "u2",
+                    "full_content": "xyz",
+                    "children": []
+                }]
+            }]
+        })
+    }
+
+    fn bodies(v: &serde_json::Value) -> Vec<Option<String>> {
+        fn walk(node: &serde_json::Value, out: &mut Vec<Option<String>>) {
+            out.push(
+                node.get("full_content")
+                    .and_then(|b| b.as_str())
+                    .map(str::to_string),
+            );
+            for child in node["children"].as_array().into_iter().flatten() {
+                walk(child, out);
+            }
+        }
+        let mut out = Vec::new();
+        for node in v["tree"].as_array().into_iter().flatten() {
+            walk(node, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn without_content_every_body_is_dropped() {
+        // The default has to stay small: a 265-message session used to serialise in full.
+        let mut v = tree_json();
+        apply_tree_content(&mut v, &opts(false, 300));
+        assert_eq!(bodies(&v), vec![None, None]);
+        // Nested nodes must be reached too, not just roots.
+        assert!(v["tree"][0]["children"][0]["message_uuid"] == "u2");
+    }
+
+    #[test]
+    fn with_content_bodies_are_truncated_and_flagged() {
+        let mut v = tree_json();
+        apply_tree_content(&mut v, &opts(true, 4));
+        assert_eq!(
+            bodies(&v),
+            vec![Some("abcd".to_string()), Some("xyz".to_string())]
+        );
+        assert_eq!(v["tree"][0]["full_content_truncated"], true);
+        assert_eq!(v["tree"][0]["children"][0]["full_content_truncated"], false);
+    }
+
+    #[test]
+    fn the_truncation_flag_is_written_on_every_node() {
+        // `search` always writes it; omitting it on untruncated nodes would force consumers
+        // to handle two shapes for the same field.
+        let mut v = tree_json();
+        apply_tree_content(&mut v, &opts(true, 999));
+        assert!(v["tree"][0].get("full_content_truncated").is_some());
+        assert!(v["tree"][0]["children"][0]
+            .get("full_content_truncated")
+            .is_some());
     }
 }
