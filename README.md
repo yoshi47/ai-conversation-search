@@ -425,4 +425,6 @@ MIT
 
 ## Acknowledgments
 
-Built for the Claude Code ecosystem. Uses smart hybrid extraction for instant, cost-free indexing.
+Originally based on [cc-conversation-search](https://github.com/akatz-ai/cc-conversation-search) by akatz-ai (MIT), now an independent project with multi-source support (Claude Code, OpenCode, Codex CLI), hybrid indexing, and a bundled Claude Code plugin.
+
+Built for the AI coding ecosystem. Uses smart hybrid extraction for instant, cost-free indexing.
