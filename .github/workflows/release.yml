@@ -46,8 +46,19 @@ jobs:
       - uses: actions/checkout@v6
       - uses: actions/download-artifact@v8
       - run: cp bin/ai-conversation-search ai-conversation-search-wrapper
+      - name: Extract release notes from CHANGELOG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" '
+            $0 ~ "^## \\[" ver "\\]" {flag=1; next}
+            flag && /^## \[/ {exit}
+            flag {print}
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          echo "----- extracted -----"; cat RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md || { echo "::error::CHANGELOG に [$VERSION] の節が無い"; exit 1; }
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             */ai-conversation-search-*
             ai-conversation-search-wrapper
