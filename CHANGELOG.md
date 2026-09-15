@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.16.2] - 2026-09-15
+
+セッションのタイトル（会話サマリ）で検索が引けるようになった。あわせて、過去セッションの監査で確定したスキルの誤用フリクションを SKILL.md 側で塞いだ。
+
+### Added
+
+- **タイトル（`conversation_summary`）一致を検索結果に含めるようにした**。タイトルは `conversations` テーブルにあり messages の FTS 索引に入っていないため、本文に同語が無いとタイトルで覚えているセッションが 0 件になっていた。本文 FTS の結果を作ったあと、本文でヒットしていないタイトル一致セッションだけを会話単位のフィルタで引いて合流させる（新テーブルや再インデックスは不要）。ピッカーの live 検索（`search --group-by-session`）経路も同対応で、fzf ヘッダの「titles + content」が実態と一致するようになった
+
+  - 本文と重複するセッションは除外するため、両方に一致する場合は本物の本文行が代表・上位に残る（代表のハイジャックを防ぐ）
+  - 日付 / リポジトリ / ソースのフィルタは `conversations` の列（`first_message_at`/`last_message_at` の重なり）で判定するため、代表メッセージの時刻に依存しない
+  - 引用句や FTS 演算子クエリ（`foo NOT bar` 等）ではタイトル照合をスキップする。演算子を無視して AND すると `NOT` が反転し除外語をタイトルで拾ってしまうため（本文 FTS 側は従来どおり演算子を尊重する）
+
+  注記: `--group-by-session` の `match_count` は、タイトルのみ一致したセッションを 1 と数える（本文に検索語を含むメッセージがあるわけではない）。統計合計 `total_matched_messages` はこれらを含めない
+
+### Fixed
+
+- **`conversation-search` スキルの SKILL.md で、監査で確定した誤用フリクション5件を塞いだ**（ドキュメントのみ、Rust 無変更）。生 `.jsonl` を `python3`/`json.loads`/`jq` で直接パースする抜け穴とサブエージェント委任時の制約非継承、`--json` の stderr 混入とスキーマ当て推量（`search` と `list` でフィールドが違う）、狭い検索範囲のまま断定する挙動、TodoWrite が使えないコンテキストで MANDATORY 手順が実行不能になる矛盾、`--no-tools` が本文を落とす条件と短縮 ID を `claude --resume` に渡すと失敗する点、をそれぞれ明文化した
+
 ## [0.16.1] - 2026-08-20
 
 0.16.0 のリリースノートと `REFERENCE.md` に載せた遡及手順が誤っていたため、その訂正のみ。コードに変更はない。
