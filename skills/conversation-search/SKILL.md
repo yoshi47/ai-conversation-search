@@ -10,7 +10,7 @@ Find past conversations across Claude Code, OpenCode, and Codex CLI and get the 
 
 ## MANDATORY FIRST STEP - CREATE TODO CHECKLIST
 
-**Before doing ANYTHING else, you MUST use the TodoWrite tool to create this exact checklist:**
+**Before doing ANYTHING else, you MUST use the TodoWrite tool to create this exact checklist:** (If TodoWrite is not in this session's tool list — e.g. a subagent/background context — skip the checklist and go straight to Level 0/1; do not block on it.)
 
 ```
 - Ensure ai-conversation-search tool is installed and upgraded
@@ -23,10 +23,11 @@ Find past conversations across Claude Code, OpenCode, and Codex CLI and get the 
 ```
 
 **CRITICAL CONSTRAINTS:**
-- DO NOT use grep, find, cat, or any manual file operations on .jsonl files
-- DO NOT skip the todo creation step
+- DO NOT use grep, find, cat, or any manual file operations on .jsonl files — this also bans parsing raw .jsonl with `python3`/`json.loads`/`jq` (piping this tool's own `--json` is fine; see below)
+- DO NOT skip the todo creation step when TodoWrite is available
 - DO NOT jump to Level 3 without attempting Levels 1 and 2
 - ONLY use ai-conversation-search commands to *locate and read* conversations
+- When you delegate past-session investigation to a subagent (Task tool), the subagent does NOT inherit these constraints — your delegating prompt MUST tell it to use `ai-conversation-search` (give the invocation) and MUST NOT tell it to grep/find/read `~/.claude/projects` or `.jsonl` files directly
 - Piping this tool's own `--json` output through `jq` is fine and expected — but reach for
   the built-in flags first (`--role`, `--no-tools`, `--flat`, `--content-chars`), which
   cover the common filters and return far less text
@@ -188,6 +189,10 @@ For temporal queries:
 
 ### Level 4: Present Results
 
+**Before asserting a match:**
+- Confirm the candidate's `context_snippet`/content actually matches the query's concrete anchors (proper nouns, dates, PR/issue numbers, the described context). If the tie is weak, present it as "最有力候補" with a caveat, not as a confirmed hit.
+- State the search scope you used (`--days`/`--repo`/`--date`, or "全期間 (no filter)"). A narrow scope silently reported as exhaustive is how wrong sessions get presented as answers.
+
 **Format results for the user:**
 
 For found conversations (results include a `source` field: `claude_code`, `opencode`, or `codex`):
@@ -221,6 +226,11 @@ For counting/analysis queries:
 - "The conversation may not exist or may be older than indexed range"
 
 ## Command Reference
+
+### Reading `--json` output (two parse traps)
+
+- Pipe as `... --json 2>/dev/null | jq`, never `2>&1`. The CLI writes diagnostics (`Note: showing first N results...`, FTS/reindex notices) to stderr on purpose; folding them into stdout makes `jq`/`json.loads` fail with "Extra data".
+- Use the real field names — don't guess `text`/`snippet`/`.messages[]`. `search` rows are message-level: `context_snippet` (matched text; `full_content` with `--content`), `message_type`, `timestamp`, `session_id`, `resume_command`, `source`, `project_path`. `list` rows are conversation-level and have NO `context_snippet`/`timestamp` — instead `conversation_summary`, `first_message_at`/`last_message_at`, `message_count`, plus `session_id`/`resume_command`/`source`/`project_path`. Size output with `--limit`/`--content-chars`, never by truncating the stream (`head -c` before `json.load` corrupts it).
 
 ### Search (for topic and hybrid queries)
 ```bash
@@ -285,6 +295,8 @@ ai-conversation-search list --days 7 --repo myproject --json
 ai-conversation-search list --source codex --json
 ```
 
+Like `search`, `list` is capped by `--limit` — the default cap can return only sessions newer than a target date and drop the older one you want. See the `.truncated` note below.
+
 ### Status
 ```bash
 # Check index health, coverage, and unindexed files
@@ -305,12 +317,14 @@ session; pass more characters to disambiguate. When the id resolves to nothing, 
 indexes that session's transcript and retries once, so a conversation that ended moments
 ago is readable without running `index`.
 
+The short prefix works for `tree`/`context` only. `claude --resume` does NOT resolve prefixes — always put the full `session_id` (UUID) from the `tree`/search result into the resume command.
+
 **`tree` options** — use these instead of post-processing the tree yourself:
 
 | Flag | Effect |
 |---|---|
 | `--role user` / `--role assistant` | Keep only that side of the conversation |
-| `--no-tools` | Drop `[Tool: X]` / `[Tool result]` / interrupt nodes, and empty bodies |
+| `--no-tools` | Drop `[Tool: X]` / `[Tool result]` / interrupt nodes, and empty bodies. **Also drops the command text on `[Tool: X]` nodes and any message text that shares a node with a `[Tool result]` marker** — skip this flag, or narrow with `--role`, when that text matters. (Tool *output* itself — bash stdout, fetched pages — is never indexed, so `--no-tools` is not why it's missing.) |
 | `--flat` | Return a flat list instead of nested `children`, in timestamp order |
 | `--content` | Include message bodies (omitted by default) |
 | `--content-chars N` | Cap each body at N characters (default 300) |
