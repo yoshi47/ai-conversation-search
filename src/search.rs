@@ -749,7 +749,10 @@ impl ConversationSearch {
         // Phase 2: Query messages+conversations by rowid IN batches.
         let scored = self.query_fts_rowids(&fts_query)?;
 
-        if scored.is_empty() {
+        // Empty FTS is not "no match" when the query can still match a title: fall
+        // through so inject_title_matches (below) runs. The empty batch loop is a
+        // no-op, so title-only sessions are the only rows produced.
+        if scored.is_empty() && Self::title_terms(trimmed).is_empty() {
             let stats = self.gather_search_stats(filter, 0, false)?;
             return Ok(SearchResult {
                 rows: Vec::new(),
@@ -757,7 +760,7 @@ impl ConversationSearch {
             });
         }
 
-        let score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
+        let mut score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
 
         // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
         const BATCH_SIZE: usize = 500;
@@ -814,6 +817,9 @@ impl ConversationSearch {
                 break;
             }
         }
+
+        // タイトルのみ一致するセッションを本文結果に合流（本文ヒット済みは除外）。
+        self.inject_title_matches(trimmed, filter, &mut all_results, &mut score_by_rowid)?;
 
         // bm25's length normalization is what sinks the multi-KB observer transcripts,
         // but it could in principle let a one-line fragment outrank a substantive
@@ -946,7 +952,8 @@ impl ConversationSearch {
         // FTS path: same trigram two-phase strategy as search_conversations.
         let scored = self.query_fts_rowids(&fts_query)?;
 
-        if scored.is_empty() {
+        // See search_conversations: fall through when a title can still match.
+        if scored.is_empty() && Self::title_terms(trimmed).is_empty() {
             let stats = self.gather_search_stats(filter, 0, false)?;
             return Ok(GroupedSearchResult {
                 rows: Vec::new(),
@@ -998,7 +1005,9 @@ impl ConversationSearch {
         // The representative moves with the ranking on purpose. Surfacing a session
         // because it holds a highly relevant message, then showing a different message
         // as the snippet, makes the ranking look broken.
-        let score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
+        let mut score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
+        // タイトルのみ一致するセッションを合流（本文ヒット済みは除外＝代表を奪わない）。
+        self.inject_title_matches(trimmed, filter, &mut all_results, &mut score_by_rowid)?;
         match filter.sort {
             SortOrder::Relevance => all_results.sort_by(|a, b| {
                 let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
@@ -1089,6 +1098,142 @@ impl ConversationSearch {
             params.push(Box::new(s.to_string()));
         }
 
+        Ok(())
+    }
+
+    /// Terms used for title (conversation_summary) matching. Quoted phrases and
+    /// FTS operator queries are skipped (they never appear literally in a title).
+    fn title_terms(trimmed: &str) -> Vec<&str> {
+        if trimmed.contains('"') {
+            return Vec::new();
+        }
+        trimmed
+            .split_whitespace()
+            .filter(|t| !matches!(*t, "AND" | "OR" | "NOT"))
+            .collect()
+    }
+
+    /// Filters against `conversations` columns. A title match is a session-level
+    /// fact, so dates are judged by overlap of the session's activity window
+    /// [first_message_at, last_message_at] with the requested range, not by any
+    /// single message's timestamp.
+    fn append_conversation_filters(
+        sql: &mut String,
+        params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+        filter: &SearchFilter<'_>,
+    ) -> Result<()> {
+        use chrono::{NaiveTime, TimeDelta};
+
+        if let Some(d) = filter.date {
+            let start = crate::date_utils::parse_date(d)?;
+            let end = start + TimeDelta::days(1);
+            sql.push_str(" AND c.last_message_at >= ? AND c.first_message_at < ?");
+            params.push(Box::new(
+                start
+                    .and_time(NaiveTime::MIN)
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string(),
+            ));
+            params.push(Box::new(
+                end.and_time(NaiveTime::MIN)
+                    .format("%Y-%m-%dT%H:%M:%S")
+                    .to_string(),
+            ));
+        } else if filter.since.is_some() || filter.until.is_some() {
+            if let Some(s) = filter.since {
+                let start = crate::date_utils::parse_date(s)?.and_time(NaiveTime::MIN);
+                sql.push_str(" AND c.last_message_at >= ?");
+                params.push(Box::new(start.format("%Y-%m-%dT%H:%M:%S").to_string()));
+            }
+            if let Some(u) = filter.until {
+                let end =
+                    (crate::date_utils::parse_date(u)? + TimeDelta::days(1)).and_time(NaiveTime::MIN);
+                sql.push_str(" AND c.first_message_at < ?");
+                params.push(Box::new(end.format("%Y-%m-%dT%H:%M:%S").to_string()));
+            }
+        } else if let Some(d) = filter.days_back {
+            let cutoff = (chrono::Local::now() - TimeDelta::days(d)).naive_local();
+            sql.push_str(" AND c.last_message_at >= ?");
+            params.push(Box::new(cutoff.format("%Y-%m-%dT%H:%M:%S").to_string()));
+        }
+
+        if let Some(pp) = filter.project_path {
+            sql.push_str(" AND c.project_path = ?");
+            params.push(Box::new(pp.to_string()));
+        }
+        if let Some(r) = filter.repo {
+            sql.push_str(" AND c.repo_root LIKE ? ESCAPE '\\'");
+            params.push(Box::new(format!("%{}%", escape_like(r))));
+        }
+        if let Some(s) = filter.source {
+            sql.push_str(" AND c.source = ?");
+            params.push(Box::new(s.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Sessions whose title matches every term and passes the session-level
+    /// filters, minus those already surfaced by body FTS (`seen_sessions`).
+    /// Anchored on the newest non-meta message so resume works; `context_snippet`
+    /// carries the title itself, so the caller can see why it matched.
+    fn title_only_rows(
+        &mut self,
+        terms: &[&str],
+        filter: &SearchFilter<'_>,
+        seen_sessions: &std::collections::HashSet<String>,
+    ) -> Result<Vec<SearchResultRow>> {
+        if terms.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut sql = String::from(
+            "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, \
+                    m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, \
+                    c.conversation_summary AS context_snippet, \
+                    c.conversation_summary, c.conversation_file, c.source \
+             FROM conversations c \
+             JOIN messages m ON m.message_uuid = ( \
+                 SELECT m2.message_uuid FROM messages m2 \
+                 WHERE m2.session_id = c.session_id AND m2.is_meta_conversation = FALSE \
+                 ORDER BY m2.rowid DESC LIMIT 1 ) \
+             WHERE c.conversation_summary IS NOT NULL",
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        for term in terms {
+            sql.push_str(" AND c.conversation_summary LIKE ? ESCAPE '\\'");
+            params.push(Box::new(format!("%{}%", escape_like(term))));
+        }
+        Self::append_conversation_filters(&mut sql, &mut params, filter)?;
+
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let rows = self.query_rows(&sql, &param_refs, SearchResultRow::from_row)?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| !seen_sessions.contains(&r.session_id))
+            .collect())
+    }
+
+    /// Fold title-only sessions into an existing body-FTS result set, ranked
+    /// first. Sessions already present (body hits) are excluded so their real
+    /// best-scoring message stays the representative.
+    fn inject_title_matches(
+        &mut self,
+        trimmed: &str,
+        filter: &SearchFilter<'_>,
+        all_results: &mut Vec<SearchResultRow>,
+        score_by_rowid: &mut HashMap<i64, f64>,
+    ) -> Result<()> {
+        let terms = Self::title_terms(trimmed);
+        if terms.is_empty() {
+            return Ok(());
+        }
+        let seen: std::collections::HashSet<String> =
+            all_results.iter().map(|r| r.session_id.clone()).collect();
+        let title_rows = self.title_only_rows(&terms, filter, &seen)?;
+        for r in &title_rows {
+            score_by_rowid.insert(r.rowid, f64::NEG_INFINITY);
+        }
+        all_results.splice(0..0, title_rows);
         Ok(())
     }
 
@@ -3025,6 +3170,175 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1");
+    }
+
+    #[test]
+    fn test_search_matches_title_only() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "RedisMigration plan",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "we discussed caching strategy at length",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_conversations("RedisMigration", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].session_id, "sess1");
+    }
+
+    #[test]
+    fn test_title_and_body_match_no_duplicate() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "RedisMigration plan",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        // 本文にも同語 → 本文ヒット。タイトルアンカーが重複追加されないこと。
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "we finished the RedisMigration today",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_conversations("RedisMigration", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].message_uuid, "msg1"); // 合成アンカーではなく本文行
+    }
+
+    #[test]
+    fn test_grouped_search_matches_title_only() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "RedisMigration plan",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "we discussed caching strategy at length",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_grouped_by_session("RedisMigration", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].representative.session_id, "sess1");
+    }
+
+    #[test]
+    fn test_title_match_respects_repo_filter() {
+        let conn = setup_test_db();
+        insert_test_conversation_with_repo(
+            &conn,
+            "sess1",
+            "/proj",
+            "RedisMigration plan",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+            "/repos/alpha",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "unrelated body text",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let mut f = default_filter();
+        f.repo = Some("beta"); // 別リポジトリ → 除外
+        assert_eq!(
+            searcher
+                .search_conversations("RedisMigration", &f)
+                .unwrap()
+                .rows
+                .len(),
+            0
+        );
+
+        let mut f2 = default_filter();
+        f2.repo = Some("alpha"); // 一致 → ヒット
+        assert_eq!(
+            searcher
+                .search_conversations("RedisMigration", &f2)
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_title_match_date_uses_session_range() {
+        // 代表は最新メッセージ(Jan-10)だが、セッション活動期間 [Jan-01, Jan-10] が
+        // --until Jan-05 と重なるので含めるべき（メッセージ時刻依存だと誤って落ちる）。
+        let conn = setup_test_db();
+        conn.execute(
+            "INSERT INTO conversations (session_id, project_path, conversation_file, root_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, source) \
+             VALUES ('sess1', '/proj', 'test.jsonl', 'm1', 'RedisMigration', '2025-01-01T00:00:00', '2025-01-10T00:00:00', 2, 'claude_code')",
+            [],
+        ).unwrap();
+        insert_test_message(&conn, "m1", "sess1", "early body", "user", "2025-01-01T00:00:00", "/proj");
+        insert_test_message(&conn, "m2", "sess1", "late body", "user", "2025-01-10T00:00:00", "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let mut f = default_filter();
+        f.until = Some("2025-01-05");
+        let rows = searcher
+            .search_conversations("RedisMigration", &f)
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].session_id, "sess1");
     }
 
     #[test]
