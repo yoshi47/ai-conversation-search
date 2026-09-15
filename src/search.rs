@@ -818,8 +818,14 @@ impl ConversationSearch {
             }
         }
 
-        // タイトルのみ一致するセッションを本文結果に合流（本文ヒット済みは除外）。
-        self.inject_title_matches(trimmed, filter, &mut all_results, &mut score_by_rowid)?;
+        // 本文ヒット済みセッションは除外して合流し、代表/上位を奪わせない。
+        self.inject_title_matches(
+            trimmed,
+            filter,
+            &mut all_results,
+            &mut score_by_rowid,
+            limit,
+        )?;
 
         // bm25's length normalization is what sinks the multi-KB observer transcripts,
         // but it could in principle let a one-line fragment outrank a substantive
@@ -1006,8 +1012,14 @@ impl ConversationSearch {
         // because it holds a highly relevant message, then showing a different message
         // as the snippet, makes the ranking look broken.
         let mut score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
-        // タイトルのみ一致するセッションを合流（本文ヒット済みは除外＝代表を奪わない）。
-        self.inject_title_matches(trimmed, filter, &mut all_results, &mut score_by_rowid)?;
+        // 本文ヒット済みセッションは除外して合流し、代表を奪わせない。
+        self.inject_title_matches(
+            trimmed,
+            filter,
+            &mut all_results,
+            &mut score_by_rowid,
+            limit,
+        )?;
         match filter.sort {
             SortOrder::Relevance => all_results.sort_by(|a, b| {
                 let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
@@ -1101,16 +1113,20 @@ impl ConversationSearch {
         Ok(())
     }
 
-    /// Terms used for title (conversation_summary) matching. Quoted phrases and
-    /// FTS operator queries are skipped (they never appear literally in a title).
+    /// Terms used for title (conversation_summary) matching, or empty to skip it.
+    /// Quoted phrases and FTS operator queries are skipped: ANDing the operands as
+    /// a title predicate would invert `NOT` (surfacing the excluded term) and
+    /// over-restrict `OR`. Body FTS still honours the operator; only the title
+    /// supplement is skipped. Operator detection mirrors `plan_query` (spaced).
     fn title_terms(trimmed: &str) -> Vec<&str> {
-        if trimmed.contains('"') {
+        if trimmed.contains('"')
+            || trimmed.contains(" AND ")
+            || trimmed.contains(" OR ")
+            || trimmed.contains(" NOT ")
+        {
             return Vec::new();
         }
-        trimmed
-            .split_whitespace()
-            .filter(|t| !matches!(*t, "AND" | "OR" | "NOT"))
-            .collect()
+        trimmed.split_whitespace().collect()
     }
 
     /// Filters against `conversations` columns. A title match is a session-level
@@ -1146,8 +1162,8 @@ impl ConversationSearch {
                 params.push(Box::new(start.format("%Y-%m-%dT%H:%M:%S").to_string()));
             }
             if let Some(u) = filter.until {
-                let end =
-                    (crate::date_utils::parse_date(u)? + TimeDelta::days(1)).and_time(NaiveTime::MIN);
+                let end = (crate::date_utils::parse_date(u)? + TimeDelta::days(1))
+                    .and_time(NaiveTime::MIN);
                 sql.push_str(" AND c.first_message_at < ?");
                 params.push(Box::new(end.format("%Y-%m-%dT%H:%M:%S").to_string()));
             }
@@ -1174,17 +1190,23 @@ impl ConversationSearch {
 
     /// Sessions whose title matches every term and passes the session-level
     /// filters, minus those already surfaced by body FTS (`seen_sessions`).
-    /// Anchored on the newest non-meta message so resume works; `context_snippet`
-    /// carries the title itself, so the caller can see why it matched.
+    /// Anchored on the session's highest-rowid non-meta message (its resume
+    /// anchor); `context_snippet` carries the title itself so the caller can see
+    /// why it matched. Capped at `limit` recent sessions so a common substring
+    /// cannot fan out into one row per conversation.
     fn title_only_rows(
         &mut self,
         terms: &[&str],
         filter: &SearchFilter<'_>,
         seen_sessions: &std::collections::HashSet<String>,
+        limit: i64,
     ) -> Result<Vec<SearchResultRow>> {
         if terms.is_empty() {
             return Ok(Vec::new());
         }
+        // A session with only meta messages has no anchor: the subquery yields
+        // NULL, the JOIN drops it, and the title match is silently skipped. That
+        // is correct -- there is no resumable message to point resume at.
         let mut sql = String::from(
             "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, \
                     m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, \
@@ -1203,6 +1225,8 @@ impl ConversationSearch {
             params.push(Box::new(format!("%{}%", escape_like(term))));
         }
         Self::append_conversation_filters(&mut sql, &mut params, filter)?;
+        sql.push_str(" ORDER BY c.last_message_at DESC LIMIT ?");
+        params.push(Box::new(limit.saturating_add(1)));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
@@ -1222,6 +1246,7 @@ impl ConversationSearch {
         filter: &SearchFilter<'_>,
         all_results: &mut Vec<SearchResultRow>,
         score_by_rowid: &mut HashMap<i64, f64>,
+        limit: i64,
     ) -> Result<()> {
         let terms = Self::title_terms(trimmed);
         if terms.is_empty() {
@@ -1229,7 +1254,7 @@ impl ConversationSearch {
         }
         let seen: std::collections::HashSet<String> =
             all_results.iter().map(|r| r.session_id.clone()).collect();
-        let title_rows = self.title_only_rows(&terms, filter, &seen)?;
+        let title_rows = self.title_only_rows(&terms, filter, &seen, limit)?;
         for r in &title_rows {
             score_by_rowid.insert(r.rowid, f64::NEG_INFINITY);
         }
@@ -3318,6 +3343,38 @@ mod tests {
     }
 
     #[test]
+    fn test_title_match_skips_operator_query() {
+        // `foo NOT bar` はタイトルに bar を含むセッションを除外したいはず。演算子を無視して
+        // AND すると逆に surface してしまう。演算子クエリでは title 照合をスキップする。
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "foo bar", // 除外語 bar を含むタイトル
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "msg1",
+            "sess1",
+            "unrelated body",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let rows = searcher
+            .search_conversations("foo NOT bar", &default_filter())
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
     fn test_title_match_date_uses_session_range() {
         // 代表は最新メッセージ(Jan-10)だが、セッション活動期間 [Jan-01, Jan-10] が
         // --until Jan-05 と重なるので含めるべき（メッセージ時刻依存だと誤って落ちる）。
@@ -3327,8 +3384,24 @@ mod tests {
              VALUES ('sess1', '/proj', 'test.jsonl', 'm1', 'RedisMigration', '2025-01-01T00:00:00', '2025-01-10T00:00:00', 2, 'claude_code')",
             [],
         ).unwrap();
-        insert_test_message(&conn, "m1", "sess1", "early body", "user", "2025-01-01T00:00:00", "/proj");
-        insert_test_message(&conn, "m2", "sess1", "late body", "user", "2025-01-10T00:00:00", "/proj");
+        insert_test_message(
+            &conn,
+            "m1",
+            "sess1",
+            "early body",
+            "user",
+            "2025-01-01T00:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "m2",
+            "sess1",
+            "late body",
+            "user",
+            "2025-01-10T00:00:00",
+            "/proj",
+        );
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let mut f = default_filter();
