@@ -177,9 +177,9 @@ acs_pick() {
             --help)
                 echo "Usage: ai-conversation-search pick [QUERY] [OPTIONS]"
                 echo ""
-                echo "Interactive session picker using fzf with live body/content search."
-                echo "Typing in the picker runs a full-text search against message bodies"
-                echo "using SQLite FTS5 (trigram tokenizer, Japanese/CJK friendly)."
+                echo "Interactive session picker using fzf with live title/body search."
+                echo "Typing in the picker runs a full-text search against session titles"
+                echo "and message bodies using SQLite FTS5 (trigram tokenizer, Japanese/CJK friendly)."
                 echo ""
                 echo "Arguments:"
                 echo "  QUERY           Initial search query (optional, shown in the prompt)"
