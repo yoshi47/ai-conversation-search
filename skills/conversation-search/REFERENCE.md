@@ -545,7 +545,7 @@ tree / context / status                    →  a command-specific object
 ```
 
 ### OpenCode (SQLite)
-Reads directly from OpenCode's `opencode.db` database. Path can be overridden with `OPENCODE_HOME` env var.
+Reads directly from OpenCode's `opencode.db` database (OpenCode v2 or later; the v1 schema is not supported). Path can be overridden with `OPENCODE_HOME` env var.
 
 ### Codex CLI (JSONL)
 Reads session files from `~/.codex/sessions/{year}/{month}/{day}/*.jsonl`.

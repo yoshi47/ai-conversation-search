@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Changed (breaking)
+
+- **OpenCode の読み取りを v2 のスキーマに置き換えた。v1 の DB は読まない**。v2 では DB（パスは同じ `~/.local/share/opencode/opencode.db`）の `session` / `message` / `part` テーブルが `session_v2` / `session_message` に置き換わった。そのため従来のクエリは失敗し、`Warning: failed to index OpenCode conversations` が出て v2 のセッションが 1 件も入らなかった。v2 に上げると OpenCode 側の DB から v1 のテーブルは消えるので、互換経路は残していない。OpenCode v1 のままだと、インデックス時に同じ警告が出て OpenCode 分がスキップされる（インデックス済みのセッションは残る）
+
+  - 取り込むメッセージは `user` / `assistant` だけ。`system` / `synthetic`（system-reminder）/ `shell` / `compaction` 等は、v1 で user/assistant 以外の role を捨てていたのと同じ扱いにした
+  - v2 の `session_v2.time_updated` は、メッセージが追記されても更新されないことがある（手元の DB では大半のセッションで最終メッセージより古かった）。そのため同期カーソルと再インデックスの判定には、セッションとメッセージの `time_updated` の大きいほうを使う
+
 ## [0.16.2] - 2026-09-15
 
 セッションのタイトル（会話サマリ）で検索が引けるようになった。あわせて、過去セッションの監査で確定したスキルの誤用フリクションを SKILL.md 側で塞いだ。

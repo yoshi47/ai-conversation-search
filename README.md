@@ -260,6 +260,7 @@ in place, both fire and two indexers run at once.
 | **Codex CLI** | `~/.codex/sessions/{year}/{month}/{day}/*.jsonl` | `codex:` |
 
 - OpenCode DB path can be overridden with `OPENCODE_HOME` environment variable
+- OpenCode v2 or later is required (the v1 database schema is not supported)
 - All sources are automatically detected and indexed together
 - Results are tagged with source labels: `[CC]` (Claude Code), `[OC]` (OpenCode), `[CX]` (Codex CLI)
 
