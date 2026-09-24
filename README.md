@@ -37,6 +37,31 @@ Install the complete plugin (skill + CLI tool instructions) directly in Claude C
 
 Then follow the installation instructions shown by Claude to install the CLI tool and initialize the database.
 
+### Installation for Codex CLI / OpenCode
+
+Only the Claude Code plugin puts the CLI on `PATH`. For Codex CLI and OpenCode, first install
+the CLI with the wrapper ([Manual Installation](#1-install-cli-tool), steps 1–2; skip step 3), then add the skill:
+
+**Codex CLI** — this repo's marketplace works as a Codex plugin marketplace:
+
+```bash
+codex plugin marketplace add yoshi47/ai-conversation-search
+codex plugin add conversation-search@ai-conversation-search
+```
+
+Codex also reads the plugin's Claude Code hooks and asks you to trust them on first use.
+They are written for Claude Code; leaving them untrusted is fine, since `search` indexes on its own.
+
+**OpenCode** (v2) — add the skill catalog to `opencode.json(c)`:
+
+```jsonc
+{
+  "skills": ["https://raw.githubusercontent.com/yoshi47/ai-conversation-search/main/skills/"]
+}
+```
+
+OpenCode caches the skill and refreshes it when `version` in `skills/index.json` changes (bumped by `scripts/bump-version.sh`).
+
 ### Manual Installation
 
 #### 1. Install CLI Tool

@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+
+- Codex CLI と OpenCode への導入経路を用意した。Codex は既存の `.claude-plugin/marketplace.json` をそのまま読めるので、`codex plugin marketplace add yoshi47/ai-conversation-search` でプラグインとして入る。OpenCode 向けにはプラグインを用意せず、`skills/index.json`（HTTP カタログ）を追加し、`"skills"` に raw URL を書けば読み込まれるようにした
+- バージョンの一致チェック（`scripts/check-versions.sh`）を CI とリリースに追加した。Cargo.toml・plugin.json・marketplace.json・`skills/index.json`・ラッパーの `ACS_WRAPPER_VERSION` のどれかがずれていると CI が落ち、リリースはタグとずれていても止まる
+
 ## [0.17.0] - 2026-09-24
 
 ### Changed (breaking)

@@ -16,7 +16,16 @@ This updates all version locations:
 - `Cargo.toml` (Rust package)
 - `.claude-plugin/plugin.json` (plugin metadata)
 - `.claude-plugin/marketplace.json` (marketplace metadata)
+- `skills/index.json` (OpenCode skill catalog)
 - `bin/ai-conversation-search` (wrapper script version)
+
+CI (`scripts/check-versions.sh`) fails when any of these differs from `Cargo.toml`, and the
+release workflow also fails when they differ from the pushed tag.
+
+OpenCode loads the skill from `skills/index.json` on `main`. Existing OpenCode users keep their
+cached copy until `version` changes; new installs fetch `main` HEAD immediately, so keep SKILL.md on
+`main` compatible with the latest released binary. Its `files` list is hand-maintained: add any new file under
+`skills/conversation-search/` there, or OpenCode never downloads it.
 
 ## Pre-push Hook
 

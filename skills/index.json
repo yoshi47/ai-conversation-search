@@ -1,0 +1,9 @@
+{
+  "skills": [
+    {
+      "name": "conversation-search",
+      "version": "0.17.0",
+      "files": ["SKILL.md", "REFERENCE.md"]
+    }
+  ]
+}

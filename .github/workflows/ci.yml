@@ -14,6 +14,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  versions:
+    name: version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - run: ./scripts/check-versions.sh
+
   lint:
     name: fmt + clippy
     runs-on: ubuntu-latest
