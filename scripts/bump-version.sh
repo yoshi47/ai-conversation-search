@@ -35,6 +35,9 @@ sedi "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/plugi
 # Update marketplace.json
 sedi "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" .claude-plugin/marketplace.json
 
+# Update OpenCode skill catalog
+sedi "s/\"version\": \".*\"/\"version\": \"$NEW_VERSION\"/" skills/index.json
+
 # Update bin/ wrapper script
 sedi "s/^ACS_WRAPPER_VERSION=\".*\"/ACS_WRAPPER_VERSION=\"$NEW_VERSION\"/" bin/ai-conversation-search
 
@@ -43,9 +46,10 @@ echo "  - Cargo.toml"
 echo "  - Cargo.lock"
 echo "  - .claude-plugin/plugin.json"
 echo "  - .claude-plugin/marketplace.json"
+echo "  - skills/index.json"
 echo "  - bin/ai-conversation-search"
 
 # Verify
 echo ""
 echo "Verification:"
-grep -n "version.*$NEW_VERSION" Cargo.toml .claude-plugin/*.json bin/ai-conversation-search
+grep -n "version.*$NEW_VERSION" Cargo.toml .claude-plugin/*.json skills/index.json bin/ai-conversation-search

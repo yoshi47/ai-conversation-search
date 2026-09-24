@@ -66,7 +66,7 @@ explicitly says "resume".
 
 ## Prerequisites
 
-The `ai-conversation-search` CLI is automatically managed by the plugin wrapper.
+In Claude Code, the `ai-conversation-search` CLI is automatically managed by the plugin wrapper.
 On first use, it downloads the correct binary for your platform and caches it.
 
 **First todo: Verify tool is available**
@@ -77,6 +77,8 @@ ai-conversation-search --version
 
 If the command is not found, the plugin may not be properly installed.
 Guide the user: reinstall the plugin or visit https://github.com/yoshi47/ai-conversation-search
+Outside Claude Code (Codex CLI, OpenCode) nothing puts the CLI on PATH — the user installs it
+per README "Manual Installation".
 
 **The reported version must be 0.16.0 or newer.** Two things break below it. Before 0.15.0,
 `--json` returns a bare array instead of the `{"results": [...]}` envelope this skill

@@ -37,6 +37,43 @@ Install the complete plugin (skill + CLI tool instructions) directly in Claude C
 
 Then follow the installation instructions shown by Claude to install the CLI tool and initialize the database.
 
+### Installation for Codex CLI / OpenCode
+
+Only the Claude Code plugin puts the CLI on `PATH`. For Codex CLI and OpenCode, first install the
+CLI wrapper and initialize the database:
+
+```bash
+mkdir -p ~/.local/bin
+curl -fsSL "https://github.com/yoshi47/ai-conversation-search/releases/latest/download/ai-conversation-search-wrapper" \
+    -o ~/.local/bin/ai-conversation-search && chmod +x ~/.local/bin/ai-conversation-search
+ai-conversation-search init   # needs ~/.local/bin on PATH; downloads the binary on first run
+```
+
+Then add the skill:
+
+**Codex CLI** — this repo's marketplace works as a Codex plugin marketplace:
+
+```bash
+codex plugin marketplace add yoshi47/ai-conversation-search
+codex plugin add conversation-search@ai-conversation-search
+```
+
+Codex also runs the plugin's hooks and asks you to trust them on first use. Trusting them enables
+background indexing after each turn and a reminder that triggers the skill when a prompt contains a
+session UUID (needs `jq`). The indexing hook does nothing until the CLI has been run once (it only
+uses an already-downloaded binary), so install the CLI first. Left untrusted, the skill still works:
+`search` indexes on its own.
+
+**OpenCode** (v2) — add the skill catalog to `opencode.json(c)`:
+
+```jsonc
+{
+  "skills": ["https://raw.githubusercontent.com/yoshi47/ai-conversation-search/main/skills/"]
+}
+```
+
+OpenCode caches the skill and refreshes it when `version` in `skills/index.json` changes (bumped by `scripts/bump-version.sh`).
+
 ### Manual Installation
 
 #### 1. Install CLI Tool
