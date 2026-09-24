@@ -49,8 +49,9 @@ codex plugin marketplace add yoshi47/ai-conversation-search
 codex plugin add conversation-search@ai-conversation-search
 ```
 
-Codex also reads the plugin's Claude Code hooks and asks you to trust them on first use.
-They are written for Claude Code; leaving them untrusted is fine, since `search` indexes on its own.
+Codex also runs the plugin's hooks and asks you to trust them on first use. Trusting them enables
+background indexing after each turn and a reminder that triggers the skill when a prompt contains a
+session UUID (needs `jq`). Left untrusted, the skill still works: `search` indexes on its own.
 
 **OpenCode** (v2) — add the skill catalog to `opencode.json(c)`:
 
