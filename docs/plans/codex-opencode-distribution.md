@@ -77,8 +77,9 @@ Codex と OpenCode 向けの導入手順は README に無く、手元では chez
 
 ## スコープ外
 
-- Codex での hooks の動作保証（Stop のバックグラウンドインデックス、UUID リマインダ）。
-  Codex は Claude 形式の `hooks/hooks.json` も読み、イベントごとに信頼確認を求める（`~/.codex/config.toml` の `[hooks.state.*]`）。
-  そのため初回に承認プロンプトが出る。`${CLAUDE_PLUGIN_ROOT}` が Codex で展開されるかは未確認で、承認せず放置してよい
+（実装後に更新）Codex の hooks はスコープに入れた。公式ドキュメントに、Codex が `CLAUDE_PLUGIN_ROOT` をセットし
+`hooks/hooks.json` を自動で読むと書かれている。一時 CODEX_HOME で hook を trust して試すと、UserPromptSubmit と Stop が完走し、
+`~/.conversation-search/.last-auto-index` が更新された。README は「承認すると自動インデックスが効く」に直し、
+UUID リマインダの文面は Claude 固有の語（Skill tool、`~/.claude/projects` だけ）を外してツール中立にした
 - OpenCode 用の JS プラグイン（hook 相当）
 - OpenCode がオフラインで起動したときのカタログ取得失敗の挙動（未確認）。raw.githubusercontent の CDN キャッシュで反映が数分遅れることはある

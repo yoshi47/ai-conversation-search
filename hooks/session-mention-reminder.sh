@@ -35,6 +35,6 @@ printf '%s' "$PROMPT" | grep -qE "$UUID_RE" || exit 0
 printf '%s' "$PROMPT" | grep -qiE 'session|セッション|会話|conversation|resume|続き|過去' || exit 0
 
 cat <<'EOF'
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"The prompt contains a session UUID and references a past session. Use the conversation-search skill (Skill tool) to read that session — do not locate or read ~/.claude/projects/**/*.jsonl manually with find/grep/jq, even if the transcript path looks obvious, and even if the session is only input to another task."}}
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"The prompt contains a session UUID and references a past session. Use the conversation-search skill to read that session — do not locate or read transcripts manually (e.g. ~/.claude/projects, ~/.codex/sessions, the OpenCode database) with find/grep/jq/sqlite, even if the path looks obvious, and even if the session is only input to another task."}}
 EOF
 exit 0
