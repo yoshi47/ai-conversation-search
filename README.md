@@ -255,6 +255,15 @@ Present this and wait for user confirmation before resuming. `resume_command`
 is `null` for OpenCode/Codex sessions and when the path cannot be expressed
 safely in a shell command — treat `null` as "resume manually".
 
+### `ai-conversation-search preview`
+Preview the tail of a session without resuming it (read-only)
+```bash
+ai-conversation-search preview SESSION_ID [--query PHRASE] [--messages N] [--json]
+```
+Shows the last N messages (default: 30) with a plain `Project:` / `Messages:` /
+`Range:` header. `--query` highlights one phrase (count unchanged); `--json`
+returns the `tree --json` envelope plus `query` / `matches` / `cwd_exists`.
+
 ### `ai-conversation-search prune-observer`
 Remove claude-mem observer sessions indexed by earlier versions
 ```bash

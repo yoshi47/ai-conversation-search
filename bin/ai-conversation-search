@@ -222,20 +222,13 @@ acs_pick() {
 
     TAB=$(printf '\t')
 
-    # Preview: {1} is the session_id column. --content is not optional here -- tree omits
-    # full_content unless asked, so without it the message list below renders empty.
-    PREVIEW_CMD="$BINARY tree {1} --json --no-tools --flat --content --content-chars 150 2>/dev/null | jq -r '
-      \"📁 \" + (.conversation.project_path // \"unknown\"),
-      \"💬 \" + (.total_messages | tostring) + \" messages\",
-      \"🕐 \" + ((.conversation.first_message_at // \"\")[0:16] | gsub(\"T\"; \" \")) + \" → \" + ((.conversation.last_message_at // \"\")[0:16] | gsub(\"T\"; \" \")),
-      \"\",
-      (.tree
-       | .[-12:]
-       | .[]
-       | (if .message_type == \"user\" then \"👤 \" else \"🤖 \" end)
-         + (.full_content | gsub(\"[\\\\n\\\\r]+\"; \" \"))
-      )
-    ' 2>/dev/null || echo '[Preview unavailable]'"
+    # Preview: {1} is the session_id column. The `preview` subcommand renders
+    # the tail itself (header + bodies), so no jq post-processing is needed.
+    # `ACS_PREVIEW_BASE` stays variable so the grep mode (pick-modes plan) can
+    # append `--query {q}` for highlight follow. An empty {q} must not produce
+    # a bare `--query` flag, so the grep variant branches on it at runtime.
+    ACS_PREVIEW_BASE="$BINARY preview {1} --messages 12 --content-chars 150"
+    PREVIEW_CMD="$ACS_PREVIEW_BASE 2>/dev/null || echo '[Preview unavailable]'"
 
     # Reload script — runs on every keystroke with fzf's {q} as "$1".
     # Emits tab-separated: SESSION_ID \t RESUME_CMD \t DISPLAY

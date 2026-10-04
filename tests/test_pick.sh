@@ -187,10 +187,10 @@ SESSION_ID=$(echo "$FIRST_LINE" | cut -f1)
 RESUME_FIELD=$(echo "$FIRST_LINE" | cut -f2)
 DISPLAY=$(echo "$FIRST_LINE" | cut -f3)
 
-if echo "$SESSION_ID" | grep -qE '^[a-f0-9-]+$'; then
-    pass "first field is a UUID-like session_id"
+if echo "$SESSION_ID" | grep -qE '^((oc|codex):)?[A-Za-z0-9_.-]+$'; then
+    pass "first field is a session_id (UUID or oc:/codex: prefixed)"
 else
-    fail "first field is a UUID-like session_id" "Got: $SESSION_ID"
+    fail "first field is a session_id (UUID or oc:/codex: prefixed)" "Got: $SESSION_ID"
 fi
 
 # resume_command may be empty for opencode/codex sources; only assert format if non-empty
@@ -288,53 +288,74 @@ echo ""
 # --- preview command ---
 echo "--- preview command ---"
 
-# Pick a real session from the fetched JSON to exercise the preview path.
-FIRST_SESSION=$(jq -r '.results[0].session_id // empty' "$TMPFILE")
+# Prefer a Claude Code session for the tool-node assertion: OpenCode transcripts
+# embed `[Tool: ...]` mentions mid-body in assistant prose, which `--no-tools`
+# deliberately keeps (it only drops bodies *starting* with a tool marker).
+FIRST_SESSION=$(jq -r '([.results[] | select(.source == "claude_code")][0] // .results[0]).session_id // empty' "$TMPFILE")
 if [ -z "$FIRST_SESSION" ]; then
     echo "  SKIP: preview tests (no sessions available)"
 else
-PREVIEW_OUTPUT=$("$BINARY" tree "$FIRST_SESSION" --json 2>/dev/null | jq -r '
-  "📁 " + (.conversation.project_path // "unknown"),
-  "💬 " + (.total_messages | tostring) + " messages",
-  "🕐 " + ((.conversation.first_message_at // "")[0:16] | gsub("T"; " ")) + " → " + ((.conversation.last_message_at // "")[0:16] | gsub("T"; " "))
-' 2>/dev/null || echo "")
+# The `preview` subcommand renders its own header + bodies (plain
+# `Project:/Messages:/Range:` header, no emoji, no jq post-processing).
+PREVIEW_OUTPUT=$("$BINARY" preview "$FIRST_SESSION" --messages 12 --content-chars 150 --no-color 2>/dev/null || echo "")
 
-if echo "$PREVIEW_OUTPUT" | grep -q "📁"; then
+if echo "$PREVIEW_OUTPUT" | grep -q "^Project: "; then
     pass "preview shows project path"
 else
     fail "preview shows project path"
 fi
 
-if echo "$PREVIEW_OUTPUT" | grep -q "💬.*messages"; then
+if echo "$PREVIEW_OUTPUT" | grep -q "^Messages: .*returned/total"; then
     pass "preview shows message count"
 else
     fail "preview shows message count"
 fi
 
-if echo "$PREVIEW_OUTPUT" | grep -q "🕐"; then
+if echo "$PREVIEW_OUTPUT" | grep -q "^Range: "; then
     pass "preview shows time range"
 else
     fail "preview shows time range"
 fi
 
-# The message list, which the header assertions above never covered. Checks that the flags
-# the preview depends on actually produce bodies -- `tree` alone emits none.
-MSG_OUTPUT=$("$BINARY" tree "$FIRST_SESSION" --json --no-tools --flat --content --content-chars 150 2>/dev/null | jq -r '
-  .tree | .[-12:] | .[]
-  | (if .message_type == "user" then "👤 " else "🤖 " end)
-    + (.full_content | gsub("[\n\r]+"; " "))
-' 2>/dev/null || echo "")
-
-if echo "$MSG_OUTPUT" | grep -qE "👤|🤖"; then
+# The message list, which the header assertions above never covered. Checks that the
+# preview renders bodies with role markers and drops tool nodes.
+if echo "$PREVIEW_OUTPUT" | grep -qE "👤|🤖"; then
     pass "preview lists messages with a role marker"
 else
-    fail "preview lists messages with a role marker" "Got: $MSG_OUTPUT"
+    fail "preview lists messages with a role marker" "Got: $(printf '%s' "$PREVIEW_OUTPUT" | head -c 200)"
 fi
 
-if echo "$MSG_OUTPUT" | grep -q "\[Tool"; then
+if echo "$PREVIEW_OUTPUT" | grep -q "\[Tool"; then
     fail "preview drops tool nodes" "Tool node leaked into the preview"
 else
     pass "preview drops tool nodes"
+fi
+
+# JSON shape is the `tree --json` envelope plus query/matches/cwd_exists.
+PREVIEW_JSON=$("$BINARY" preview "$FIRST_SESSION" --messages 12 --content-chars 150 --json 2>/dev/null || echo "")
+if [ -n "$(printf '%s' "$PREVIEW_JSON" | jq -r '.tree // empty' 2>/dev/null)" ]; then
+    pass "preview --json carries tree envelope"
+else
+    fail "preview --json carries tree envelope"
+fi
+
+if [ "$(printf '%s' "$PREVIEW_JSON" | jq -r '.matches | length' 2>/dev/null)" = "0" ] \
+    && [ "$(printf '%s' "$PREVIEW_JSON" | jq -r '.query' 2>/dev/null)" = "null" ]; then
+    pass "preview --json without query has empty matches"
+else
+    fail "preview --json without query has empty matches" "Got: $(printf '%s' "$PREVIEW_JSON" | jq -c '{query, matches}' 2>/dev/null)"
+fi
+
+QUERY_HIT=$(printf '%s' "$PREVIEW_JSON" | jq -r '.tree[0].full_content[0:4] // empty' 2>/dev/null)
+if [ -n "$QUERY_HIT" ]; then
+    QUERY_MATCHES=$("$BINARY" preview "$FIRST_SESSION" --messages 12 --query "$QUERY_HIT" --json 2>/dev/null | jq -r '.matches | length' 2>/dev/null)
+    if [ -n "$QUERY_MATCHES" ] && [ "$QUERY_MATCHES" -ge 1 ]; then
+        pass "preview --query lists matching uuids"
+    else
+        fail "preview --query lists matching uuids" "query was: $QUERY_HIT"
+    fi
+else
+    echo "  SKIP: preview --query test (empty first body)"
 fi
 
 # Character count, not bytes: awk's length() counts bytes in this locale, so a Japanese
@@ -449,8 +470,8 @@ else
     }
 
     run_reload ""
-    if [ "$RC" -eq 0 ] && [ -n "$OUT" ] && echo "$OUT" | head -1 | grep -qE '^[a-f0-9-]+'"$TAB"; then
-        pass "reload script produces tab-separated lines starting with UUID"
+    if [ "$RC" -eq 0 ] && [ -n "$OUT" ] && echo "$OUT" | head -1 | grep -qE '^((oc|codex):)?[A-Za-z0-9_.-]+'"$TAB"; then
+        pass "reload script produces tab-separated lines starting with session_id"
     else
         fail "reload script output format" "rc=$RC, first line: $(echo "$OUT" | head -1)"
     fi
@@ -459,7 +480,7 @@ else
     # (no match) or well-formed tab-separated lines.
     run_reload "認証"
     if [ "$RC" -eq 0 ]; then
-        if [ -z "$OUT" ] || echo "$OUT" | head -1 | grep -qE '^[a-f0-9-]+'"$TAB"; then
+        if [ -z "$OUT" ] || echo "$OUT" | head -1 | grep -qE '^((oc|codex):)?[A-Za-z0-9_.-]+'"$TAB"; then
             pass "reload script handles CJK queries cleanly"
         else
             fail "CJK output format malformed" "$(echo "$OUT" | head -1)"
@@ -472,7 +493,7 @@ else
     # or well-formed output, not crash.
     run_reload '"unclosed'
     if [ "$RC" -eq 0 ]; then
-        if [ -z "$OUT" ] || echo "$OUT" | head -1 | grep -qE '^[a-f0-9-]+'"$TAB"; then
+        if [ -z "$OUT" ] || echo "$OUT" | head -1 | grep -qE '^((oc|codex):)?[A-Za-z0-9_.-]+'"$TAB"; then
             pass "reload script handles malformed FTS input cleanly"
         else
             fail "malformed FTS output format" "$(echo "$OUT" | head -1)"
