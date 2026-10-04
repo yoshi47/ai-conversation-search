@@ -15,6 +15,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Codex CLI と OpenCode への導入経路を用意した。Codex は既存の `.claude-plugin/marketplace.json` をそのまま読めるので、`codex plugin marketplace add yoshi47/ai-conversation-search` でプラグインとして入る。OpenCode 向けにはプラグインを用意せず、`skills/index.json`（HTTP カタログ）を追加し、`"skills"` に raw URL を書けば読み込まれるようにした
 - バージョンの一致チェック（`scripts/check-versions.sh`）を CI とリリースに追加した。Cargo.toml・plugin.json・marketplace.json・`skills/index.json`・ラッパーの `ACS_WRAPPER_VERSION` のどれかがずれていると CI が落ち、リリースはタグとずれていても止まる
 
+### Fixed
+
+- OpenCode HTTP カタログ（`skills/index.json`）の `files` を `["conversation-search.md", "REFERENCE.md"]` に変え、命名 Markdown 形式にした。従来の `SKILL.md` だとダウンロード後のソースルート直下が `SKILL.md` になり、V2 ではスキル ID が `conversation-search` ではなくリテラル `SKILL` になっていた。`skills/conversation-search/conversation-search.md`（`SKILL.md` と同内容＋`REFERENCE.md` への誘導付き）を追加し、`SKILL.md` 自体は Claude Code / Codex 用に残した
+
 ## [0.17.0] - 2026-09-24
 
 ### Changed (breaking)

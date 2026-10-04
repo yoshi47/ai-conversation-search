@@ -27,6 +27,11 @@ cached copy until `version` changes; new installs fetch `main` HEAD immediately,
 `main` compatible with the latest released binary. Its `files` list is hand-maintained: add any new file under
 `skills/conversation-search/` there, or OpenCode never downloads it.
 
+`skills/conversation-search/conversation-search.md` is the HTTP-catalog copy of `SKILL.md`
+in named-Markdown form, so its skill ID is `conversation-search` instead of the literal `SKILL`.
+When you edit `SKILL.md`, mirror the change into `conversation-search.md` (keeping its `REFERENCE.md`
+pointer) and bump the version, or OpenCode users keep serving the stale copy.
+
 ## Pre-push Hook
 
 A git pre-push hook validates that the version tag doesn't already exist on the remote.
