@@ -339,7 +339,7 @@ ai-conversation-search resume-spec SESSION_ID [--json]
   "source": "claude_code",
   "session_id": "abc-123",
   "project_path": "/home/user/proj",
-  "cwd_exists": true,
+  "project_exists": true,
   "binary": "claude",
   "args": ["--resume", "abc-123"],
   "resume_command": "cd -- /home/user/proj && claude --resume abc-123"
@@ -351,7 +351,7 @@ ai-conversation-search resume-spec SESSION_ID [--json]
   `env FOO=1 claude` → `"claude"`). `args` is `["--resume", session_id]`.
   When the command cannot be decomposed, `resume_command` still carries the
   original string for eval compatibility.
-- `cwd_exists` is a single `Path::exists()` stat. It is `null` when
+- `project_exists` is a single `Path::exists()` stat. It is `null` when
   `project_path` is `null`.
 - `resume_command` is shell-quoted and safe to `eval`. It is `null` for
   OpenCode/Codex sessions (with `note: "resumed with their own tools"`),
@@ -362,7 +362,7 @@ ai-conversation-search resume-spec SESSION_ID [--json]
 
 **Example:**
 ```bash
-# Human-readable (source / cwd / run / eval)
+# Human-readable (source / project / run / eval)
 ai-conversation-search resume-spec abc-123
 
 # Structured (for programmatic use)
@@ -424,7 +424,7 @@ key. `tree[]` holds the last N messages; `total_messages` still means
       "full_content_truncated": false
     }
   ],
-  "cwd_exists": true,
+  "project_exists": true,
   "query": "auth",
   "matches": ["msg-uuid-1"]
 }
@@ -433,10 +433,10 @@ key. `tree[]` holds the last N messages; `total_messages` still means
 - `query` is the trimmed phrase, or `null` when `--query` was not given (then
   `matches` is `[]`). `matches` only covers the returned last N, judged
   against the pre-truncation body.
-- `cwd_exists` is a single `Path::exists()` stat, same as `resume-spec`
+- `project_exists` is a single `Path::exists()` stat, same as `resume-spec`
   (`null` when `project_path` is `null`).
 - Unresolvable ids exit `1` with the `tree`-shaped error envelope (`.error`
-  key) plus `query`/`matches`/`cwd_exists`, and the reason on stderr.
+  key) plus `query`/`matches`/`project_exists`, and the reason on stderr.
 
 **Human output:** a plain header plus bodies, no emoji-painted framing:
 

@@ -262,7 +262,7 @@ ai-conversation-search preview SESSION_ID [--query PHRASE] [--messages N] [--jso
 ```
 Shows the last N messages (default: 30) with a plain `Project:` / `Messages:` /
 `Range:` header. `--query` highlights one phrase (count unchanged); `--json`
-returns the `tree --json` envelope plus `query` / `matches` / `cwd_exists`.
+returns the `tree --json` envelope plus `query` / `matches` / `project_exists`.
 
 ### `ai-conversation-search prune-observer`
 Remove claude-mem observer sessions indexed by earlier versions

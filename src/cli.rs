@@ -393,7 +393,7 @@ pub enum Commands {
         /// Show the last N messages (default: 30)
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         messages: u64,
-        /// Output as JSON (tree-compatible envelope plus query/matches/cwd_exists)
+        /// Output as JSON (tree-compatible envelope plus query/matches/project_exists)
         #[arg(long)]
         json: bool,
         /// Disable ANSI highlight even on a TTY
@@ -2066,7 +2066,7 @@ struct ResumeSpecOutput {
     source: String,
     session_id: String,
     project_path: Option<String>,
-    cwd_exists: Option<bool>,
+    project_exists: Option<bool>,
     binary: Option<String>,
     args: Vec<String>,
     resume_command: Option<String>,
@@ -2077,7 +2077,7 @@ struct ResumeSpecOutput {
 }
 
 fn build_resume_spec_with_cmd(target: &ResumeTarget, cmd: &str) -> ResumeSpecOutput {
-    let cwd_exists: Option<bool> = target
+    let project_exists: Option<bool> = target
         .project_path
         .as_ref()
         .map(|p| std::path::Path::new(p).exists());
@@ -2086,7 +2086,7 @@ fn build_resume_spec_with_cmd(target: &ResumeTarget, cmd: &str) -> ResumeSpecOut
             source: target.source.clone(),
             session_id: target.session_id.clone(),
             project_path: target.project_path.clone(),
-            cwd_exists,
+            project_exists,
             binary: None,
             args: Vec::new(),
             resume_command: None,
@@ -2129,7 +2129,7 @@ fn build_resume_spec_with_cmd(target: &ResumeTarget, cmd: &str) -> ResumeSpecOut
         source: target.source.clone(),
         session_id: target.session_id.clone(),
         project_path: target.project_path.clone(),
-        cwd_exists,
+        project_exists,
         binary,
         args,
         resume_command,
@@ -2152,10 +2152,10 @@ fn cmd_resume_spec(session_id: &str, json_output: bool) -> Result<()> {
     }
 
     println!("source: {}", spec.source);
-    match (&spec.project_path, spec.cwd_exists) {
-        (Some(pp), Some(true)) => println!("cwd: {} (exists)", pp),
-        (Some(pp), Some(false)) => println!("cwd: {} (missing)", pp),
-        _ => println!("cwd: (unknown)"),
+    match (&spec.project_path, spec.project_exists) {
+        (Some(pp), Some(true)) => println!("project: {} (exists)", pp),
+        (Some(pp), Some(false)) => println!("project: {} (missing)", pp),
+        _ => println!("project: (unknown)"),
     }
     if spec.binary.is_some() && spec.resume_command.is_some() {
         let binary = spec.binary.as_deref().unwrap();
@@ -2321,7 +2321,7 @@ fn cmd_preview(
                             },
                         );
                         map.insert("matches".to_string(), serde_json::Value::Array(Vec::new()));
-                        map.insert("cwd_exists".to_string(), serde_json::Value::Null);
+                        map.insert("project_exists".to_string(), serde_json::Value::Null);
                     }
                     println!("{}", serde_json::to_string_pretty(&localized)?);
                 }
@@ -2333,7 +2333,7 @@ fn cmd_preview(
             return Err(e);
         }
     };
-    let cwd_exists: Option<bool> = target
+    let project_exists: Option<bool> = target
         .project_path
         .as_ref()
         .map(|p| std::path::Path::new(p).exists());
@@ -2408,8 +2408,8 @@ fn cmd_preview(
                 ),
             );
             map.insert(
-                "cwd_exists".to_string(),
-                match cwd_exists {
+                "project_exists".to_string(),
+                match project_exists {
                     Some(b) => serde_json::Value::Bool(b),
                     None => serde_json::Value::Null,
                 },
@@ -2970,7 +2970,7 @@ mod tests {
             spec.args,
             vec!["--resume".to_string(), "abc-123".to_string()]
         );
-        assert_eq!(spec.cwd_exists, Some(true));
+        assert_eq!(spec.project_exists, Some(true));
         assert!(spec.resume_command.is_some());
         assert!(spec.error.is_none());
         assert_eq!(spec.project_path.as_deref(), Some(proj.as_str()));
@@ -3012,8 +3012,8 @@ mod tests {
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert!(spec.resume_command.is_none());
         assert_eq!(spec.error.as_deref(), Some("unsafe_path"));
-        // `cwd_exists` still reports the stat; it must not panic.
-        assert!(spec.cwd_exists.is_some());
+        // `project_exists` still reports the stat; it must not panic.
+        assert!(spec.project_exists.is_some());
     }
 
     #[test]
@@ -3026,7 +3026,7 @@ mod tests {
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert!(spec.resume_command.is_none());
         assert_eq!(spec.error.as_deref(), Some("no_project_path"));
-        assert_eq!(spec.cwd_exists, None);
+        assert_eq!(spec.project_exists, None);
     }
 
     #[test]
