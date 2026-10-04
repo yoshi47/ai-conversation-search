@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- 2文字クエリ（`mo`、`失敗`等）がFTSランキングに載るようになった。Rust側のbigram解析（CJKラン→重なりbigram、ASCII→単語＋prefix）を`unicode61`の別FTS表（`message_content_bigram_fts`）に索引し、既存trigram表と併用する。新規依存・SQLite拡張なし（`rusqlite`の`functions`フィーチャで登録するスカラー関数＋トリガで同期）。混合クエリはtrigram bm25＋bigram絞り込み、全語短語はbigram bm25で順序付けし、二表のスコア加算はしない。1文字・絵文字のみ等のクエリは従来どおりLIKEフォールバック
+- `backfill-bigram`サブコマンドを追加した。マイグレーション10以前に索引された行のbigramエントリを埋める（冪等・再実行可、`--dry-run`あり）。`index --all --force`では埋まらない（既存行を書き換えないため）。初回アップグレード後に1回実行すること
+
 - `search` / `list --json` の各行に `project_exists`（起動ディレクトリの有無。`project_path: null` では `null`）と `project_basename`（末尾1段。worktree の見分け用）を追加した。`resume-spec` / `preview` の JSON にも `project_basename` を足し、人間向け `list` / `search` / `preview` 表示では存在しないディレクトリに `(missing)` を付ける。既存フィールドは不変
 - `search` / `list` に `--exclude-project STR` / `--exclude-repo STR`（部分一致除外。繰り返し指定で OR。定型ノイズ除け例: `--exclude-project observer --exclude-project /tmp`）と `--here`（起動ディレクトリがカレント配下のみ。セパレータ境界の prefix 一致）を追加した。`list` には `search` と同じ完全一致の `--project` も足した。除外・`--here` で減った分は LIMIT を伸ばして追い fetch するので `--limit N` は生存 N 件まで埋まり、`.truncated` は生存行基準で再計算される
 - `preview` サブコマンドを追加した。`SESSION_ID` の末尾 N 件（既定 30、`--messages`）を read-only で覗く。`tree --flat --no-tools --content --json` と同一エンベロープに `query` / `matches`（返却 N 件内で `--query` フレーズを含む `message_uuid` 一覧）/ `project_exists` / `project_basename` を足すだけなので、既存の `tree` 読み手はそのまま読める。人間向け出力は `Project:` / `Messages:` / `Range:` のプレーンヘッダ＋本文で、`--query` は単一フレーズの ASCII 大文字小文字無視ハイライト（件数は変えない、`--json` に ANSI は混ぜない）。`pick` の fzf プレビューも `tree | jq` インラインから `preview {1} --messages 12 --content-chars 150` 呼び出しに置き換えた

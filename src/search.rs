@@ -270,16 +270,44 @@ enum QueryPlan<'a> {
     /// Hand the query to FTS verbatim: quoted phrases and explicit operators.
     Raw(String),
     /// Terms of `MIN_TRIGRAM_CHARS`+ go to FTS, OR-joined and bm25-ranked. Shorter
-    /// terms cannot be ranked by, so they narrow the phase-2 rows with LIKE instead.
-    /// Rows holding every long term sort above partial matches (see
-    /// `contains_all_terms`), so recall stays OR while the top reads AND-like.
+    /// terms that reach the bigram index narrow phase-2 rows through it instead
+    /// of LIKE; only bigram-unexpressible terms (single chars, emoji-only,
+    /// ...) stay as LIKE residuals. Rows holding every long term sort above
+    /// partial matches (see `contains_all_terms`), so recall stays OR while
+    /// the top reads AND-like.
     Hybrid {
         fts_query: String,
+        /// Bigram-expressible short terms, AND-joined into one MATCH fragment.
+        /// Applied as a rowid filter in phase 2, never as a ranking signal.
+        bigram_query: Option<String>,
+        /// Terms no FTS table can express. Phase-2 LIKE, AND semantics.
         short_terms: Vec<&'a str>,
     },
-    /// Nothing reaches the trigram minimum. Full-table LIKE, AND semantics, recency
+    /// Every term is short, but every term reaches the bigram index (or all
+    /// but the LIKE residuals do). Phase 1 ranks by the bigram table's bm25;
+    /// this is the rescued form of what used to be `LikeOnly`.
+    BigramOnly {
+        fts_query: String,
+        /// Bigram-unexpressible terms. Phase-2 LIKE, AND semantics.
+        like_terms: Vec<&'a str>,
+        /// Original terms behind `fts_query`, for the full-match boost.
+        boost_terms: Vec<&'a str>,
+    },
+    /// Nothing reaches any FTS table. Full-table LIKE, AND semantics, recency
     /// order. Also covers the empty query, where `terms` is empty.
     LikeOnly { terms: Vec<&'a str> },
+}
+
+/// Which FTS table drives phase 1. Scores are never mixed across tables:
+///
+/// - `Trigram` ranks by `bm25(message_content_fts)`; bigram conditions (if any)
+///   are a subtractive rowid filter in phase 2.
+/// - `Bigram` ranks by `bm25(message_content_bigram_fts)`; used only when no
+///   trigram term exists, so there is no cross-table score to fuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FtsTable {
+    Trigram,
+    Bigram,
 }
 
 fn plan_query(trimmed: &str) -> QueryPlan<'_> {
@@ -297,8 +325,19 @@ fn plan_query(trimmed: &str) -> QueryPlan<'_> {
     // Why not test for operators first: `OR` is two characters, so an all-short query
     // such as `更新 OR 認証` would reach FTS with no tokenizable term and return zero
     // rows. LikeOnly treats the operator as a literal, which is imperfect but non-empty.
+    // (Unchanged by the bigram rescue: an explicit operator with a short operand
+    // still cannot go to FTS whole -- the trigram table would tokenize the short
+    // operand to nothing and silently rewrite the operator's meaning.)
     if long_terms.is_empty() {
-        return QueryPlan::LikeOnly { terms };
+        // Explicit operators stay literal LIKE even when every operand would
+        // reach the bigram table: the bigram MATCH has no operator semantics,
+        // and handing the query to the trigram table whole would tokenize the
+        // short operands to nothing (the `A AND 失敗` trap above). Single bare
+        // operators (`OR` alone) still take the bigram path; they are harmless.
+        if terms.len() > 1 && terms.iter().any(|t| matches!(*t, "AND" | "OR" | "NOT")) {
+            return QueryPlan::LikeOnly { terms };
+        }
+        return plan_short_query(terms);
     }
 
     // Spaces are load-bearing: a bare `contains("AND")` would misroute `STANDARD`.
@@ -324,7 +363,52 @@ fn plan_query(trimmed: &str) -> QueryPlan<'_> {
             .map(|t| format!("\"{}\"", t))
             .collect::<Vec<_>>()
             .join(" OR "),
-        short_terms,
+        bigram_query: {
+            let frags: Vec<String> = short_terms
+                .iter()
+                .filter_map(|t| crate::bigram::analyze_for_query(t))
+                .collect();
+            if frags.is_empty() {
+                None
+            } else {
+                Some(frags.join(" AND "))
+            }
+        },
+        short_terms: short_terms
+            .into_iter()
+            .filter(|t| crate::bigram::analyze_for_query(t).is_none())
+            .collect(),
+    }
+}
+
+/// All terms are short (no trigram term). Rescue what the bigram index can
+/// express; only fall back to `LikeOnly` when nothing can be expressed.
+///
+/// Across-term OR keeps parity with `Hybrid`'s OR + bm25 philosophy (recall
+/// over precision, ranking decides). Within a term the fragments stay AND
+/// (`analyze_for_query` joins them), so a 4-char CJK term still requires all
+/// its bigrams.
+fn plan_short_query<'a>(terms: Vec<&'a str>) -> QueryPlan<'a> {
+    let mut frags: Vec<String> = Vec::new();
+    let mut boost_terms: Vec<&'a str> = Vec::new();
+    let mut like_terms: Vec<&'a str> = Vec::new();
+    for t in terms {
+        match crate::bigram::analyze_for_query(t) {
+            Some(f) => {
+                frags.push(f);
+                boost_terms.push(t);
+            }
+            None => like_terms.push(t),
+        }
+    }
+    if frags.is_empty() {
+        return QueryPlan::LikeOnly { terms: like_terms };
+    }
+    QueryPlan::BigramOnly {
+        // FTS5 AND binds tighter than OR, so within-term ANDs survive the join.
+        fts_query: frags.join(" OR "),
+        like_terms,
+        boost_terms,
     }
 }
 
@@ -720,9 +804,13 @@ impl ConversationSearch {
 
         let trimmed = query.trim();
 
-        let (fts_query, short_terms, boost_terms): (String, Vec<&str>, Vec<&str>) = match plan_query(
-            trimmed,
-        ) {
+        let (fts_table, fts_query, short_terms, bigram_filter, boost_terms): (
+            FtsTable,
+            String,
+            Vec<&str>,
+            Option<String>,
+            Vec<&str>,
+        ) = match plan_query(trimmed) {
             QueryPlan::LikeOnly { terms } => {
                 let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
                 // No term reaches the trigram minimum, so there is no term-frequency signal
@@ -752,20 +840,33 @@ impl ConversationSearch {
                 let stats = self.gather_search_stats(filter, matched, truncated)?;
                 return Ok(SearchResult { rows, stats });
             }
-            QueryPlan::Raw(q) => (q, Vec::new(), Vec::new()),
+            QueryPlan::Raw(q) => (FtsTable::Trigram, q, Vec::new(), None, Vec::new()),
             QueryPlan::Hybrid {
                 fts_query,
+                bigram_query,
                 short_terms,
             } => {
                 // Long terms for the full-match boost (see contains_all_terms). The
-                // short terms are already enforced by the phase-2 LIKE, so every
-                // surviving row contains them; only the long terms discriminate.
+                // short terms are already enforced by the phase-2 LIKE or the
+                // bigram rowid filter, so every surviving row contains them; only
+                // the long terms discriminate.
                 let boost_terms: Vec<&str> = trimmed
                     .split_whitespace()
                     .filter(|t| t.chars().count() >= MIN_TRIGRAM_CHARS)
                     .collect();
-                (fts_query, short_terms, boost_terms)
+                (
+                    FtsTable::Trigram,
+                    fts_query,
+                    short_terms,
+                    bigram_query,
+                    boost_terms,
+                )
             }
+            QueryPlan::BigramOnly {
+                fts_query,
+                like_terms,
+                boost_terms,
+            } => (FtsTable::Bigram, fts_query, like_terms, None, boost_terms),
         };
 
         // Two-phase query to work around SQLite trigram FTS performance issue.
@@ -773,7 +874,10 @@ impl ConversationSearch {
         // scanning ~all messages and checking trigram FTS for each row (O(N) full table scan).
         // Phase 1: Get matching rowids from FTS (fast, ~50ms for 1700 matches).
         // Phase 2: Query messages+conversations by rowid IN batches.
-        let scored = self.query_fts_rowids(&fts_query)?;
+        let scored = match fts_table {
+            FtsTable::Trigram => self.query_fts_rowids(&fts_query)?,
+            FtsTable::Bigram => self.query_bigram_rowids(&fts_query)?,
+        };
 
         // Empty FTS is not "no match" when the query can still match a title: fall
         // through so inject_title_matches (below) runs. The empty batch loop is a
@@ -816,6 +920,17 @@ impl ConversationSearch {
             for term in &short_terms {
                 sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
                 batch_params.push(Box::new(format!("%{}%", escape_like(term))));
+            }
+
+            // Bigram-expressible short terms narrow through the bigram index
+            // instead of LIKE. Like every other phase-2 predicate this is
+            // purely subtractive, which is what keeps the early stop below
+            // sound. The subquery is an FTS rowid lookup, not a scan.
+            if let Some(ref bigram_query) = bigram_filter {
+                sql.push_str(
+                    " AND m.rowid IN (SELECT rowid FROM message_content_bigram_fts WHERE bigram_content MATCH ?)",
+                );
+                batch_params.push(Box::new(bigram_query.clone()));
             }
 
             Self::append_filters(&mut sql, &mut batch_params, filter)?;
@@ -913,7 +1028,7 @@ impl ConversationSearch {
     /// (not the message level). Returns up to `limit` distinct sessions and the total match
     /// count for each. The representative message is the session's best-scoring match under
     /// `SortOrder::Relevance`. Under `SortOrder::Recent` -- and on the LIKE-only path
-    /// (empty query, or no term reaching 3 characters) regardless of `sort`, since that
+    /// (empty query, or no term reaching any FTS table) regardless of `sort`, since that
     /// path has no bm25 score to rank by -- it is the most recent match instead.
     pub fn search_grouped_by_session(
         &mut self,
@@ -942,7 +1057,13 @@ impl ConversationSearch {
         let trimmed = query.trim();
         let plan = plan_query(trimmed);
 
-        let (fts_query, short_terms, boost_terms): (String, Vec<&str>, Vec<&str>) = match plan {
+        let (fts_table, fts_query, short_terms, bigram_filter, boost_terms): (
+            FtsTable,
+            String,
+            Vec<&str>,
+            Option<String>,
+            Vec<&str>,
+        ) = match plan {
             QueryPlan::LikeOnly { terms } => {
                 // SQL window function picks the most recent message per session and counts
                 // matches per session, then we LIMIT at session level. Like the non-grouped
@@ -989,21 +1110,36 @@ impl ConversationSearch {
                 let stats = self.gather_search_stats(filter, matched_total, truncated)?;
                 return Ok(GroupedSearchResult { rows, stats });
             }
-            QueryPlan::Raw(q) => (q, Vec::new(), Vec::new()),
+            QueryPlan::Raw(q) => (FtsTable::Trigram, q, Vec::new(), None, Vec::new()),
             QueryPlan::Hybrid {
                 fts_query,
+                bigram_query,
                 short_terms,
             } => {
                 let boost_terms: Vec<&str> = trimmed
                     .split_whitespace()
                     .filter(|t| t.chars().count() >= MIN_TRIGRAM_CHARS)
                     .collect();
-                (fts_query, short_terms, boost_terms)
+                (
+                    FtsTable::Trigram,
+                    fts_query,
+                    short_terms,
+                    bigram_query,
+                    boost_terms,
+                )
             }
+            QueryPlan::BigramOnly {
+                fts_query,
+                like_terms,
+                boost_terms,
+            } => (FtsTable::Bigram, fts_query, like_terms, None, boost_terms),
         };
 
         // FTS path: same trigram two-phase strategy as search_conversations.
-        let scored = self.query_fts_rowids(&fts_query)?;
+        let scored = match fts_table {
+            FtsTable::Trigram => self.query_fts_rowids(&fts_query)?,
+            FtsTable::Bigram => self.query_bigram_rowids(&fts_query)?,
+        };
 
         // See search_conversations: fall through when a title can still match.
         if scored.is_empty() && Self::title_terms(trimmed).is_empty() {
@@ -1034,9 +1170,16 @@ impl ConversationSearch {
                 batch_params.push(Box::new(*rowid));
             }
             // Sub-trigram terms narrow here; see search_conversations for the rationale.
+            // Bigram-expressible ones use the rowid filter instead of LIKE.
             for term in &short_terms {
                 sql.push_str(" AND m.full_content LIKE ? ESCAPE '\\'");
                 batch_params.push(Box::new(format!("%{}%", escape_like(term))));
+            }
+            if let Some(ref bigram_query) = bigram_filter {
+                sql.push_str(
+                    " AND m.rowid IN (SELECT rowid FROM message_content_bigram_fts WHERE bigram_content MATCH ?)",
+                );
+                batch_params.push(Box::new(bigram_query.clone()));
             }
             Self::append_filters(&mut sql, &mut batch_params, filter)?;
             // No ORDER BY: final order is decided in Rust below (see search_conversations).
@@ -1344,6 +1487,23 @@ impl ConversationSearch {
         let mut stmt = self.conn.prepare(
             "SELECT rowid, bm25(message_content_fts) AS score \
              FROM message_content_fts WHERE full_content MATCH ? \
+             ORDER BY score",
+        )?;
+        let scored = stmt
+            .query_map(rusqlite::params![fts_query], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })?
+            .collect::<std::result::Result<Vec<(i64, f64)>, _>>()?;
+        Ok(scored)
+    }
+
+    /// Bigram-table counterpart of `query_fts_rowids`: same contract
+    /// (best-first `(rowid, bm25)` pairs the early stop depends on), ranked by
+    /// the bigram table alone. Never mixed with trigram scores.
+    fn query_bigram_rowids(&self, fts_query: &str) -> Result<Vec<(i64, f64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rowid, bm25(message_content_bigram_fts) AS score \
+             FROM message_content_bigram_fts WHERE bigram_content MATCH ? \
              ORDER BY score",
         )?;
         let scored = stmt
@@ -2500,10 +2660,11 @@ mod tests {
         assert!(grouped.stats.truncated);
     }
 
-    /// When NO term reaches 3 characters the query keeps AND semantics and recency
-    /// ordering, while the FTS path uses OR + bm25. That asymmetry is deliberate: there is
-    /// no ranking signal here, and a 2-char term ORed against anything matches nearly
-    /// everything.
+    /// When NO term reaches any FTS table (single chars, emoji-only, ...) the query
+    /// keeps AND semantics and recency ordering, while the FTS paths use OR +
+    /// bm25. That asymmetry is deliberate: there is no ranking signal here, and
+    /// a degenerate term ORed against anything matches nearly everything.
+    /// (2-char terms used to fall here too; they now take the BigramOnly path.)
     #[test]
     fn test_like_fallback_still_and_and_recency_ordered() {
         let conn = setup_test_db();
@@ -2520,7 +2681,7 @@ mod tests {
             &conn,
             "both_old",
             "sess1",
-            "認証 実装 の話",
+            "あ い の話",
             "user",
             "2025-01-15T10:00:00",
             "/proj",
@@ -2529,7 +2690,7 @@ mod tests {
             &conn,
             "both_new",
             "sess1",
-            "実装 と 認証 について",
+            "い と あ について",
             "user",
             "2025-01-15T11:00:00",
             "/proj",
@@ -2538,7 +2699,7 @@ mod tests {
             &conn,
             "one_only",
             "sess1",
-            "認証 だけ",
+            "あ だけ",
             "user",
             "2025-01-15T12:00:00",
             "/proj",
@@ -2546,7 +2707,7 @@ mod tests {
 
         let mut searcher = ConversationSearch::from_connection(conn);
         let rows = searcher
-            .search_conversations("認証 実装", &default_filter())
+            .search_conversations("あ い", &default_filter())
             .unwrap()
             .rows;
 
@@ -2835,10 +2996,10 @@ mod tests {
         assert_eq!(uuids(&rows), vec!["old_tight", "new_padded"]);
     }
 
-    /// When nothing reaches the trigram minimum there is no ranking signal at all, so the
-    /// query keeps AND semantics and recency order.
+    /// All-short-but-bigramable queries take the BigramOnly path: OR semantics
+    /// plus bm25, like Hybrid. (Pre-bigram this fell back to LIKE AND.)
     #[test]
-    fn test_hybrid_all_short_terms_falls_back_to_like() {
+    fn test_bigram_all_short_terms_use_or_plus_bm25() {
         let mut s = setup_hybrid_db(&[
             ("only_one", "認証だけの話", "2025-01-20T10:00:00"),
             ("both_old", "認証と実装の話", "2025-01-05T10:00:00"),
@@ -2850,7 +3011,150 @@ mod tests {
             .unwrap()
             .rows;
 
-        assert_eq!(uuids(&rows), vec!["both_new", "both_old"]);
+        let mut got = uuids(&rows);
+        got.sort_unstable();
+        assert_eq!(
+            got,
+            vec!["both_new", "both_old", "only_one"],
+            "BigramOnly is OR: single-term rows match too"
+        );
+    }
+
+    /// `mo` (2 chars) reaches FTS now: ranked by bigram bm25, not recency.
+    /// The old short doc outranks the newer padded one through length
+    /// normalization; the LIKE path would have returned pure recency order.
+    #[test]
+    fn test_bigram_single_short_term_ranked_by_bm25() {
+        let mut s = setup_hybrid_db(&[
+            ("old_short", "mo", "2025-01-05T10:00:00"),
+            (
+                "new_padded",
+                &format!("{} mo {}", "filler ".repeat(50), "filler ".repeat(50)),
+                "2025-01-30T10:00:00",
+            ),
+        ]);
+
+        let rows = s
+            .search_conversations("mo", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["old_short", "new_padded"]);
+    }
+
+    /// CJK 2-char terms are found through the bigram table.
+    #[test]
+    fn test_bigram_cjk_two_char_found() {
+        let mut s = setup_hybrid_db(&[
+            ("hit", "デプロイに失敗した話", "2025-01-10T10:00:00"),
+            ("miss", "今日のランチの話", "2025-01-11T10:00:00"),
+        ]);
+
+        let rows = s
+            .search_conversations("失敗", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(uuids(&rows), vec!["hit"]);
+    }
+
+    /// The grouped path ranks short-term queries too, with per-session counts.
+    #[test]
+    fn test_bigram_grouped_by_session() {
+        let conn = setup_test_db();
+        for (sess, ts) in [
+            ("sess1", "2025-01-10T10:00:00"),
+            ("sess2", "2025-01-12T10:00:00"),
+        ] {
+            insert_test_conversation(
+                &conn,
+                sess,
+                "/proj",
+                "summary",
+                "2025-01-01T00:00:00",
+                ts,
+                "claude_code",
+            );
+        }
+        insert_test_message(
+            &conn,
+            "m1",
+            "sess1",
+            "mo memo about markdown",
+            "user",
+            "2025-01-10T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "m2",
+            "sess1",
+            "another mo note",
+            "user",
+            "2025-01-11T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "m3",
+            "sess2",
+            "mo third session",
+            "user",
+            "2025-01-12T10:00:00",
+            "/proj",
+        );
+
+        let mut s = ConversationSearch::from_connection(conn);
+        let grouped = s
+            .search_grouped_by_session("mo", &default_filter())
+            .unwrap();
+        assert_eq!(grouped.rows.len(), 2);
+        let total: i64 = grouped.rows.iter().map(|g| g.match_count).sum();
+        assert_eq!(total, 3);
+    }
+
+    /// Routing table for the three short-term shapes.
+    #[test]
+    fn test_plan_query_bigram_routing() {
+        // 2-char terms with no LIKE residual go BigramOnly.
+        assert!(matches!(plan_query("mo"), QueryPlan::BigramOnly { .. }));
+        assert!(matches!(plan_query("失敗"), QueryPlan::BigramOnly { .. }));
+        // Single chars / emoji-only express nothing: still LikeOnly.
+        assert!(matches!(plan_query("あ"), QueryPlan::LikeOnly { .. }));
+        assert!(matches!(plan_query("a"), QueryPlan::LikeOnly { .. }));
+        assert!(matches!(plan_query("😀"), QueryPlan::LikeOnly { .. }));
+        // Mixed short + residual: BigramOnly with a LIKE remainder.
+        match plan_query("mo あ") {
+            QueryPlan::BigramOnly { like_terms, .. } => assert_eq!(like_terms, vec!["あ"]),
+            other => panic!("expected BigramOnly, got {}", plan_name(&other)),
+        }
+        // Hybrid keeps the bigram fragment out of the LIKE residuals.
+        match plan_query("markdown mo") {
+            QueryPlan::Hybrid {
+                bigram_query,
+                short_terms,
+                ..
+            } => {
+                assert_eq!(bigram_query.as_deref(), Some("\"mo\""));
+                assert!(short_terms.is_empty());
+            }
+            other => panic!("expected Hybrid, got {}", plan_name(&other)),
+        }
+        // Explicit operators with short operands stay literal LIKE (unchanged).
+        assert!(matches!(
+            plan_query("更新 OR 認証"),
+            QueryPlan::LikeOnly { .. }
+        ));
+    }
+
+    /// `matches!` gives no payload on failure; name the variant instead.
+    fn plan_name(plan: &QueryPlan<'_>) -> &'static str {
+        match plan {
+            QueryPlan::Raw(_) => "Raw",
+            QueryPlan::Hybrid { .. } => "Hybrid",
+            QueryPlan::BigramOnly { .. } => "BigramOnly",
+            QueryPlan::LikeOnly { .. } => "LikeOnly",
+        }
     }
 
     /// `OR` is two characters, so a length-only short-term check used to misclassify
@@ -5583,14 +5887,14 @@ mod tests {
         );
 
         let mut searcher = ConversationSearch::from_connection(conn);
-        // Both terms must match (AND join)
+        // OR semantics with a full-match boost: msg1 holds both terms.
         let results = searcher
             .search_conversations("認証 実装", &default_filter())
             .unwrap()
             .rows;
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].message_uuid, "msg1"); // Only msg1 contains both 認証 and 実装
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].message_uuid, "msg1"); // full match sorts first
     }
 
     #[test]

@@ -255,6 +255,12 @@ pub enum Commands {
         #[arg(long)]
         yes: bool,
     },
+    /// Fill bigram index entries for messages indexed before migration 10
+    BackfillBigram {
+        /// Report how many messages lack a bigram entry without changing the database
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show index status and health
     Status {
         /// Output as JSON
@@ -665,6 +671,7 @@ pub fn run(cli: Cli) -> Result<()> {
             quiet,
         }) => cmd_index(days, all, force, quiet),
         Some(Commands::PruneObserver { dry_run, yes }) => cmd_prune_observer(dry_run, yes),
+        Some(Commands::BackfillBigram { dry_run }) => cmd_backfill_bigram(dry_run),
         Some(Commands::Status { json }) => cmd_status(json),
         Some(Commands::Search {
             query,
@@ -1061,6 +1068,35 @@ fn cmd_prune_observer(dry_run: bool, assume_yes: bool) -> Result<()> {
     // The file does not shrink -- freed pages are reused instead. Saying so up front
     // avoids a "nothing happened" reading of an unchanged file size.
     eprintln!("Database file size is unchanged; the freed space is reused by future indexing.");
+    Ok(())
+}
+
+fn cmd_backfill_bigram(dry_run: bool) -> Result<()> {
+    // init_schema first: on a pre-10 database this creates the bigram table
+    // and repairs the triggers (recording migration 10), so the fill below
+    // sees the post-migration shape. It also registers `bigram_analyze`,
+    // which the fill statement calls.
+    let conn = db::connect(db::DEFAULT_DB_PATH, false)?;
+    crate::schema::init_schema(&conn)?;
+
+    let missing = crate::schema::count_bigram_missing(&conn)?;
+    if dry_run {
+        eprintln!(
+            "{} message(s) lack a bigram index entry. Re-run without --dry-run to fill them.",
+            missing
+        );
+        return Ok(());
+    }
+    if missing == 0 {
+        eprintln!("Bigram index is complete. Nothing to do.");
+        return Ok(());
+    }
+    let filled = crate::schema::fill_bigram_missing(&conn)?;
+    eprintln!(
+        "\u{2713} Filled {} bigram index entr{}.",
+        filled,
+        if filled == 1 { "y" } else { "ies" }
+    );
     Ok(())
 }
 
@@ -2886,6 +2922,9 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute_batch(include_str!("../data/schema.sql"))
             .unwrap();
+        // Triggers call `bigram_analyze`; schema.sql alone does not register it
+        // (production gets it via `db::connect`, other tests via `init_schema`).
+        crate::bigram::register_sql_function(&conn).unwrap();
         conn.execute(
             "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content)
              VALUES (?, 'sess1', 0, '2025-01-15T10:00:00', 'user', '/proj', ?)",
@@ -3280,6 +3319,8 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute_batch(include_str!("../data/schema.sql"))
             .unwrap();
+        // See `search_with_message`: triggers need the scalar function.
+        crate::bigram::register_sql_function(&conn).unwrap();
         conn
     }
 

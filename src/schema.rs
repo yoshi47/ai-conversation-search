@@ -4,21 +4,25 @@ use crate::error::{AppError, Result};
 
 const SCHEMA_SQL: &str = include_str!("../data/schema.sql");
 
-/// Trigger definitions that keep `message_content_fts` in sync with `messages`.
+/// Trigger definitions that keep `message_content_fts` and
+/// `message_content_bigram_fts` in sync with `messages`.
 ///
 /// Must stay identical to the copy in data/schema.sql, which is what fresh databases
-/// get; `test_migration_triggers_match_schema_sql` enforces that. Migration 9 recreates
-/// the delete/update triggers from here, since `CREATE TRIGGER IF NOT EXISTS` cannot
+/// get; `test_migration_triggers_match_schema_sql` enforces that. Migrations 9 and 10
+/// recreate the triggers from here, since `CREATE TRIGGER IF NOT EXISTS` cannot
 /// update an existing database.
 pub const FTS_SYNC_TRIGGERS: &str = "
     CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
         INSERT INTO message_content_fts(rowid, message_uuid, full_content)
         VALUES (new.rowid, new.message_uuid, new.full_content);
+        INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
+        VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
     END;
 
     CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
         INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
         VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
+        DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
     END;
 
     CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
@@ -26,6 +30,9 @@ pub const FTS_SYNC_TRIGGERS: &str = "
         VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
         INSERT INTO message_content_fts(rowid, message_uuid, full_content)
         VALUES (new.rowid, new.message_uuid, new.full_content);
+        DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
+        INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
+        VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
     END;";
 
 /// Migration kinds.
@@ -95,6 +102,11 @@ const MIGRATIONS: &[(i64, &str, MigrationKind)] = &[
         "fix FTS delete/update triggers for external-content table",
         MigrationKind::Custom,
     ),
+    (
+        10,
+        "add bigram FTS table for short-term/CJK search",
+        MigrationKind::Custom,
+    ),
 ];
 
 /// Initialize the database schema and run migrations.
@@ -108,6 +120,13 @@ const MIGRATIONS: &[(i64, &str, MigrationKind)] = &[
 /// 4. Run any unapplied migrations (adding columns, tables, indexes, FTS changes).
 /// 5. Re-run schema.sql to ensure all indexes/triggers exist (now that columns are present).
 pub fn init_schema(conn: &Connection) -> Result<()> {
+    // The FTS sync triggers call `bigram_analyze`, so the function must exist
+    // before any write fires them -- including writes made by migrations and
+    // by test helpers that insert directly. Production connections also get it
+    // via `db::connect`; registering twice on the same connection is harmless
+    // (it replaces the previous definition).
+    crate::bigram::register_sql_function(conn)?;
+
     // First pass: create base tables. Errors from indexes on missing columns are expected
     // for pre-migration databases and will be resolved after migrations run.
     let _ = conn.execute_batch(SCHEMA_SQL);
@@ -253,6 +272,9 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bo
         // The fixed trigger issues a 'delete' command; the broken one issued a
         // DELETE statement.
         9 => ("trigger", "messages_ad", "'delete'"),
+        // The bigram triggers feed `message_content_bigram_fts`; the pre-10
+        // `messages_ai` body only touches `message_content_fts`.
+        10 => ("trigger", "messages_ai", "bigram"),
         v => unreachable!("unhandled custom migration version: {}", v),
     };
 
@@ -346,11 +368,42 @@ fn parse_create_index(sql: &str) -> Option<String> {
     Some(index.to_string())
 }
 
+/// How many `messages` rows have no entry in the bigram FTS table.
+///
+/// Non-zero on databases whose rows predate migration 10 (or whose backfill
+/// was interrupted). Re-running the fill is safe: it only touches missing rows.
+pub fn count_bigram_missing(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM messages m
+         LEFT JOIN message_content_bigram_fts b ON b.rowid = m.rowid
+         WHERE b.rowid IS NULL",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Fill bigram entries for rows counted by `count_bigram_missing`.
+///
+/// Single statement, idempotent, safe to re-run (interrupted runs just leave
+/// rows for the next run). `OR REPLACE` tolerates a concurrent indexer
+/// inserting the same rowid mid-statement. Returns the number of rows filled.
+pub fn fill_bigram_missing(conn: &Connection) -> Result<usize> {
+    let filled = conn.execute(
+        "INSERT OR REPLACE INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
+         SELECT m.rowid, m.message_uuid, bigram_analyze(m.full_content) FROM messages m
+         LEFT JOIN message_content_bigram_fts b ON b.rowid = m.rowid
+         WHERE b.rowid IS NULL",
+        [],
+    )?;
+    Ok(filled)
+}
+
 /// Run custom migration by version.
 fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
     match version {
         8 => migrate_fts_to_trigram(conn),
         9 => migrate_fix_fts_delete_triggers(conn),
+        10 => migrate_add_bigram_fts(conn),
         v => unreachable!("unhandled custom migration version: {}", v),
     }
 }
@@ -363,6 +416,31 @@ fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
 /// `prune-observer` performs.
 fn migrate_fix_fts_delete_triggers(conn: &Connection) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
+    tx.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
+    tx.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
+    tx.execute_batch(FTS_SYNC_TRIGGERS)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Add the bigram FTS table and extend the sync triggers to feed both tables.
+///
+/// `CREATE TRIGGER IF NOT EXISTS` in schema.sql cannot update an existing
+/// database, so the old single-table definitions are dropped explicitly.
+/// Existing message rows are NOT backfilled here: that needs one
+/// `bigram_analyze` call per row and belongs in the `backfill-bigram` command,
+/// not in a migration that runs inside the background indexer. New writes are
+/// covered by the triggers from this point on.
+fn migrate_add_bigram_fts(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS message_content_bigram_fts USING fts5(
+            message_uuid UNINDEXED,
+            bigram_content,
+            tokenize='unicode61 remove_diacritics 1'
+        );",
+    )?;
+    tx.execute_batch("DROP TRIGGER IF EXISTS messages_ai;")?;
     tx.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
     tx.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
     tx.execute_batch(FTS_SYNC_TRIGGERS)?;
@@ -549,20 +627,30 @@ mod tests {
     }
 
     /// A database still carrying the broken triggers must be repaired by migration 9.
+    ///
+    /// Simulates a true pre-10 database: single-table `messages_ai`, legacy
+    /// `messages_ad`, and no bigram table at all. Rewinding both 9 and 10
+    /// exercises the migration chain end to end.
     #[test]
     fn test_migration_9_replaces_legacy_delete_trigger() {
         let conn = setup_fresh_db();
         init_schema(&conn).unwrap();
 
-        // Reinstate the pre-0.15.0 trigger and rewind the recorded version.
+        // Reinstate the pre-bigram/-0.15.0 triggers and rewind the versions.
         conn.execute_batch(
-            "DROP TRIGGER IF EXISTS messages_ad;
+            "DROP TRIGGER IF EXISTS messages_ai;
+             CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                 INSERT INTO message_content_fts(rowid, message_uuid, full_content)
+                 VALUES (new.rowid, new.message_uuid, new.full_content);
+             END;
+             DROP TRIGGER IF EXISTS messages_ad;
              CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
                  DELETE FROM message_content_fts WHERE rowid = old.rowid;
-             END;",
+             END;
+             DROP TABLE IF EXISTS message_content_bigram_fts;",
         )
         .unwrap();
-        conn.execute("DELETE FROM schema_version WHERE version = 9", [])
+        conn.execute("DELETE FROM schema_version WHERE version IN (9, 10)", [])
             .unwrap();
 
         // Confirm the legacy trigger really does strand an entry, so passing after the
@@ -579,9 +667,15 @@ mod tests {
         init_schema(&conn).unwrap();
 
         insert_message(&conn, "m1", "zebra crossing");
+        assert_eq!(
+            bigram_hits(&conn, "zebra"),
+            1,
+            "migration 10 must restore bigram writes"
+        );
         conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
             .unwrap();
         assert_eq!(orphan_fts_rows(&conn, "zeb"), 0);
+        assert_eq!(orphan_bigram_rows(&conn, "zebra"), 0);
     }
 
     /// On a fresh database schema.sql already produces the post-migration form, so the
@@ -594,6 +688,114 @@ mod tests {
 
         assert!(detect_custom_migration_applied(&conn, 8).unwrap());
         assert!(detect_custom_migration_applied(&conn, 9).unwrap());
+        assert!(detect_custom_migration_applied(&conn, 10).unwrap());
+    }
+
+    /// Counts bigram index entries whose content row is gone. Same shape as
+    /// `orphan_fts_rows`, but the MATCH fragment must be bigram-analyzed
+    /// (`analyze_for_query`), since the bigram table uses `unicode61`.
+    fn orphan_bigram_rows(conn: &Connection, query_term: &str) -> i64 {
+        let frag = crate::bigram::analyze_for_query(query_term).expect("test term must be FTSable");
+        conn.query_row(
+            "SELECT COUNT(*) FROM (SELECT rowid FROM message_content_bigram_fts WHERE message_content_bigram_fts MATCH ?) f
+             LEFT JOIN messages m ON m.rowid = f.rowid WHERE m.rowid IS NULL",
+            [frag],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn bigram_hits(conn: &Connection, query_term: &str) -> i64 {
+        let frag = crate::bigram::analyze_for_query(query_term).expect("test term must be FTSable");
+        conn.query_row(
+            "SELECT COUNT(*) FROM message_content_bigram_fts WHERE message_content_bigram_fts MATCH ?",
+            [frag],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_bigram_triggers_insert_delete_update() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "alphabet soup 失敗");
+
+        assert_eq!(bigram_hits(&conn, "alphabet"), 1);
+        assert_eq!(bigram_hits(&conn, "失敗"), 1);
+
+        conn.execute(
+            "UPDATE messages SET full_content = 'zebra crossing' WHERE message_uuid = 'm1'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            bigram_hits(&conn, "alphabet"),
+            0,
+            "old bigram terms must not survive an update"
+        );
+        assert_eq!(
+            bigram_hits(&conn, "失敗"),
+            0,
+            "old CJK bigram must not survive an update"
+        );
+        assert_eq!(bigram_hits(&conn, "zebra"), 1);
+
+        conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
+            .unwrap();
+        assert_eq!(orphan_bigram_rows(&conn, "zebra"), 0);
+    }
+
+    /// A database still carrying the pre-10 single-table triggers must be
+    /// repaired by migration 10: new writes have to reach the bigram table.
+    #[test]
+    fn test_migration_10_replaces_legacy_triggers() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+
+        // Reinstate the pre-bigram trigger and rewind the recorded version.
+        conn.execute_batch(
+            "DROP TRIGGER IF EXISTS messages_ai;
+             CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                 INSERT INTO message_content_fts(rowid, message_uuid, full_content)
+                 VALUES (new.rowid, new.message_uuid, new.full_content);
+             END;",
+        )
+        .unwrap();
+        conn.execute("DELETE FROM schema_version WHERE version = 10", [])
+            .unwrap();
+        assert!(!detect_custom_migration_applied(&conn, 10).unwrap());
+
+        init_schema(&conn).unwrap();
+
+        insert_message(&conn, "m1", "alphabet soup");
+        assert_eq!(
+            bigram_hits(&conn, "alphabet"),
+            1,
+            "post-migration inserts must reach the bigram table"
+        );
+    }
+
+    #[test]
+    fn test_backfill_bigram_count_and_fill() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "alphabet soup");
+        insert_message(&conn, "m2", "認証に失敗した");
+
+        // Simulate a pre-10 database: rows exist but the bigram table is empty.
+        conn.execute("DELETE FROM message_content_bigram_fts", [])
+            .unwrap();
+        assert_eq!(count_bigram_missing(&conn).unwrap(), 2);
+
+        let filled = fill_bigram_missing(&conn).unwrap();
+        assert_eq!(filled, 2);
+        assert_eq!(count_bigram_missing(&conn).unwrap(), 0);
+        assert_eq!(bigram_hits(&conn, "alphabet"), 1);
+        assert_eq!(bigram_hits(&conn, "失敗"), 1);
+
+        // Idempotent: a second run fills nothing.
+        assert_eq!(fill_bigram_missing(&conn).unwrap(), 0);
     }
 
     /// The detector has to recognise the pre-0.15.0 trigger as *not* migrated; if it

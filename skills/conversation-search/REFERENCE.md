@@ -103,28 +103,33 @@ normalizes by document length, very long machine-generated transcripts sink
 automatically. Use `--sort=recent` when you want to browse chronologically
 instead (it disables both rules and orders by timestamp only).
 
-**Short terms (under 3 characters):** the trigram tokenizer needs 3+ characters, so short
-terms cannot be ranked by. They are applied as a **mandatory substring filter** on top of
-the FTS results instead — a result must contain every short term, while the longer terms
-are OR-joined and ranked.
-
-Example: in `パッケージ 更新 ドキュメント`, `更新` is 2 characters, so results are ranked
-by `パッケージ`/`ドキュメント` relevance but must all contain `更新`.
-
-**Only if _every_ term is under 3 characters** (e.g. `認証 実装`) does the whole query fall
-back to substring matching: AND semantics, recency order, and `--sort` has no effect. An
-empty query behaves the same way.
+**Short terms (under 3 characters):** the trigram tokenizer needs 3+ characters, so
+short terms go through a second index instead: CJK runs are pre-split into
+overlapping bigrams and ASCII into words, ranked by that index's bm25.
+- Mixed with longer terms (e.g. `パッケージ 更新 ドキュメント`, where `更新` is
+  2 characters): results are ranked by the longer terms' relevance but must all
+  match the short term through the bigram index.
+- **If _every_ term is under 3 characters** (e.g. `認証 実装`, `mo`): the whole
+  query is ranked by the bigram index (OR + bm25, with the same full-match
+  boost as longer queries).
+- Only terms no index can express (single characters, emoji-only, ...) stay as
+  a mandatory `LIKE` substring filter. If _every_ term is one of those, the
+  query falls back to substring matching: AND semantics, recency order, and
+  `--sort` has no effect. An empty query behaves the same way.
+- Messages indexed before the bigram table existed need
+  `backfill-bigram` once (see below); until then they are invisible to
+  short-term FTS (title matching still applies).
 
 Escape hatch: quoting any part of the query — `"..."` or `--exact` — sends it to FTS
 verbatim.
 
 Explicit `AND`/`OR`/`NOT` operators also go to FTS verbatim, but **only if every operand is
 3+ characters**. Otherwise the query takes the substring-matching path and the operator is
-treated as a literal word — a sub-3-character operand cannot be expressed in FTS at all, so
-honoring the operator would silently drop it. Quote the short operand to force FTS.
+treated as a literal word — a sub-3-character operand cannot be expressed in the trigram
+table, so honoring the operator would silently drop it. Quote the short operand to force FTS.
 
-Case sensitivity differs by term length: long terms fold case across Unicode, short terms
-only across ASCII (they go through `LIKE`).
+Case sensitivity differs by term length: long terms fold case across Unicode; bigram
+terms fold ASCII case and match CJK literally; `LIKE`-residual terms fold ASCII only.
 
 **Note:** Cannot mix `--days` with `--date/--since/--until`.
 
@@ -536,6 +541,29 @@ rows and cannot be undone.
 - Nothing is lost: the observations live in `~/.claude-mem/claude-mem.db`, and the mirrored
   tool calls live in the primary sessions, which stay indexed.
 - New observer sessions are skipped at index time, so this only needs running once.
+
+---
+
+### ai-conversation-search backfill-bigram
+
+Fill bigram index entries for messages indexed before the bigram table existed
+(migration 10). Two-character queries (`mo`, `失敗`) need these entries to use
+the FTS index; without them, old messages are invisible to short-term search
+(new messages are indexed going forward by the sync triggers).
+
+```bash
+ai-conversation-search backfill-bigram [--dry-run]
+```
+
+**Options:**
+- `--dry-run`: Report how many messages lack a bigram entry, without changing anything
+
+**Notes:**
+- Idempotent and safe to re-run; an interrupted run simply leaves rows for the
+  next run. No confirmation prompt: it only adds index entries, never deletes rows.
+- `index --all --force` does NOT do this: `--force` only re-reads changed files,
+  and already-indexed sessions insert no new rows. Do not suggest it as a substitute.
+- Run once after upgrading; afterwards the triggers keep the table in sync.
 
 ---
 

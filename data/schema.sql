@@ -55,10 +55,24 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_content_fts USING fts5(
     tokenize='trigram case_sensitive 0'
 );
 
--- Triggers to keep FTS in sync
+-- Bigram rescue index for short (2-char) terms. Standalone table (no
+-- content=): the indexed text is Rust-analyzed (`bigram_analyze`), not a
+-- `messages` column, so an external-content `rebuild` could not re-read it.
+-- Triggers below always supply the values explicitly; backfill is the
+-- `backfill-bigram` command.
+CREATE VIRTUAL TABLE IF NOT EXISTS message_content_bigram_fts USING fts5(
+    message_uuid UNINDEXED,
+    bigram_content,
+    tokenize='unicode61 remove_diacritics 1'
+);
+
+-- Triggers to keep both FTS tables in sync. `bigram_analyze` is a Rust scalar
+-- function registered on every connection (see `src/bigram.rs` and `db::connect`).
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     INSERT INTO message_content_fts(rowid, message_uuid, full_content)
     VALUES (new.rowid, new.message_uuid, new.full_content);
+    INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
+    VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
 END;
 
 -- Removal uses the 'delete' command rather than `DELETE FROM ... WHERE rowid = ?`.
@@ -67,9 +81,20 @@ END;
 -- already gone, leaving the index entry behind with no error raised.
 -- On UPDATE the failure differs: the content row still exists but already holds the NEW
 -- values, so a plain DELETE unindexes those and the old terms stay searchable forever.
+-- Removal uses the 'delete' command rather than `DELETE FROM ... WHERE rowid = ?`.
+-- This is an external-content table (content='messages'), so a plain DELETE re-reads
+-- the content row to find the terms to unindex -- and by AFTER DELETE that row is
+-- already gone, leaving the index entry behind with no error raised.
+-- On UPDATE the failure differs: the content row still exists but already holds the NEW
+-- values, so a plain DELETE unindexes those and the old terms stay searchable forever.
+--
+-- The bigram table below is the mirror image: it is STANDALONE (no content=),
+-- so a plain DELETE is correct there -- and the 'delete' command is rejected
+-- with `SQL logic error` (verified on the bundled SQLite). Do not "unify" them.
 CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
     VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
+    DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
 END;
 
 CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
@@ -77,6 +102,9 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
     INSERT INTO message_content_fts(rowid, message_uuid, full_content)
     VALUES (new.rowid, new.message_uuid, new.full_content);
+    DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
+    INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
+    VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
 END;
 
 -- Conversation metadata (one per session)
