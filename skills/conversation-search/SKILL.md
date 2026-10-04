@@ -220,7 +220,7 @@ Note: OpenCode sessions have `oc:` prefix, Codex sessions have `codex:` prefix i
 Present `preview` and `resume-spec`, then wait for the user:
 
 ```bash
-ai-conversation-search tree <SESSION_ID> --no-tools --flat --content --content-chars 300
+ai-conversation-search preview <SESSION_ID> --messages 12 --query "<phrase>" --no-color
 ai-conversation-search resume-spec <SESSION_ID> --json
 ```
 

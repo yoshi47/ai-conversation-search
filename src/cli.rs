@@ -383,6 +383,26 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Preview the tail of a session with optional query highlight (read-only)
+    Preview {
+        /// Session ID (full, unique prefix, or oc:/codex: prefixed)
+        session_id: String,
+        /// Highlight this phrase (single phrase, ASCII case-insensitive) and list matching message UUIDs in JSON
+        #[arg(long)]
+        query: Option<String>,
+        /// Show the last N messages (default: 30)
+        #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
+        messages: u64,
+        /// Output as JSON (tree-compatible envelope plus query/matches/cwd_exists)
+        #[arg(long)]
+        json: bool,
+        /// Disable ANSI highlight even on a TTY
+        #[arg(long)]
+        no_color: bool,
+        /// Max characters of each message body to show
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..))]
+        content_chars: u64,
+    },
     /// Trigger background indexing (for use as a Claude Code hook)
     Hook,
 }
@@ -720,6 +740,21 @@ pub fn run(cli: Cli) -> Result<()> {
         ),
         Some(Commands::Resume { uuid }) => cmd_resume(&uuid),
         Some(Commands::ResumeSpec { session_id, json }) => cmd_resume_spec(&session_id, json),
+        Some(Commands::Preview {
+            session_id,
+            query,
+            messages,
+            json,
+            no_color,
+            content_chars,
+        }) => cmd_preview(
+            &session_id,
+            query.as_deref(),
+            messages as usize,
+            json,
+            no_color,
+            content_chars as usize,
+        ),
         Some(Commands::Hook) => cmd_hook(),
     }
 }
@@ -2145,6 +2180,303 @@ fn cmd_resume_spec(session_id: &str, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// Whether the preview highlight may emit ANSI.
+///
+/// Disabled by `--no-color`, by a present `NO_COLOR` env (any value, per
+/// https://no-color.org), or when stdout is not a TTY (piped into `head`,
+/// fzf's preview pane captures the same way). `--json` never highlights
+/// regardless — the caller can check this separately, this is only the TTY
+/// half of the decision.
+fn preview_color_enabled(no_color: bool) -> bool {
+    preview_color_enabled_with(
+        no_color,
+        std::env::var_os("NO_COLOR").is_some(),
+        clicolor_force(),
+        std::io::IsTerminal::is_terminal(&std::io::stdout()),
+    )
+}
+
+/// `CLICOLOR_FORCE=1` (and not `0`) forces color even when piped — the fzf
+/// preview pane captures stdout, so without this the grep mode (`preview
+/// --query {q}` from `pick`) could never highlight. `NO_COLOR` still wins
+/// when both are set.
+fn clicolor_force() -> bool {
+    match std::env::var("CLICOLOR_FORCE") {
+        Ok(v) => v != "0",
+        Err(_) => false,
+    }
+}
+
+fn preview_color_enabled_with(
+    no_color_flag: bool,
+    no_color_env: bool,
+    clicolor_force: bool,
+    is_tty: bool,
+) -> bool {
+    if no_color_flag || no_color_env {
+        return false;
+    }
+    clicolor_force || is_tty
+}
+
+/// Normalize the `--query` phrase: trim surrounding whitespace, ignore empty.
+///
+/// Multi-word input stays one phrase (no AND/OR splitting) — the contract
+/// with `pick`'s grep mode (`--query {q}`), where fzf's `{q}` can contain
+/// spaces.
+fn normalize_preview_query(query: Option<&str>) -> Option<String> {
+    query
+        .map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_string)
+}
+
+/// ASCII-only case-insensitive phrase highlight.
+///
+/// `to_ascii_lowercase` is length-preserving, and ASCII bytes never appear
+/// inside a multibyte UTF-8 sequence, so byte indices found in the lowered
+/// copy are always char boundaries in the original — no panic on Japanese
+/// text. Non-ASCII case differences are deliberately not folded.
+fn highlight_query(line: &str, query: &str) -> String {
+    let needle = query.to_ascii_lowercase();
+    if needle.is_empty() {
+        return line.to_string();
+    }
+    let hay = line.to_ascii_lowercase();
+    let mut out = String::with_capacity(line.len() + 16);
+    let mut pos = 0;
+    while pos <= hay.len() {
+        let Some(rel) = hay[pos..].find(&needle) else {
+            out.push_str(&line[pos..]);
+            break;
+        };
+        let start = pos + rel;
+        let end = start + needle.len();
+        out.push_str(&line[pos..start]);
+        out.push_str("\x1b[1;31m");
+        out.push_str(&line[start..end]);
+        out.push_str("\x1b[0m");
+        pos = end;
+        if pos >= hay.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// Whether a message body contains the preview query (pre-truncation full
+/// text, ASCII case-insensitive). Used for both the human highlight path
+/// and the JSON `matches` list so the two agree.
+fn preview_body_matches(full_content: &str, query: Option<&str>) -> bool {
+    let Some(q) = normalize_preview_query(query) else {
+        return false;
+    };
+    full_content
+        .to_ascii_lowercase()
+        .contains(&q.to_ascii_lowercase())
+}
+
+/// Short `YYYY-MM-DD HH:MM` for the preview `Range:` header.
+///
+/// Timestamps are RFC3339 (localized by the time they reach JSON); if parsing
+/// fails the raw value is truncated to 16 chars like the `pick` preview does.
+fn short_preview_time(ts: &str) -> String {
+    let cleaned = ts.replace('Z', "+00:00");
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&cleaned) {
+        let local: chrono::DateTime<chrono::Local> = dt.with_timezone(&chrono::Local);
+        return local.format("%Y-%m-%d %H:%M").to_string();
+    }
+    ts.chars().take(16).collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cmd_preview(
+    session_id: &str,
+    query: Option<&str>,
+    messages: usize,
+    json_output: bool,
+    no_color: bool,
+    content_chars: usize,
+) -> Result<()> {
+    // Canonicalize first so bare prefixes (`e16efca0`) and `oc:`/`codex:`
+    // inputs resolve exactly like `resume-spec`. Ambiguous/unsafe inputs
+    // are hard errors here, matching `tree`'s wording via the shared helper.
+    // In `--json` mode an unresolvable id still prints the `tree`-shaped
+    // error envelope (`.error` key) so JSON readers need no second shape —
+    // only the exit status tells success from failure.
+    let target = match resolve_resume_target(session_id) {
+        Ok(target) => target,
+        Err(e) => {
+            if json_output {
+                if let Ok(tree) = lookup_tree(db::DEFAULT_DB_PATH, session_id, None) {
+                    let json_val = serde_json::to_value(&tree)?;
+                    let mut localized = localize_timestamps(json_val);
+                    if let Some(map) = localized.as_object_mut() {
+                        map.insert("returned_messages".to_string(), serde_json::Value::from(0));
+                        map.insert(
+                            "query".to_string(),
+                            match normalize_preview_query(query) {
+                                Some(q) => serde_json::Value::String(q),
+                                None => serde_json::Value::Null,
+                            },
+                        );
+                        map.insert("matches".to_string(), serde_json::Value::Array(Vec::new()));
+                        map.insert("cwd_exists".to_string(), serde_json::Value::Null);
+                    }
+                    println!("{}", serde_json::to_string_pretty(&localized)?);
+                }
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            return Err(e);
+        }
+    };
+    let cwd_exists: Option<bool> = target
+        .project_path
+        .as_ref()
+        .map(|p| std::path::Path::new(p).exists());
+
+    let mut tree = match lookup_tree(db::DEFAULT_DB_PATH, &target.session_id, None) {
+        Ok(tree) => tree,
+        Err(e) => {
+            maybe_background_index();
+            return Err(e);
+        }
+    };
+    maybe_background_index();
+
+    let code = tree_exit_code(&tree);
+    if tree.error.is_none() {
+        let opts = TreeOpts {
+            role: None,
+            no_tools: true,
+            flat: true,
+            content: true,
+            content_chars,
+            json: json_output,
+        };
+        filter_tree(&mut tree, &opts);
+        // `flatten_tree` inside `filter_tree` already sorted chronologically,
+        // so the tail is the most recent N.
+        if tree.tree.len() > messages {
+            let at = tree.tree.len() - messages;
+            tree.tree = tree.tree.split_off(at);
+        }
+    }
+    let returned = tree.tree.len();
+    let total = tree.total_messages;
+
+    if json_output {
+        let query_norm = normalize_preview_query(query);
+        let matches: Vec<String> = tree
+            .tree
+            .iter()
+            .filter(|n| preview_body_matches(&n.full_content, query))
+            .map(|n| n.message_uuid.clone())
+            .collect();
+        let json_val = serde_json::to_value(&tree)?;
+        let mut localized = localize_timestamps(json_val);
+        apply_tree_content(
+            &mut localized,
+            &TreeOpts {
+                role: None,
+                no_tools: true,
+                flat: true,
+                content: true,
+                content_chars,
+                json: true,
+            },
+        );
+        if let Some(map) = localized.as_object_mut() {
+            map.insert(
+                "returned_messages".to_string(),
+                serde_json::Value::from(returned),
+            );
+            map.insert(
+                "query".to_string(),
+                match query_norm {
+                    Some(q) => serde_json::Value::String(q),
+                    None => serde_json::Value::Null,
+                },
+            );
+            map.insert(
+                "matches".to_string(),
+                serde_json::Value::Array(
+                    matches.into_iter().map(serde_json::Value::String).collect(),
+                ),
+            );
+            map.insert(
+                "cwd_exists".to_string(),
+                match cwd_exists {
+                    Some(b) => serde_json::Value::Bool(b),
+                    None => serde_json::Value::Null,
+                },
+            );
+        }
+        println!("{}", serde_json::to_string_pretty(&localized)?);
+    } else {
+        // Human path mirrors `cmd_tree`'s error contract: stderr + exit code,
+        // never stdout, so `preview ... > out.txt` keeps the failure visible.
+        if let Some(ref err) = tree.error {
+            eprintln!("Error: {}", err);
+        } else {
+            if let Some(ref warning) = tree.warning {
+                eprintln!("Warning: {}", warning);
+            }
+            let project = target.project_path.as_deref().unwrap_or("(unknown)");
+            let (start, end) = if returned == 0 {
+                (0, 0)
+            } else {
+                (total.saturating_sub(returned) + 1, total)
+            };
+            println!("Project: {}", project);
+            println!("Messages: {}-{}/{} (returned/total)", start, end, total);
+            let range = if returned == 0 {
+                "(empty)".to_string()
+            } else {
+                format!(
+                    "{} → {}",
+                    short_preview_time(&tree.tree.first().unwrap().timestamp),
+                    short_preview_time(&tree.tree.last().unwrap().timestamp)
+                )
+            };
+            println!("Range: {}", range);
+            println!();
+            let color = preview_color_enabled(no_color);
+            let query_norm = normalize_preview_query(query);
+            for node in &tree.tree {
+                let icon = if node.message_type == "user" {
+                    "\u{1f464}"
+                } else {
+                    "\u{1f916}"
+                };
+                println!("{} {}", icon, node.summary.as_deref().unwrap_or(""));
+                let (body, dropped) = truncate_chars(&node.full_content, content_chars);
+                for line in body.lines() {
+                    let rendered = match &query_norm {
+                        Some(q) if color => highlight_query(line, q),
+                        _ => line.to_string(),
+                    };
+                    println!("    {}", rendered);
+                }
+                if dropped {
+                    println!("    ...");
+                }
+            }
+        }
+    }
+
+    if code != 0 {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+        std::process::exit(code);
+    }
+
+    Ok(())
+}
+
 fn cmd_hook() -> Result<()> {
     // Own TTL, not the shared one -- see `hook_index_ttl_secs` for why.
     let ttl = hook_index_ttl_secs(std::env::var("CONVERSATION_SEARCH_HOOK_TTL").ok());
@@ -2330,6 +2662,67 @@ mod tests {
         let (out, dropped) = truncate_chars("日本語のテキスト", 3);
         assert_eq!(out, "日本語");
         assert!(dropped);
+    }
+
+    #[test]
+    fn test_highlight_query_ascii_case_insensitive() {
+        let out = highlight_query("Use PICK to pick sessions", "pick");
+        assert_eq!(
+            out,
+            "Use \x1b[1;31mPICK\x1b[0m to \x1b[1;31mpick\x1b[0m sessions"
+        );
+    }
+
+    #[test]
+    fn test_highlight_query_empty_is_passthrough() {
+        assert_eq!(highlight_query("hello", ""), "hello");
+    }
+
+    #[test]
+    fn test_highlight_query_no_byte_boundary_panic_on_japanese() {
+        // The needle is ASCII so matches are ASCII bytes, which are always
+        // char boundaries in UTF-8 — multibyte text around them must survive.
+        let out = highlight_query("日本語のpickテキストpick終わり", "pick");
+        assert_eq!(
+            out,
+            "日本語の\x1b[1;31mpick\x1b[0mテキスト\x1b[1;31mpick\x1b[0m終わり"
+        );
+        // A non-ASCII needle falls back to a plain substring search; it must
+        // not panic either.
+        let out = highlight_query("日本語のテキスト", "日本語");
+        assert!(out.contains("\x1b[1;31m日本語\x1b[0m"));
+    }
+
+    #[test]
+    fn test_normalize_preview_query_trims_and_drops_empty() {
+        assert_eq!(
+            normalize_preview_query(Some("  auth  ")),
+            Some("auth".to_string())
+        );
+        assert_eq!(normalize_preview_query(Some("   ")), None);
+        assert_eq!(normalize_preview_query(None), None);
+    }
+
+    #[test]
+    fn test_preview_body_matches_is_case_insensitive() {
+        assert!(preview_body_matches("Use PICK here", Some("pick")));
+        assert!(preview_body_matches("日本語pickテキスト", Some("PICK")));
+        assert!(!preview_body_matches("nothing here", Some("pick")));
+        assert!(!preview_body_matches("anything", None));
+        assert!(!preview_body_matches("anything", Some("  ")));
+    }
+
+    #[test]
+    fn test_preview_color_respects_flags() {
+        // Pure-function half of the decision — no env access, so no
+        // process-global mutation from tests.
+        assert!(!preview_color_enabled_with(true, false, false, true));
+        assert!(!preview_color_enabled_with(false, true, false, true));
+        assert!(!preview_color_enabled_with(false, false, false, false));
+        assert!(preview_color_enabled_with(false, false, false, true));
+        // CLICOLOR_FORCE re-enables piped output (fzf preview pane); NO_COLOR wins over it.
+        assert!(preview_color_enabled_with(false, false, true, false));
+        assert!(!preview_color_enabled_with(false, true, true, false));
     }
 
     #[test]

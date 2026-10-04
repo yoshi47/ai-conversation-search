@@ -372,6 +372,88 @@ ai-conversation-search resume-spec oc:ses_abc --json  # resume_command is null
 
 ---
 
+### ai-conversation-search preview
+
+Preview the tail of a session without resuming it (read-only). For deciding
+*which* session to resume, or recalling how one ended.
+
+```bash
+ai-conversation-search preview SESSION_ID [--query PHRASE] [--messages N] [--json] [--no-color] [--content-chars N]
+```
+
+**Arguments:**
+- `SESSION_ID`: Session ID from list or search results. Same resolution as
+  `tree`/`resume-spec`: a unique prefix is accepted, an ambiguous prefix is
+  an error with the number of matches, and bare UUIDs also resolve to
+  `oc:`/`codex:`-prefixed OpenCode and Codex sessions.
+
+**Options:**
+- `--messages N`: Show the last N messages (default: 30)
+- `--query PHRASE`: Highlight one phrase in human output (single phrase, ASCII
+  case-insensitive, surrounding whitespace trimmed, empty is ignored). The
+  message count never changes — this only highlights. In `--json`, matching
+  message UUIDs are listed in `matches` instead (no ANSI in JSON)
+- `--no-color`: Disable ANSI highlight even on a TTY. Highlight is also off
+  when `NO_COLOR` is set or stdout is not a TTY (e.g. piped). Set
+  `CLICOLOR_FORCE=1` to force color when piped (the fzf preview pane)
+- `--content-chars N`: Cap each body at N characters (default: 300, same as `tree`)
+- `--json`: Output as JSON
+
+**Output (JSON):** the `tree --flat --no-tools --content --json` envelope
+unchanged (`conversation` / `tree[]` / `total_messages` /
+`returned_messages`, same node shape with `full_content` +
+`full_content_truncated`), plus three additive keys. There is no `messages`
+key. `tree[]` holds the last N messages; `total_messages` still means
+"messages in the session".
+
+```json
+{
+  "conversation": {
+    "session_id": "abc-123",
+    "source": "claude_code",
+    "project_path": "/home/user/proj"
+  },
+  "total_messages": 120,
+  "returned_messages": 30,
+  "tree": [
+    {
+      "message_uuid": "msg-uuid-1",
+      "message_type": "user",
+      "timestamp": "2026-09-01T11:59:00+09:00",
+      "full_content": "...",
+      "full_content_truncated": false
+    }
+  ],
+  "cwd_exists": true,
+  "query": "auth",
+  "matches": ["msg-uuid-1"]
+}
+```
+
+- `query` is the trimmed phrase, or `null` when `--query` was not given (then
+  `matches` is `[]`). `matches` only covers the returned last N, judged
+  against the pre-truncation body.
+- `cwd_exists` is a single `Path::exists()` stat, same as `resume-spec`
+  (`null` when `project_path` is `null`).
+- Unresolvable ids exit `1` with the `tree`-shaped error envelope (`.error`
+  key) plus `query`/`matches`/`cwd_exists`, and the reason on stderr.
+
+**Human output:** a plain header plus bodies, no emoji-painted framing:
+
+```
+Project: /home/user/proj
+Messages: 91-120/120 (returned/total)
+Range: 2026-09-01 10:00 → 2026-09-01 12:00
+```
+
+**Example:**
+```bash
+ai-conversation-search preview abc-123 --messages 12
+ai-conversation-search preview abc-123 --query auth --json | jq .matches
+```
+
+---
+
 ### ai-conversation-search index
 
 JIT index conversations (instant, no AI calls). The skill runs this before every search.
