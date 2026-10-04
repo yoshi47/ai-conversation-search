@@ -271,6 +271,8 @@ enum QueryPlan<'a> {
     Raw(String),
     /// Terms of `MIN_TRIGRAM_CHARS`+ go to FTS, OR-joined and bm25-ranked. Shorter
     /// terms cannot be ranked by, so they narrow the phase-2 rows with LIKE instead.
+    /// Rows holding every long term sort above partial matches (see
+    /// `contains_all_terms`), so recall stays OR while the top reads AND-like.
     Hybrid {
         fts_query: String,
         short_terms: Vec<&'a str>,
@@ -415,6 +417,19 @@ fn find_term(haystack: &str, needle: &str) -> Option<(usize, usize)> {
     }
 
     None
+}
+
+/// Whether `text` contains every term (Unicode case-insensitive, literal).
+///
+/// Ranks full matches above partial OR matches on the Hybrid path: v0.14.0 moved
+/// multi-term queries from AND to OR so that `パッケージ アップグレード ドキュメント`
+/// stops returning zero rows, but OR lets single-term noise fill the top. Boosting
+/// full matches keeps OR's recall while restoring AND-like precision at the top --
+/// without a second FTS round, whose bm25 scores would be incomparable anyway
+/// (different query, different idf). An empty `terms` (the Raw path) matches
+/// everything, so explicit-operator and quoted queries keep pure bm25 order.
+fn contains_all_terms(text: &str, terms: &[&str]) -> bool {
+    terms.iter().all(|t| find_term(text, t).is_some())
 }
 
 fn summary_from_content(content: &str) -> String {
@@ -705,7 +720,9 @@ impl ConversationSearch {
 
         let trimmed = query.trim();
 
-        let (fts_query, short_terms) = match plan_query(trimmed) {
+        let (fts_query, short_terms, boost_terms): (String, Vec<&str>, Vec<&str>) = match plan_query(
+            trimmed,
+        ) {
             QueryPlan::LikeOnly { terms } => {
                 let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
                 // No term reaches the trigram minimum, so there is no term-frequency signal
@@ -735,11 +752,20 @@ impl ConversationSearch {
                 let stats = self.gather_search_stats(filter, matched, truncated)?;
                 return Ok(SearchResult { rows, stats });
             }
-            QueryPlan::Raw(q) => (q, Vec::new()),
+            QueryPlan::Raw(q) => (q, Vec::new(), Vec::new()),
             QueryPlan::Hybrid {
                 fts_query,
                 short_terms,
-            } => (fts_query, short_terms),
+            } => {
+                // Long terms for the full-match boost (see contains_all_terms). The
+                // short terms are already enforced by the phase-2 LIKE, so every
+                // surviving row contains them; only the long terms discriminate.
+                let boost_terms: Vec<&str> = trimmed
+                    .split_whitespace()
+                    .filter(|t| t.chars().count() >= MIN_TRIGRAM_CHARS)
+                    .collect();
+                (fts_query, short_terms, boost_terms)
+            }
         };
 
         // Two-phase query to work around SQLite trigram FTS performance issue.
@@ -760,7 +786,7 @@ impl ConversationSearch {
             });
         }
 
-        let mut score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
+        let score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
 
         // Process in batches to stay within SQLITE_MAX_VARIABLE_NUMBER
         const BATCH_SIZE: usize = 500;
@@ -819,13 +845,25 @@ impl ConversationSearch {
         }
 
         // 本文ヒット済みセッションは除外して合流し、代表/上位を奪わせない。
-        self.inject_title_matches(
-            trimmed,
-            filter,
-            &mut all_results,
-            &mut score_by_rowid,
-            limit,
-        )?;
+        // 順序は下のソートで決める: 本文の全語一致 > タイトルのみ > 本文の部分一致。
+        let mut title_rowids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        self.inject_title_matches(trimmed, filter, &mut all_results, &mut title_rowids, limit)?;
+
+        // Full-match boost (Hybrid path only): rows holding every long term sort
+        // above partial OR matches. Single-term and Raw queries skip the content
+        // scan -- every row trivially qualifies, so the order stays pure bm25.
+        // Runs before snippet extraction, while context_snippet still holds the
+        // full text (title rows hold the title itself, which matches by AND).
+        let mut full_rowids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        if boost_terms.len() < 2 {
+            full_rowids.extend(all_results.iter().map(|r| r.rowid));
+        } else {
+            for r in &all_results {
+                if contains_all_terms(&r.context_snippet, &boost_terms) {
+                    full_rowids.insert(r.rowid);
+                }
+            }
+        }
 
         // bm25's length normalization is what sinks the multi-KB observer transcripts,
         // but it could in principle let a one-line fragment outrank a substantive
@@ -834,10 +872,13 @@ impl ConversationSearch {
         // short-but-correct messages unfindable.
         match filter.sort {
             SortOrder::Relevance => all_results.sort_by(|a, b| {
-                let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
-                let sb = score_by_rowid.get(&b.rowid).copied().unwrap_or(f64::MAX);
-                sa.partial_cmp(&sb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                Self::sort_tier(a.rowid, &full_rowids, &title_rowids)
+                    .cmp(&Self::sort_tier(b.rowid, &full_rowids, &title_rowids))
+                    .then_with(|| {
+                        let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
+                        let sb = score_by_rowid.get(&b.rowid).copied().unwrap_or(f64::MAX);
+                        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     // Ties prefer the newer message AMONG COLLECTED ROWS ONLY. An
                     // equal-scoring row in a later batch is never fetched once the
                     // early stop fires, so across a batch boundary ties resolve in
@@ -901,7 +942,7 @@ impl ConversationSearch {
         let trimmed = query.trim();
         let plan = plan_query(trimmed);
 
-        let (fts_query, short_terms) = match plan {
+        let (fts_query, short_terms, boost_terms): (String, Vec<&str>, Vec<&str>) = match plan {
             QueryPlan::LikeOnly { terms } => {
                 // SQL window function picks the most recent message per session and counts
                 // matches per session, then we LIMIT at session level. Like the non-grouped
@@ -948,11 +989,17 @@ impl ConversationSearch {
                 let stats = self.gather_search_stats(filter, matched_total, truncated)?;
                 return Ok(GroupedSearchResult { rows, stats });
             }
-            QueryPlan::Raw(q) => (q, Vec::new()),
+            QueryPlan::Raw(q) => (q, Vec::new(), Vec::new()),
             QueryPlan::Hybrid {
                 fts_query,
                 short_terms,
-            } => (fts_query, short_terms),
+            } => {
+                let boost_terms: Vec<&str> = trimmed
+                    .split_whitespace()
+                    .filter(|t| t.chars().count() >= MIN_TRIGRAM_CHARS)
+                    .collect();
+                (fts_query, short_terms, boost_terms)
+            }
         };
 
         // FTS path: same trigram two-phase strategy as search_conversations.
@@ -1011,21 +1058,31 @@ impl ConversationSearch {
         // The representative moves with the ranking on purpose. Surfacing a session
         // because it holds a highly relevant message, then showing a different message
         // as the snippet, makes the ranking look broken.
-        let mut score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
+        let score_by_rowid: HashMap<i64, f64> = scored.iter().copied().collect();
         // 本文ヒット済みセッションは除外して合流し、代表を奪わせない。
-        self.inject_title_matches(
-            trimmed,
-            filter,
-            &mut all_results,
-            &mut score_by_rowid,
-            limit,
-        )?;
+        // 順序は下のソートで決める(flat側と同じ4階層)。代表選定ループは
+        // ソート済み先頭を取るため、自動で最良層・最良bm25の行になる。
+        let mut title_rowids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        self.inject_title_matches(trimmed, filter, &mut all_results, &mut title_rowids, limit)?;
+        let mut full_rowids: std::collections::HashSet<i64> = std::collections::HashSet::new();
+        if boost_terms.len() < 2 {
+            full_rowids.extend(all_results.iter().map(|r| r.rowid));
+        } else {
+            for r in &all_results {
+                if contains_all_terms(&r.context_snippet, &boost_terms) {
+                    full_rowids.insert(r.rowid);
+                }
+            }
+        }
         match filter.sort {
             SortOrder::Relevance => all_results.sort_by(|a, b| {
-                let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
-                let sb = score_by_rowid.get(&b.rowid).copied().unwrap_or(f64::MAX);
-                sa.partial_cmp(&sb)
-                    .unwrap_or(std::cmp::Ordering::Equal)
+                Self::sort_tier(a.rowid, &full_rowids, &title_rowids)
+                    .cmp(&Self::sort_tier(b.rowid, &full_rowids, &title_rowids))
+                    .then_with(|| {
+                        let sa = score_by_rowid.get(&a.rowid).copied().unwrap_or(f64::MAX);
+                        let sb = score_by_rowid.get(&b.rowid).copied().unwrap_or(f64::MAX);
+                        sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+                    })
                     .then_with(|| b.timestamp.cmp(&a.timestamp))
             }),
             // Recent: representative reverts to the most recent matching message.
@@ -1237,15 +1294,19 @@ impl ConversationSearch {
             .collect())
     }
 
-    /// Fold title-only sessions into an existing body-FTS result set, ranked
-    /// first. Sessions already present (body hits) are excluded so their real
-    /// best-scoring message stays the representative.
+    /// Fold title-only sessions into an existing body-FTS result set.
+    ///
+    /// Sessions already present (body hits) are excluded so their real
+    /// best-scoring message stays the representative. Title rows carry no bm25
+    /// score -- the Relevance sort keys them into their own tier below body
+    /// rows (see `sort_tier`), where they order by recency. Callers pass
+    /// `title_rowids` so the sort can tell the tiers apart.
     fn inject_title_matches(
         &mut self,
         trimmed: &str,
         filter: &SearchFilter<'_>,
         all_results: &mut Vec<SearchResultRow>,
-        score_by_rowid: &mut HashMap<i64, f64>,
+        title_rowids: &mut std::collections::HashSet<i64>,
         limit: i64,
     ) -> Result<()> {
         let terms = Self::title_terms(trimmed);
@@ -1256,10 +1317,22 @@ impl ConversationSearch {
             all_results.iter().map(|r| r.session_id.clone()).collect();
         let title_rows = self.title_only_rows(&terms, filter, &seen, limit)?;
         for r in &title_rows {
-            score_by_rowid.insert(r.rowid, f64::NEG_INFINITY);
+            title_rowids.insert(r.rowid);
         }
         all_results.splice(0..0, title_rows);
         Ok(())
+    }
+
+    /// Sort tier for the Relevance order: full body (0), full title (1),
+    /// partial body (2), partial title (3). Within a tier, bm25 then recency
+    /// applies; title rows have no bm25, so they fall back to recency among
+    /// themselves. `Recent` order never consults this.
+    fn sort_tier(
+        rowid: i64,
+        full: &std::collections::HashSet<i64>,
+        title: &std::collections::HashSet<i64>,
+    ) -> u8 {
+        (!full.contains(&rowid) as u8) * 2 + (title.contains(&rowid) as u8)
     }
 
     /// Returns `(rowid, bm25_score)` pairs sorted best-first.
@@ -3296,6 +3369,218 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "msg1"); // 合成アンカーではなく本文行
+    }
+
+    /// Full-match boost: a diluted document holding every long term outranks a
+    /// tiny partial match, even though bm25's length normalization and the newer
+    /// timestamp both favor the partial one. Only the tier rule can put `full` first.
+    #[test]
+    fn test_full_match_boost_beats_bm25_partial() {
+        let conn = setup_test_db();
+        for (sid, proj) in [("sessA", "/proj"), ("sessB", "/proj")] {
+            insert_test_conversation(
+                &conn,
+                sid,
+                proj,
+                "summary",
+                "2025-01-15T09:00:00",
+                "2025-01-15T10:00:00",
+                "claude_code",
+            );
+        }
+        let diluted = format!(
+            "alpha {} bravo {}",
+            "filler ".repeat(200),
+            "filler ".repeat(200)
+        );
+        insert_test_message(
+            &conn,
+            "full",
+            "sessA",
+            &diluted,
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "part",
+            "sessB",
+            "alpha",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_conversations("alpha bravo", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].message_uuid, "full",
+            "the document holding every term must rank first despite worse bm25"
+        );
+    }
+
+    /// Body hits sort above title-only matches in the same tier. Before the tier
+    /// rule, title rows carried NEG_INFINITY and always came first.
+    #[test]
+    fn test_body_hit_ranks_above_title_only() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sessA",
+            "/proj",
+            "unrelated title",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "body",
+            "sessA",
+            "we finished the WidgetMigration today",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_conversation(
+            &conn,
+            "sessB",
+            "/proj",
+            "WidgetMigration plan",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "other",
+            "sessB",
+            "we discussed caching strategy at length",
+            "user",
+            "2025-01-15T10:30:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_conversations("WidgetMigration", &default_filter())
+            .unwrap()
+            .rows;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].session_id, "sessA");
+        assert_eq!(results[0].message_uuid, "body");
+    }
+
+    /// `--sort recent` disables the tier rule: recency alone decides.
+    #[test]
+    fn test_full_match_boost_ignored_under_sort_recent() {
+        let conn = setup_test_db();
+        for (sid, proj) in [("sessA", "/proj"), ("sessB", "/proj")] {
+            insert_test_conversation(
+                &conn,
+                sid,
+                proj,
+                "summary",
+                "2025-01-15T09:00:00",
+                "2025-01-15T10:00:00",
+                "claude_code",
+            );
+        }
+        let diluted = format!(
+            "alpha {} bravo {}",
+            "filler ".repeat(200),
+            "filler ".repeat(200)
+        );
+        insert_test_message(
+            &conn,
+            "full",
+            "sessA",
+            &diluted,
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "part",
+            "sessB",
+            "alpha",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let results = searcher
+            .search_conversations(
+                "alpha bravo",
+                &SearchFilter {
+                    sort: SortOrder::Recent,
+                    ..default_filter()
+                },
+            )
+            .unwrap()
+            .rows;
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].message_uuid, "part");
+    }
+
+    /// Grouped path inherits the tier rule: the session whose representative is
+    /// a full match comes first, and the representative stays the best-tier row.
+    #[test]
+    fn test_grouped_full_match_session_first() {
+        let conn = setup_test_db();
+        for (sid, proj) in [("sessA", "/proj"), ("sessB", "/proj")] {
+            insert_test_conversation(
+                &conn,
+                sid,
+                proj,
+                "summary",
+                "2025-01-15T09:00:00",
+                "2025-01-15T10:00:00",
+                "claude_code",
+            );
+        }
+        let diluted = format!(
+            "alpha {} bravo {}",
+            "filler ".repeat(200),
+            "filler ".repeat(200)
+        );
+        insert_test_message(
+            &conn,
+            "full",
+            "sessA",
+            &diluted,
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "part",
+            "sessB",
+            "alpha",
+            "user",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let result = searcher
+            .search_grouped_by_session("alpha bravo", &default_filter())
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].representative.session_id, "sessA");
+        assert_eq!(result.rows[0].representative.message_uuid, "full");
     }
 
     #[test]

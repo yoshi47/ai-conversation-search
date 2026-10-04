@@ -154,8 +154,13 @@ Based on query classification:
 
 **For Topic or Hybrid queries:**
 ```bash
-ai-conversation-search search "search terms" --days 14 --json
+ai-conversation-search search "search terms" --group-by-session --limit 50 --json
 ```
+
+No date filter on the first attempt: a `--days 14` window silently drops older
+sessions (e.g. from months ago). Add `--days`/`--date` only when the user named
+an explicit date or range ("yesterday", "last week", "6/29"). Words like
+"昔/以前/あの" are the opposite signal — they mean widen the scope, not narrow it.
 
 **For Temporal queries:**
 ```bash
@@ -171,9 +176,12 @@ ai-conversation-search list --date yesterday --json  # or --days N, --since, --u
 **Only if Level 1 found nothing useful.**
 
 For topic/hybrid queries:
-- Remove time constraints: `ai-conversation-search search "terms" --json`
-- Try alternative keywords: "auth" vs "authentication"
-- Try broader terms: "database" vs "postgres"
+- Level 1 is already unscoped in time, so widen by words, not by dates:
+  try alternative keywords ("auth" vs "authentication"), broader terms
+  ("database" vs "postgres"), or fewer terms (drop the least essential word —
+  every extra word narrows the top of the ranking)
+- If matches found but `.truncated` is `true`, re-run with a higher `--limit`
+  before concluding anything is absent
 
 For temporal queries:
 - Expand time range: `--days 30` instead of `--days 7`
@@ -414,8 +422,8 @@ User: "Find that conversation where we fixed the authentication bug"
 Todo workflow:
 1. ✓ Tool installed/upgraded
 2. ✓ Classify: TOPIC query
-3. ✓ Level 1: `ai-conversation-search search "authentication bug" --days 14 --json`
-4. If no results → Level 2: `ai-conversation-search search "auth bug" --json`
+3. ✓ Level 1: `ai-conversation-search search "authentication bug" --group-by-session --limit 50 --json`
+4. If no results → Level 2: `ai-conversation-search search "auth bug" --group-by-session --limit 50 --json`
 5. Present results with resume commands
 
 **Example 2: Temporal query**

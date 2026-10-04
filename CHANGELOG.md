@@ -15,6 +15,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Codex CLI と OpenCode への導入経路を用意した。Codex は既存の `.claude-plugin/marketplace.json` をそのまま読めるので、`codex plugin marketplace add yoshi47/ai-conversation-search` でプラグインとして入る。OpenCode 向けにはプラグインを用意せず、`skills/index.json`（HTTP カタログ）を追加し、`"skills"` に raw URL を書けば読み込まれるようにした
 - バージョンの一致チェック（`scripts/check-versions.sh`）を CI とリリースに追加した。Cargo.toml・plugin.json・marketplace.json・`skills/index.json`・ラッパーの `ACS_WRAPPER_VERSION` のどれかがずれていると CI が落ち、リリースはタグとずれていても止まる
 
+### Changed
+
+- `search` の多語クエリは OR のまま、**全語を含むメッセージを上位に寄せる**ようにした（FTS は単発、Rust 側の順序規則のみ。`--exact`・明示演算子・引用句は不変）。`crit markdown browser` のような探索クエリで部分一致のノイズが上位を埋めにくくなる。全語を含む文書がなくても 0 件にはならない（v0.14.0 の OR 化の動機は維持）。各層内は従来どおり bm25→新着順、`--sort recent` では順序規則は効かない
+- タイトルのみ一致（`conversation_summary`）は本文ヒットより下に並べるようにした。本文に同語がないセッションは従来どおり見つかる（recall は不変）が、タイトル行が本文行の上に出て代表を奪うことはなくなる
+- `conversation-search` スキルの Level 1 初手を `search "terms" --days 14 --json` から `search "terms" --group-by-session --limit 50 --json`（期間フィルタなし）に変えた。`--days 14` では古いセッションが初手で除外されていた。`--days` は日付が明示されたときのみ付ける（ドキュメントのみ、Rust 無変更）
+
 ### Fixed
 
 - OpenCode HTTP カタログ（`skills/index.json`）の `files` を `["conversation-search.md", "REFERENCE.md"]` に変え、命名 Markdown 形式にした。従来の `SKILL.md` だとダウンロード後のソースルート直下が `SKILL.md` になり、V2 ではスキル ID が `conversation-search` ではなくリテラル `SKILL` になっていた。`skills/conversation-search/conversation-search.md`（`SKILL.md` と同内容＋`REFERENCE.md` への誘導付き）を追加し、`SKILL.md` 自体は Claude Code / Codex 用に残した
