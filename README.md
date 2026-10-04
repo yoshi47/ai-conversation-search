@@ -219,7 +219,7 @@ ai-conversation-search context MESSAGE_UUID [--depth 5] [--content] [--json]
 List recent conversations with calendar date support
 ```bash
 # Traditional relative time
-ai-conversation-search list [--days 7] [--limit 20] [--source SOURCE] [--json]
+ai-conversation-search list [--days 7] [--limit 20] [--project PATH] [--repo REPO] [--here] [--exclude-project STR]... [--exclude-repo STR]... [--source SOURCE] [--json]
 
 # Calendar date filtering
 ai-conversation-search list --date yesterday [--json]
@@ -262,7 +262,7 @@ ai-conversation-search preview SESSION_ID [--query PHRASE] [--messages N] [--jso
 ```
 Shows the last N messages (default: 30) with a plain `Project:` / `Messages:` /
 `Range:` header. `--query` highlights one phrase (count unchanged); `--json`
-returns the `tree --json` envelope plus `query` / `matches` / `project_exists`.
+returns the `tree --json` envelope plus `query` / `matches` / `project_exists` / `project_basename`.
 
 ### `ai-conversation-search prune-observer`
 Remove claude-mem observer sessions indexed by earlier versions

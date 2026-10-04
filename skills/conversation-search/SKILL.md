@@ -290,11 +290,19 @@ ai-conversation-search search "query" --limit 50 --json
 
 **Other filter options:**
 - `--repo REPO`: Filter by git repository root (partial match). Matches conversations from the same repo including worktrees and subdirectories.
+- `--project PATH`: Filter by working directory (exact match, `search` and `list`).
+- `--here`: Keep only sessions started at or under the current directory (prefix match, `search` and `list`).
+- `--exclude-project STR` / `--exclude-repo STR`: Drop rows whose working directory / repository root partially matches (repeatable, OR). Typical noise filter: `--exclude-project observer --exclude-project /tmp`. Both are ASCII case-insensitive, no path normalization.
 - `--limit N`: Max results (**default: 20**). Results are capped at this value. When the cap drops matches, a `Note: showing first N results (more matches exist)` line is printed to stderr — do not read a capped list as "nothing else exists". Raise it before concluding a topic is absent.
 - `--content`: Show fuller message content instead of the 200-character snippet. Works for
   human output, `--group-by-session`, and `--json` (which gains `full_content` and
   `full_content_truncated` per row). Capped at `--content-chars` (default 300) in both
   modes — raise it deliberately, since 50 uncapped bodies run to ~175KB of context.
+
+Every `search`/`list --json` row carries `project_exists` (bool, `null` when
+`project_path` is `null`) and `project_basename` (last path segment, for telling
+worktrees apart). Skip rows with `project_exists == false` before presenting
+candidates: `jq '.results | map(select(.project_exists != false))'`.
 
 ### List (for temporal queries)
 ```bash
@@ -304,6 +312,9 @@ ai-conversation-search list --since 2025-11-10 --until today --json
 
 # Filter by repository
 ai-conversation-search list --days 7 --repo myproject --json
+
+# Filter to the current directory and below
+ai-conversation-search list --days 7 --here --json
 
 # Filter by source
 ai-conversation-search list --source codex --json
