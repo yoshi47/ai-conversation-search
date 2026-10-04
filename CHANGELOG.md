@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-10-04
+
 ### Added
 
 - 2文字クエリ（`mo`、`失敗`等）がFTSランキングに載るようになった。Rust側のbigram解析（CJKラン→重なりbigram、ASCII→単語＋prefix）を`unicode61`の別FTS表（`message_content_bigram_fts`）に索引し、既存trigram表と併用する。新規依存・SQLite拡張なし（`rusqlite`の`functions`フィーチャで登録するスカラー関数＋トリガで同期）。混合クエリはtrigram bm25＋bigram絞り込み、全語短語はbigram bm25で順序付けし、二表のスコア加算はしない。1文字・絵文字のみ等のクエリは従来どおりLIKEフォールバック
