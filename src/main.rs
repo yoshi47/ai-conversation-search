@@ -1,3 +1,4 @@
+mod bigram;
 mod cli;
 mod date_utils;
 mod db;
