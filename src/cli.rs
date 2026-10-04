@@ -375,6 +375,14 @@ pub enum Commands {
         /// Message UUID
         uuid: String,
     },
+    /// Show resume target as structured spec without starting it
+    ResumeSpec {
+        /// Session ID (full, unique prefix, or oc:/codex: prefixed)
+        session_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Trigger background indexing (for use as a Claude Code hook)
     Hook,
 }
@@ -711,6 +719,7 @@ pub fn run(cli: Cli) -> Result<()> {
             },
         ),
         Some(Commands::Resume { uuid }) => cmd_resume(&uuid),
+        Some(Commands::ResumeSpec { session_id, json }) => cmd_resume_spec(&session_id, json),
         Some(Commands::Hook) => cmd_hook(),
     }
 }
@@ -1835,22 +1844,301 @@ fn print_tree_nodes(nodes: &[TreeNode], indent: usize, opts: &TreeOpts) {
 }
 
 fn cmd_resume(uuid: &str) -> Result<()> {
-    // Direct query for the message
-    let conn = db::connect(db::DEFAULT_DB_PATH, true)?;
-    let result: std::result::Result<(String, String), _> = conn.query_row(
-        "SELECT session_id, project_path FROM messages WHERE message_uuid = ?",
-        [uuid],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    );
-
-    match result {
-        Ok((session_id, project_path)) => {
+    let target = resolve_resume_target(uuid)?;
+    match target.project_path {
+        Some(project_path) => {
             println!("cd -- {}", shell_quote(&project_path));
-            println!("{} --resume {}", claude_cmd(), shell_quote(&session_id));
+            println!(
+                "{} --resume {}",
+                claude_cmd(),
+                shell_quote(&target.session_id)
+            );
         }
-        Err(_) => {
+        None => {
             eprintln!("Message not found: {}", uuid);
             std::process::exit(1);
+        }
+    }
+
+    Ok(())
+}
+
+/// A session that can be resumed, resolved from either a message UUID or a session ID.
+#[derive(Debug)]
+struct ResumeTarget {
+    source: String,
+    session_id: String,
+    project_path: Option<String>,
+}
+
+/// Escape LIKE wildcards for prefix resolution (same rules as `search::escape_like`).
+fn escape_resume_like(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
+fn fetch_resume_target(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<ResumeTarget>> {
+    let mut stmt = conn.prepare(
+        "SELECT session_id, source, project_path FROM conversations WHERE session_id = ?",
+    )?;
+    let mut rows = stmt.query([session_id])?;
+    if let Some(row) = rows.next()? {
+        let sid: String = row.get(0)?;
+        let source: Option<String> = row.get(1)?;
+        let project_path: Option<String> = row.get(2)?;
+        return Ok(Some(ResumeTarget {
+            source: source.unwrap_or_else(|| "claude_code".to_string()),
+            session_id: sid,
+            project_path,
+        }));
+    }
+    Ok(None)
+}
+
+/// Resolve `input` (message UUID or session ID) to its resume target.
+///
+/// Resolution order mirrors `tree`: exact session win, then unique prefix
+/// (including bare-UUID matching of `oc:`/`codex:` rows), then message UUID
+/// for the legacy `resume` path. Ambiguous prefixes and unsafe inputs are
+/// hard errors; a stored unsafe path is NOT an error here (it becomes
+/// `resume_command: null` + `error` in the spec output instead).
+fn resolve_resume_target_with_conn(
+    conn: &rusqlite::Connection,
+    input: &str,
+) -> Result<ResumeTarget> {
+    if input.is_empty() {
+        return Err(AppError::General("empty session id".to_string()));
+    }
+    if input.chars().any(|c| c.is_control()) {
+        return Err(AppError::General(format!(
+            "refusing session id containing control characters: {}",
+            input
+        )));
+    }
+    if input.starts_with('-') {
+        return Err(AppError::General(format!(
+            "refusing session id starting with '-': {}",
+            input
+        )));
+    }
+
+    if let Some(target) = fetch_resume_target(conn, input)? {
+        return Ok(target);
+    }
+
+    let esc = escape_resume_like(input);
+    let like_bare = format!("{}%", esc);
+    let like_oc = format!("oc:{}%", esc);
+    let like_codex = format!("codex:{}%", esc);
+    let mut stmt = conn.prepare(
+        "SELECT session_id FROM conversations
+         WHERE session_id LIKE ?1 ESCAPE '\\'
+            OR session_id LIKE ?2 ESCAPE '\\'
+            OR session_id LIKE ?3 ESCAPE '\\'
+         ORDER BY session_id
+         LIMIT 11",
+    )?;
+    let candidates: Vec<String> = stmt
+        .query_map(rusqlite::params![like_bare, like_oc, like_codex], |row| {
+            row.get(0)
+        })?
+        .collect::<std::result::Result<Vec<String>, _>>()?;
+    match candidates.len() {
+        0 => {}
+        1 => {
+            let full = candidates.into_iter().next().unwrap();
+            if let Some(target) = fetch_resume_target(conn, &full)? {
+                return Ok(target);
+            }
+            return Err(AppError::General(format!(
+                "Conversation {} not found",
+                input
+            )));
+        }
+        n => {
+            let sample = candidates
+                .iter()
+                .take(3)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::General(format!(
+                "Ambiguous session id '{}' matches {}{} conversations: {}",
+                input,
+                n,
+                if n >= 11 { "+" } else { "" },
+                sample
+            )));
+        }
+    }
+
+    let msg: std::result::Result<(String, Option<String>), _> = conn.query_row(
+        "SELECT session_id, project_path FROM messages WHERE message_uuid = ?",
+        [input],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    );
+    match msg {
+        Ok((session_id, msg_project)) => {
+            if let Some(target) = fetch_resume_target(conn, &session_id)? {
+                return Ok(target);
+            }
+            Ok(ResumeTarget {
+                source: "claude_code".to_string(),
+                session_id,
+                project_path: msg_project,
+            })
+        }
+        Err(_) => Err(AppError::General(format!(
+            "Conversation {} not found",
+            input
+        ))),
+    }
+}
+
+fn resolve_resume_target(input: &str) -> Result<ResumeTarget> {
+    let conn = db::connect(db::DEFAULT_DB_PATH, true)?;
+    resolve_resume_target_with_conn(&conn, input)
+}
+
+/// Split `claude_cmd()` into its real binary.
+///
+/// The command is a shell fragment, not a filename: `env FOO=1 claude` is
+/// legitimate. The leading `env` and its `KEY=value` assignments are skipped.
+/// Returns `None` when no binary remains; callers still emit the original
+/// `resume_command` string for eval compatibility.
+fn parse_resume_binary(cmd: &str) -> Option<String> {
+    let mut parts = cmd.split_whitespace();
+    let first = parts.next()?;
+    if first == "env" {
+        for token in parts {
+            if token.contains('=') {
+                continue;
+            }
+            return Some(token.to_string());
+        }
+        return None;
+    }
+    Some(first.to_string())
+}
+
+#[derive(serde::Serialize)]
+struct ResumeSpecOutput {
+    source: String,
+    session_id: String,
+    project_path: Option<String>,
+    cwd_exists: Option<bool>,
+    binary: Option<String>,
+    args: Vec<String>,
+    resume_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+fn build_resume_spec_with_cmd(target: &ResumeTarget, cmd: &str) -> ResumeSpecOutput {
+    let cwd_exists: Option<bool> = target
+        .project_path
+        .as_ref()
+        .map(|p| std::path::Path::new(p).exists());
+    if target.source == "opencode" || target.source == "codex" {
+        return ResumeSpecOutput {
+            source: target.source.clone(),
+            session_id: target.session_id.clone(),
+            project_path: target.project_path.clone(),
+            cwd_exists,
+            binary: None,
+            args: Vec::new(),
+            resume_command: None,
+            note: Some("resumed with their own tools".to_string()),
+            error: None,
+        };
+    }
+    let binary = parse_resume_binary(cmd);
+    let args = match binary {
+        Some(_) => vec!["--resume".to_string(), target.session_id.clone()],
+        None => Vec::new(),
+    };
+    let error_kind: Option<&str> = match (&target.project_path, &target.session_id) {
+        (None, _) => Some("no_project_path"),
+        (Some(pp), _) if !is_shell_safe_value(pp) => Some("unsafe_path"),
+        (_, sid) if !is_shell_safe_value(sid) || sid.starts_with('-') => Some("unsafe_session_id"),
+        _ => None,
+    };
+    let resume_command = match error_kind {
+        Some(_) => None,
+        None => {
+            let pp = target.project_path.as_deref().unwrap();
+            build_resume_command(pp, &target.session_id, cmd)
+        }
+    };
+    // `build_resume_command` re-checks shell safety; a `None` here means the
+    // stored values failed that check even though the input did not.
+    let error = match (&resume_command, error_kind) {
+        (Some(_), _) => None,
+        (None, Some(kind)) => Some(kind.to_string()),
+        (None, None) => {
+            if !is_shell_safe_value(&target.session_id) || target.session_id.starts_with('-') {
+                Some("unsafe_session_id".to_string())
+            } else {
+                Some("unsafe_path".to_string())
+            }
+        }
+    };
+    ResumeSpecOutput {
+        source: target.source.clone(),
+        session_id: target.session_id.clone(),
+        project_path: target.project_path.clone(),
+        cwd_exists,
+        binary,
+        args,
+        resume_command,
+        note: None,
+        error,
+    }
+}
+
+fn build_resume_spec(target: &ResumeTarget) -> ResumeSpecOutput {
+    build_resume_spec_with_cmd(target, &claude_cmd())
+}
+
+fn cmd_resume_spec(session_id: &str, json_output: bool) -> Result<()> {
+    let target = resolve_resume_target(session_id)?;
+    let spec = build_resume_spec(&target);
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&spec)?);
+        return Ok(());
+    }
+
+    println!("source: {}", spec.source);
+    match (&spec.project_path, spec.cwd_exists) {
+        (Some(pp), Some(true)) => println!("cwd: {} (exists)", pp),
+        (Some(pp), Some(false)) => println!("cwd: {} (missing)", pp),
+        _ => println!("cwd: (unknown)"),
+    }
+    if spec.binary.is_some() && spec.resume_command.is_some() {
+        let binary = spec.binary.as_deref().unwrap();
+        let pp = spec.project_path.as_deref().unwrap_or("");
+        println!("run: {} --resume {} (in {})", binary, spec.session_id, pp);
+    }
+    match spec.resume_command {
+        Some(cmd) => println!("eval: {}", cmd),
+        None => {
+            if spec.source == "opencode" {
+                println!("OpenCode sessions are resumed with their own tools");
+            } else if spec.source == "codex" {
+                println!("Codex sessions are resumed with their own tools");
+            } else if let Some(err) = spec.error {
+                println!("cannot build shell command: {}", err);
+            } else {
+                println!("cannot build shell command");
+            }
         }
     }
 
@@ -2242,6 +2530,180 @@ mod tests {
             "got: {}",
             cmd
         );
+    }
+
+    fn resume_test_conn() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(include_str!("../data/schema.sql"))
+            .unwrap();
+        conn
+    }
+
+    fn insert_conversation(
+        conn: &rusqlite::Connection,
+        session_id: &str,
+        source: &str,
+        project_path: Option<&str>,
+    ) {
+        conn.execute(
+            "INSERT INTO conversations (session_id, source, project_path, message_count) VALUES (?, ?, ?, 1)",
+            rusqlite::params![session_id, source, project_path],
+        )
+        .unwrap();
+    }
+
+    fn insert_message(conn: &rusqlite::Connection, uuid: &str, session_id: &str) {
+        conn.execute(
+            "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content)
+             VALUES (?, ?, 0, '2025-01-15T10:00:00', 'user', '/proj', 'body')",
+            rusqlite::params![uuid, session_id],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_cmd_resume_spec_claude_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().to_str().unwrap().to_string();
+        let target = ResumeTarget {
+            source: "claude_code".to_string(),
+            session_id: "abc-123".to_string(),
+            project_path: Some(proj.clone()),
+        };
+        let spec = build_resume_spec_with_cmd(&target, "claude");
+        assert_eq!(spec.binary.as_deref(), Some("claude"));
+        assert_eq!(
+            spec.args,
+            vec!["--resume".to_string(), "abc-123".to_string()]
+        );
+        assert_eq!(spec.cwd_exists, Some(true));
+        assert!(spec.resume_command.is_some());
+        assert!(spec.error.is_none());
+        assert_eq!(spec.project_path.as_deref(), Some(proj.as_str()));
+    }
+
+    #[test]
+    fn test_cmd_resume_spec_opencode_is_null_with_note() {
+        let target = ResumeTarget {
+            source: "opencode".to_string(),
+            session_id: "oc:ses_abc".to_string(),
+            project_path: Some("/tmp/proj".to_string()),
+        };
+        let spec = build_resume_spec_with_cmd(&target, "claude");
+        assert!(spec.resume_command.is_none());
+        assert!(spec.binary.is_none());
+        assert!(spec.args.is_empty());
+        assert_eq!(spec.note.as_deref(), Some("resumed with their own tools"));
+    }
+
+    #[test]
+    fn test_cmd_resume_spec_codex_is_null_with_note() {
+        let target = ResumeTarget {
+            source: "codex".to_string(),
+            session_id: "codex:019e72d8".to_string(),
+            project_path: Some("/tmp/proj".to_string()),
+        };
+        let spec = build_resume_spec_with_cmd(&target, "claude");
+        assert!(spec.resume_command.is_none());
+        assert!(spec.binary.is_none());
+    }
+
+    #[test]
+    fn test_cmd_resume_spec_unsafe_path_is_null_with_error() {
+        let target = ResumeTarget {
+            source: "claude_code".to_string(),
+            session_id: "abc-123".to_string(),
+            project_path: Some("/tmp/a\nb".to_string()),
+        };
+        let spec = build_resume_spec_with_cmd(&target, "claude");
+        assert!(spec.resume_command.is_none());
+        assert_eq!(spec.error.as_deref(), Some("unsafe_path"));
+        // `cwd_exists` still reports the stat; it must not panic.
+        assert!(spec.cwd_exists.is_some());
+    }
+
+    #[test]
+    fn test_cmd_resume_spec_no_project_path() {
+        let target = ResumeTarget {
+            source: "claude_code".to_string(),
+            session_id: "abc-123".to_string(),
+            project_path: None,
+        };
+        let spec = build_resume_spec_with_cmd(&target, "claude");
+        assert!(spec.resume_command.is_none());
+        assert_eq!(spec.error.as_deref(), Some("no_project_path"));
+        assert_eq!(spec.cwd_exists, None);
+    }
+
+    #[test]
+    fn test_cmd_resume_spec_ambiguous_prefix_reports_matches() {
+        let conn = resume_test_conn();
+        insert_conversation(
+            &conn,
+            "beefcafe-1111-3333-4444-555555555555",
+            "claude_code",
+            Some("/tmp/a"),
+        );
+        insert_conversation(
+            &conn,
+            "beefcafe-2222-3333-4444-555555555555",
+            "claude_code",
+            Some("/tmp/b"),
+        );
+        let err = resolve_resume_target_with_conn(&conn, "beefcafe").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("matches 2"),
+            "expected match count in error, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn test_resolve_resume_target_prefers_exact_and_prefix() {
+        let conn = resume_test_conn();
+        insert_conversation(
+            &conn,
+            "abcdef01-2222-3333-4444-555555555555",
+            "claude_code",
+            Some("/tmp/proj"),
+        );
+        let target = resolve_resume_target_with_conn(&conn, "abcdef01").unwrap();
+        assert_eq!(target.session_id, "abcdef01-2222-3333-4444-555555555555");
+        let full =
+            resolve_resume_target_with_conn(&conn, "abcdef01-2222-3333-4444-555555555555").unwrap();
+        assert_eq!(full.session_id, target.session_id);
+    }
+
+    #[test]
+    fn test_resolve_resume_target_accepts_message_uuid() {
+        let conn = resume_test_conn();
+        insert_conversation(&conn, "sess-1", "claude_code", Some("/tmp/proj"));
+        insert_message(&conn, "msg-uuid-1", "sess-1");
+        let target = resolve_resume_target_with_conn(&conn, "msg-uuid-1").unwrap();
+        assert_eq!(target.session_id, "sess-1");
+        assert_eq!(target.project_path.as_deref(), Some("/tmp/proj"));
+    }
+
+    #[test]
+    fn test_resolve_resume_target_rejects_dash_and_control() {
+        let conn = resume_test_conn();
+        let err = resolve_resume_target_with_conn(&conn, "-x").unwrap_err();
+        assert!(err.to_string().contains('-'));
+        let err = resolve_resume_target_with_conn(&conn, "ab\ncd").unwrap_err();
+        assert!(!err.to_string().is_empty());
+    }
+
+    #[test]
+    fn test_parse_resume_binary_strips_env_assignments() {
+        assert_eq!(
+            parse_resume_binary("env FOO=1 claude").as_deref(),
+            Some("claude")
+        );
+        assert_eq!(parse_resume_binary("claude").as_deref(), Some("claude"));
+        assert_eq!(parse_resume_binary("").as_deref(), None);
+        assert_eq!(parse_resume_binary("env FOO=1").as_deref(), None);
     }
 
     #[test]

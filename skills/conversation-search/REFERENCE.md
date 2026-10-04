@@ -317,6 +317,61 @@ ai-conversation-search tree session-     # unique prefix
 
 ---
 
+### ai-conversation-search resume-spec
+
+Show a resume target as a structured spec without starting it. For
+agent/skill confirmation-before-launch flows: present this, then `resume`
+only after the user confirms. Never auto-start from this output.
+
+```bash
+ai-conversation-search resume-spec SESSION_ID [--json]
+```
+
+**Arguments:**
+- `SESSION_ID`: Session ID from list or search results. Same resolution as
+  `tree`: a unique prefix is accepted, an ambiguous prefix is an error with
+  the number of matches, and bare UUIDs also resolve to `oc:`/`codex:`-prefixed
+  OpenCode and Codex sessions.
+
+**Output (JSON):**
+```json
+{
+  "source": "claude_code",
+  "session_id": "abc-123",
+  "project_path": "/home/user/proj",
+  "cwd_exists": true,
+  "binary": "claude",
+  "args": ["--resume", "abc-123"],
+  "resume_command": "cd -- /home/user/proj && claude --resume abc-123"
+}
+```
+
+- `binary` is the real binary from `CC_CONVERSATION_SEARCH_CMD` (a leading
+  `env` and its `KEY=value` assignments are skipped, e.g.
+  `env FOO=1 claude` → `"claude"`). `args` is `["--resume", session_id]`.
+  When the command cannot be decomposed, `resume_command` still carries the
+  original string for eval compatibility.
+- `cwd_exists` is a single `Path::exists()` stat. It is `null` when
+  `project_path` is `null`.
+- `resume_command` is shell-quoted and safe to `eval`. It is `null` for
+  OpenCode/Codex sessions (with `note: "resumed with their own tools"`),
+  and also `null` when the project path or session id cannot be expressed
+  safely in a shell command — treat `null` as "resume manually", not as an
+  error. The reason is in `error` (`no_project_path`, `unsafe_path`, or
+  `unsafe_session_id`).
+
+**Example:**
+```bash
+# Human-readable (source / cwd / run / eval)
+ai-conversation-search resume-spec abc-123
+
+# Structured (for programmatic use)
+ai-conversation-search resume-spec abc-123 --json
+ai-conversation-search resume-spec oc:ses_abc --json  # resume_command is null
+```
+
+---
+
 ### ai-conversation-search index
 
 JIT index conversations (instant, no AI calls). The skill runs this before every search.

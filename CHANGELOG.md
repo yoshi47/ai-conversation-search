@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- `resume-spec` サブコマンドを追加した。`SESSION_ID` を渡すと起動せずに resume 対象の実行スペック（`source` / `session_id` / `project_path` / `cwd_exists` / `binary` / `args` / `resume_command`）を返す。agent/Skill が確認→起動の2段階フローを取れるようにするためのもの。`resume_command` は既存の shell-safe 規則のまま eval 可能で、`opencode` / `codex` と shell-safe でない行では `null`（理由は `note` / `error`）になる。既存 `resume` / `search` / `list` の出力は不変
 - Codex CLI と OpenCode への導入経路を用意した。Codex は既存の `.claude-plugin/marketplace.json` をそのまま読めるので、`codex plugin marketplace add yoshi47/ai-conversation-search` でプラグインとして入る。OpenCode 向けにはプラグインを用意せず、`skills/index.json`（HTTP カタログ）を追加し、`"skills"` に raw URL を書けば読み込まれるようにした
 - バージョンの一致チェック（`scripts/check-versions.sh`）を CI とリリースに追加した。Cargo.toml・plugin.json・marketplace.json・`skills/index.json`・ラッパーの `ACS_WRAPPER_VERSION` のどれかがずれていると CI が落ち、リリースはタグとずれていても止まる
 

@@ -246,6 +246,15 @@ only — OpenCode (`oc:`) and Codex (`codex:`) ids are not stored in that layout
 `--role`, `--no-tools` and `--flat` narrow the tree; `--content` adds message bodies, which
 are omitted by default so a long session does not serialise to hundreds of KB.
 
+### `ai-conversation-search resume-spec`
+Show a resume target as a structured spec without starting it
+```bash
+ai-conversation-search resume-spec SESSION_ID [--json]
+```
+Present this and wait for user confirmation before resuming. `resume_command`
+is `null` for OpenCode/Codex sessions and when the path cannot be expressed
+safely in a shell command — treat `null` as "resume manually".
+
 ### `ai-conversation-search prune-observer`
 Remove claude-mem observer sessions indexed by earlier versions
 ```bash
