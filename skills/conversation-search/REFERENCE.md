@@ -85,13 +85,23 @@ ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--un
 
 **Search Syntax:**
 - Simple: `authentication bug`
-- Multiple terms: `react hooks useEffect` (implicit OR, ranked by relevance — documents matching more terms rank higher)
+- Multiple terms: `react hooks useEffect` (implicit OR — a document matching any
+  term is a candidate, but documents matching **every** long term rank first,
+  then the rest by relevance. Adding a word narrows the top of the ranking;
+  dropping one widens it. The answer is never empty just because no document
+  contains every word)
 - Phrases: `"exact phrase"` (or use `--exact`)
 - Operators: `auth AND bug`, `react OR vue`
 
-**Ranking:** Results are ordered by bm25 relevance by default. Because bm25 normalizes by
-document length, very long machine-generated transcripts sink automatically. Use
-`--sort=recent` when you want to browse chronologically instead.
+**Ranking:** Results are ordered by bm25 relevance by default, with two
+tie-breaking rules on top. First, full matches win: on a multi-term query,
+messages containing every long term sort above partial matches (within each
+tier, bm25 then recency applies). Second, body wins over title-only: a session
+matching only in its title (`conversation_summary`) sorts below body matches in
+the same tier — titles keep the session findable, never first. Because bm25
+normalizes by document length, very long machine-generated transcripts sink
+automatically. Use `--sort=recent` when you want to browse chronologically
+instead (it disables both rules and orders by timestamp only).
 
 **Short terms (under 3 characters):** the trigram tokenizer needs 3+ characters, so short
 terms cannot be ranked by. They are applied as a **mandatory substring filter** on top of
