@@ -64,7 +64,7 @@ jobs:
           ' CHANGELOG.md > RELEASE_NOTES.md
           echo "----- extracted -----"; cat RELEASE_NOTES.md
           test -s RELEASE_NOTES.md || { echo "::error::CHANGELOG に [$VERSION] の節が無い"; exit 1; }
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
           files: |
