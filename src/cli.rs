@@ -7,7 +7,11 @@ use crate::indexer::codex::CodexIndexer;
 use crate::indexer::count_conversation_files_on_disk;
 use crate::indexer::opencode::{get_opencode_db_path, OpenCodeIndexer};
 use crate::indexer::ConversationIndexer;
-use crate::search::{format_timestamp, ConversationSearch, SearchFilter, SortOrder, TreeNode};
+use crate::search::{
+    format_timestamp, ConversationRow, ConversationSearch, GroupedRow, SearchFilter,
+    SearchResultRow, SortOrder, TreeNode,
+};
+use std::collections::HashMap;
 
 /// Source display labels
 const SOURCE_LABELS: &[(&str, &str)] = &[("opencode", "[OC]"), ("codex", "[CX]")];
@@ -134,9 +138,9 @@ fn inject_full_content(
     }
 }
 
-/// Serialize rows into the envelope, inject `resume_command`, and print.
+/// Serialize rows into the envelope, inject `resume_command` + `project_*`, and print.
 ///
-/// Both injections run on the inner array *before* wrapping. `inject_resume_command`
+/// All injections run on the inner array *before* wrapping. `inject_resume_command`
 /// recurses into arrays and mutates session-bearing objects but does not descend into
 /// object values, so running it on the finished envelope would silently do nothing.
 fn print_json_envelope<T: serde::Serialize>(
@@ -146,6 +150,7 @@ fn print_json_envelope<T: serde::Serialize>(
 ) -> Result<()> {
     let mut results = localize_timestamps(serde_json::to_value(rows)?);
     inject_resume_command(&mut results);
+    inject_project_fields(&mut results);
     if let Some((search, content_chars)) = content {
         inject_full_content(&mut results, search, content_chars);
     }
@@ -281,6 +286,15 @@ pub enum Commands {
         /// Filter by repository root (partial match)
         #[arg(long)]
         repo: Option<String>,
+        /// Exclude sessions whose working directory partially matches (repeatable)
+        #[arg(long)]
+        exclude_project: Vec<String>,
+        /// Exclude sessions whose repository root partially matches (repeatable)
+        #[arg(long)]
+        exclude_repo: Vec<String>,
+        /// Only sessions started at or under the current directory
+        #[arg(long)]
+        here: bool,
         /// Filter by source
         #[arg(long, value_parser = ["claude_code", "opencode", "codex"])]
         source: Option<String>,
@@ -337,9 +351,21 @@ pub enum Commands {
         /// Max results (default: 20)
         #[arg(long, default_value_t = 20)]
         limit: i64,
+        /// Filter by project path (exact match, same as search)
+        #[arg(long)]
+        project: Option<String>,
         /// Filter by repository root
         #[arg(long)]
         repo: Option<String>,
+        /// Exclude sessions whose working directory partially matches (repeatable)
+        #[arg(long)]
+        exclude_project: Vec<String>,
+        /// Exclude sessions whose repository root partially matches (repeatable)
+        #[arg(long)]
+        exclude_repo: Vec<String>,
+        /// Only sessions started at or under the current directory
+        #[arg(long)]
+        here: bool,
         /// Filter by source
         #[arg(long, value_parser = ["claude_code", "opencode", "codex"])]
         source: Option<String>,
@@ -393,7 +419,7 @@ pub enum Commands {
         /// Show the last N messages (default: 30)
         #[arg(long, default_value_t = 30, value_parser = clap::value_parser!(u64).range(1..))]
         messages: u64,
-        /// Output as JSON (tree-compatible envelope plus query/matches/cwd_exists)
+        /// Output as JSON (tree-compatible envelope plus query/matches/project_*)
         #[arg(long)]
         json: bool,
         /// Disable ANSI highlight even on a TTY
@@ -649,6 +675,9 @@ pub fn run(cli: Cli) -> Result<()> {
             date,
             project,
             repo,
+            exclude_project,
+            exclude_repo,
+            here,
             source,
             limit,
             content,
@@ -679,9 +708,15 @@ pub fn run(cli: Cli) -> Result<()> {
                     _ => SortOrder::Relevance,
                 },
             };
+            let post = PostFilter {
+                exclude_project,
+                exclude_repo,
+                here: here.then(PostFilter::current_dir).flatten(),
+            };
             cmd_search(
                 &effective_query,
                 &filter,
+                &post,
                 content,
                 content_chars,
                 verbose,
@@ -701,7 +736,11 @@ pub fn run(cli: Cli) -> Result<()> {
             until,
             date,
             limit,
+            project,
             repo,
+            exclude_project,
+            exclude_repo,
+            here,
             source,
             json,
         }) => {
@@ -711,13 +750,18 @@ pub fn run(cli: Cli) -> Result<()> {
                 until: until.as_deref(),
                 date: date.as_deref(),
                 limit,
-                project_path: None,
+                project_path: project.as_deref(),
                 repo: repo.as_deref(),
                 source: source.as_deref(),
                 // `list` has no query, so there is no relevance to rank by.
                 sort: SortOrder::Recent,
             };
-            cmd_list(&filter, json)
+            let post = PostFilter {
+                exclude_project,
+                exclude_repo,
+                here: here.then(PostFilter::current_dir).flatten(),
+            };
+            cmd_list(&filter, &post, json)
         }
         Some(Commands::Tree {
             session_id,
@@ -1183,6 +1227,198 @@ fn inject_resume_command(val: &mut serde_json::Value) {
     }
 }
 
+/// Partial-match exclusion against an optional path column.
+///
+/// Empty patterns never match; `None` is never excluded. ASCII
+/// case-insensitive, mirroring SQLite `LIKE` for the paths this filters
+/// (`project_path`, `repo_root`). No normalization (no trailing-slash
+/// stripping, no `~` expansion) — patterns match the stored string as-is.
+fn matches_exclude(value: Option<&str>, excludes: &[String]) -> bool {
+    let Some(v) = value else {
+        return false;
+    };
+    let lower = v.to_ascii_lowercase();
+    excludes
+        .iter()
+        .any(|e| !e.is_empty() && lower.contains(&e.to_ascii_lowercase()))
+}
+
+/// Partial-match exclusion on the session's working directory (`project_path`).
+/// Owned by the `list-enrich` plan; `last` reuses it.
+pub fn matches_exclude_project(project_path: Option<&str>, excludes: &[String]) -> bool {
+    matches_exclude(project_path, excludes)
+}
+
+/// Partial-match exclusion on the git-common repository root (`repo_root`).
+/// Owned by the `list-enrich` plan; `last` reuses it.
+pub fn matches_exclude_repo(repo_root: Option<&str>, excludes: &[String]) -> bool {
+    matches_exclude(repo_root, excludes)
+}
+
+/// Last path segment for display (`pick` shows this column already).
+///
+/// `Path::file_name`, not a `/` split: trailing slashes resolve to the real
+/// segment and multibyte boundaries cannot panic. `None` when there is no
+/// path, no segment (`..`, empty), or non-UTF8 content.
+pub fn project_basename(project_path: Option<&str>) -> Option<String> {
+    project_path.and_then(|p| {
+        std::path::Path::new(p)
+            .file_name()?
+            .to_str()
+            .map(String::from)
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// `--here` predicate: the session started at or under the invoking shell's
+/// directory. Separator-boundary prefix, so cwd `/a/b` keeps `/a/b/c` but
+/// not the sibling `/a/bc`. `None` (unknown `project_path`) never matches.
+pub fn matches_here(project_path: Option<&str>, cwd: &str) -> bool {
+    let Some(pp) = project_path else {
+        return false;
+    };
+    let cwd = cwd.trim_end_matches('/');
+    if cwd.is_empty() {
+        // Invoker is at the filesystem root: every absolute path is under it.
+        return pp.starts_with('/');
+    }
+    pp == cwd || pp.starts_with(&format!("{}/", cwd))
+}
+
+/// Rust-side narrowing shared by `search`/`list`: partial-match excludes plus
+/// `--here`. SQL is untouched (`SearchFilter` carries the exact-match
+/// `--project`/`--repo`/`--source`/date scope); this runs per fetch round.
+#[derive(Default)]
+struct PostFilter {
+    exclude_project: Vec<String>,
+    exclude_repo: Vec<String>,
+    /// Canonicalized invoker cwd (`--here`), or `None` when off.
+    here: Option<String>,
+}
+
+impl PostFilter {
+    fn active(&self) -> bool {
+        !self.exclude_project.is_empty() || !self.exclude_repo.is_empty() || self.here.is_some()
+    }
+
+    fn current_dir() -> Option<String> {
+        std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().trim_end_matches('/').to_string())
+    }
+}
+
+/// Whether one row survives the post-filter. `repo_root` comes from
+/// `ConversationRow` on the `list` path and from
+/// `repo_roots_for_sessions` on the `search` paths.
+fn row_kept(project_path: Option<&str>, repo_root: Option<&str>, post: &PostFilter) -> bool {
+    if matches_exclude_project(project_path, &post.exclude_project) {
+        return false;
+    }
+    if matches_exclude_repo(repo_root, &post.exclude_repo) {
+        return false;
+    }
+    if let Some(cwd) = post.here.as_deref() {
+        if !matches_here(project_path, cwd) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Re-run the query with a growing `LIMIT` until `requested` rows survive the
+/// post-filter or the corpus is exhausted.
+///
+/// Ordering is stable across rounds (each round is a longer prefix of the
+/// same order), so filtering the longest prefix is equivalent to filtering
+/// everything and taking the head. `truncated` errs toward `true` while more
+/// rows may exist, and is exact once the tail is reached. The fetch cap keeps
+/// an exclude-everything pattern from scanning the whole index.
+///
+/// `fetch` returns its rows, whether more rows exist beyond them, and a
+/// per-round context for `keep` (the `search` paths resolve `repo_root` per
+/// round; `list` rows already carry it, so it passes `()`).
+fn fetch_filling<T: Clone, C>(
+    requested: i64,
+    mut fetch: impl FnMut(i64) -> Result<(Vec<T>, bool, C)>,
+    keep: impl Fn(&T, &C) -> bool,
+) -> Result<(Vec<T>, bool)> {
+    /// Hard stop for the growth loop below.
+    const MAX_FETCH: i64 = 1000;
+    /// At most this many queries per command. One FTS round over a large
+    /// index costs seconds, so an unbounded doubling loop turns a broad query
+    /// with a narrow filter (`search "the" --here`) into minutes. Three rounds
+    /// fill the common cases; beyond that return partial + `truncated: true`.
+    const MAX_ROUNDS: u32 = 3;
+    if requested <= 0 {
+        let (rows, truncated, ctx) = fetch(1)?;
+        let kept: Vec<T> = rows.iter().filter(|r| keep(r, &ctx)).cloned().collect();
+        let excluded_any = kept.len() != rows.len();
+        return Ok((Vec::new(), truncated || excluded_any));
+    }
+    let mut fetch_limit = requested.saturating_add(1).max(1);
+    let mut rounds: u32 = 0;
+    loop {
+        rounds += 1;
+        let (rows, underlying_truncated, ctx) = fetch(fetch_limit)?;
+        let kept: Vec<T> = rows.iter().filter(|r| keep(r, &ctx)).cloned().collect();
+        if kept.len() as i64 > requested {
+            let mut out = kept;
+            out.truncate(requested as usize);
+            return Ok((out, true));
+        }
+        if !underlying_truncated || fetch_limit >= MAX_FETCH || rounds >= MAX_ROUNDS {
+            // Exhausted (exact), or capped (conservative: more may exist).
+            let truncated = underlying_truncated;
+            return Ok((kept, truncated));
+        }
+        fetch_limit = (fetch_limit.saturating_mul(4).saturating_add(1)).min(MAX_FETCH);
+    }
+}
+
+/// Suffix for human output when the session's directory is gone.
+fn missing_marker(project_path: Option<&str>) -> &'static str {
+    match project_path {
+        Some(p) if !std::path::Path::new(p).exists() => " (missing)",
+        _ => "",
+    }
+}
+
+fn inject_project_fields(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Array(arr) => {
+            for item in arr.iter_mut() {
+                inject_project_fields(item);
+            }
+        }
+        // Same session-bearing-object rule as `inject_resume_command`.
+        serde_json::Value::Object(map) if map.contains_key("session_id") => {
+            let project_path = map
+                .get("project_path")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let exists = project_path
+                .as_deref()
+                .map(|p| std::path::Path::new(p).exists());
+            map.insert(
+                "project_exists".to_string(),
+                match exists {
+                    Some(b) => serde_json::Value::Bool(b),
+                    None => serde_json::Value::Null,
+                },
+            );
+            map.insert(
+                "project_basename".to_string(),
+                match project_basename(project_path.as_deref()) {
+                    Some(b) => serde_json::Value::String(b),
+                    None => serde_json::Value::Null,
+                },
+            );
+        }
+        _ => {}
+    }
+}
+
 /// Render a stored summary, or a placeholder when there is nothing to show.
 ///
 /// Whitespace-only counts as nothing: it would otherwise print as a blank line, which
@@ -1216,6 +1452,7 @@ fn truncate_chars(s: &str, max: usize) -> (String, bool) {
 fn cmd_search(
     query: &str,
     filter: &SearchFilter<'_>,
+    post: &PostFilter,
     show_content: bool,
     content_chars: usize,
     verbose: bool,
@@ -1230,6 +1467,7 @@ fn cmd_search(
             &mut search,
             query,
             filter,
+            post,
             show_content,
             content_chars,
             verbose,
@@ -1237,19 +1475,46 @@ fn cmd_search(
         );
     }
 
-    let search_result = search.search_conversations(query, filter)?;
-    let results = search_result.rows;
-    let stats = &search_result.stats;
+    // Rust-side excludes/--here narrow each fetched prefix; refetch with a
+    // growing LIMIT so `--limit N` still returns N surviving rows.
+    let (results, truncated, stats) = if post.active() {
+        let mut last_stats = None;
+        let (rows, trunc) = fetch_filling(
+            filter.limit,
+            |fetch_limit| {
+                let f = SearchFilter {
+                    limit: fetch_limit,
+                    ..*filter
+                };
+                let r = search.search_conversations(query, &f)?;
+                let ids: Vec<String> = r.rows.iter().map(|row| row.session_id.clone()).collect();
+                let roots = search.repo_roots_for_sessions(&ids)?;
+                let truncated = r.stats.truncated;
+                last_stats = Some(r.stats);
+                Ok((r.rows, truncated, roots))
+            },
+            |row: &SearchResultRow, roots: &HashMap<String, Option<String>>| {
+                let repo = roots.get(&row.session_id).and_then(|o| o.as_deref());
+                row_kept(row.project_path.as_deref(), repo, post)
+            },
+        )?;
+        let stats = last_stats.expect("fetch_filling queries at least once");
+        (rows, trunc, stats)
+    } else {
+        let r = search.search_conversations(query, filter)?;
+        let truncated = r.stats.truncated;
+        (r.rows, truncated, r.stats)
+    };
 
     if json_output {
         print_json_envelope(
             &results,
-            stats.truncated,
+            truncated,
             show_content.then_some((&search, content_chars)),
         )?;
         // Also on stderr: a human piping stdout into jq never sees the envelope's
         // `truncated`, so the line still has a reader.
-        print_truncation_notice(stats.truncated, results.len(), "results");
+        print_truncation_notice(truncated, results.len(), "results");
         if verbose {
             eprintln!(
                 "Scanned {} sessions ({} messages), {} matched",
@@ -1264,7 +1529,7 @@ fn cmd_search(
         println!("No results found for: {}", query);
         // Before the diagnostics, because an empty list produced by `--limit 0` still has
         // matches behind it and "No results found" reads as their absence.
-        print_truncation_notice(stats.truncated, results.len(), "results");
+        print_truncation_notice(truncated, results.len(), "results");
         eprintln!(
             "Scanned {} sessions ({} messages), 0 matched",
             stats.sessions_in_scope, stats.total_indexed_messages
@@ -1281,7 +1546,7 @@ fn cmd_search(
         print_unindexed_warning(&search);
     }
 
-    print_truncation_notice(stats.truncated, results.len(), "results");
+    print_truncation_notice(truncated, results.len(), "results");
 
     println!(
         "\u{1f50d} Found {} matches for '{}':\n",
@@ -1306,7 +1571,11 @@ fn cmd_search(
 
         println!("{} {} {}", icon, label, summary);
         println!("   Session: {}", session_id);
-        println!("   Project: {}", project_dir);
+        println!(
+            "   Project: {}{}",
+            project_dir,
+            missing_marker(result.project_path.as_deref())
+        );
         println!("   Time: {}", timestamp);
         println!("   Message: {}", message_uuid);
 
@@ -1344,21 +1613,54 @@ fn cmd_search_grouped(
     search: &mut ConversationSearch,
     query: &str,
     filter: &SearchFilter<'_>,
+    post: &PostFilter,
     show_content: bool,
     content_chars: usize,
     verbose: bool,
     json_output: bool,
 ) -> Result<()> {
-    let result = search.search_grouped_by_session(query, filter)?;
-    let stats = &result.stats;
+    let (rows, truncated, stats) = if post.active() {
+        let mut last_stats = None;
+        let (rows, trunc) = fetch_filling(
+            filter.limit,
+            |fetch_limit| {
+                let f = SearchFilter {
+                    limit: fetch_limit,
+                    ..*filter
+                };
+                let r = search.search_grouped_by_session(query, &f)?;
+                let ids: Vec<String> = r
+                    .rows
+                    .iter()
+                    .map(|g| g.representative.session_id.clone())
+                    .collect();
+                let roots = search.repo_roots_for_sessions(&ids)?;
+                let truncated = r.stats.truncated;
+                last_stats = Some(r.stats);
+                Ok((r.rows, truncated, roots))
+            },
+            |grouped: &GroupedRow, roots: &HashMap<String, Option<String>>| {
+                let r = &grouped.representative;
+                let repo = roots.get(&r.session_id).and_then(|o| o.as_deref());
+                row_kept(r.project_path.as_deref(), repo, post)
+            },
+        )?;
+        let stats = last_stats.expect("fetch_filling queries at least once");
+        (rows, trunc, stats)
+    } else {
+        let r = search.search_grouped_by_session(query, filter)?;
+        let truncated = r.stats.truncated;
+        (r.rows, truncated, r.stats)
+    };
+    let result_rows = rows;
 
     if json_output {
         print_json_envelope(
-            &result.rows,
-            stats.truncated,
+            &result_rows,
+            truncated,
             show_content.then_some((&*search, content_chars)),
         )?;
-        print_truncation_notice(stats.truncated, result.rows.len(), "sessions");
+        print_truncation_notice(truncated, result_rows.len(), "sessions");
         if verbose {
             eprintln!(
                 "Scanned {} sessions ({} messages), {} matched",
@@ -1369,9 +1671,9 @@ fn cmd_search_grouped(
         return Ok(());
     }
 
-    if result.rows.is_empty() {
+    if result_rows.is_empty() {
         println!("No results found for: {}", query);
-        print_truncation_notice(stats.truncated, result.rows.len(), "sessions");
+        print_truncation_notice(truncated, result_rows.len(), "sessions");
         eprintln!(
             "Scanned {} sessions ({} messages), 0 matched",
             stats.sessions_in_scope, stats.total_indexed_messages
@@ -1388,15 +1690,15 @@ fn cmd_search_grouped(
         print_unindexed_warning(search);
     }
 
-    print_truncation_notice(stats.truncated, result.rows.len(), "sessions");
+    print_truncation_notice(truncated, result_rows.len(), "sessions");
 
     println!(
         "\u{1f50d} Found {} sessions matching '{}':\n",
-        result.rows.len(),
+        result_rows.len(),
         query
     );
 
-    for grouped in &result.rows {
+    for grouped in &result_rows {
         let r = &grouped.representative;
         let source_str = r.source.as_deref().unwrap_or("claude_code");
         let label = source_label(source_str);
@@ -1407,7 +1709,11 @@ fn cmd_search_grouped(
 
         println!("{} {} ({} matches)", label, summary, grouped.match_count);
         println!("   Session: {}", session_id);
-        println!("   Project: {}", project_dir);
+        println!(
+            "   Project: {}{}",
+            project_dir,
+            missing_marker(r.project_path.as_deref())
+        );
         println!("   Time: {}", timestamp);
 
         if show_content {
@@ -1484,16 +1790,40 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool) ->
     Ok(())
 }
 
-fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
+fn cmd_list(filter: &SearchFilter<'_>, post: &PostFilter, json_output: bool) -> Result<()> {
     maybe_background_index();
     let search = ConversationSearch::new(db::DEFAULT_DB_PATH)?;
-    let result = search.list_recent_conversations(filter)?;
-    let convs = &result.rows;
+    // Same refill contract as `cmd_search`: Rust-side excludes/--here narrow
+    // each fetched prefix, so grow LIMIT until `--limit N` is filled.
+    // `ConversationRow` already carries `repo_root`, so no extra lookup.
+    let (convs, truncated) = if post.active() {
+        fetch_filling(
+            filter.limit,
+            |fetch_limit| {
+                let f = SearchFilter {
+                    limit: fetch_limit,
+                    ..*filter
+                };
+                let r = search.list_recent_conversations(&f)?;
+                Ok((r.rows, r.truncated, ()))
+            },
+            |conv: &ConversationRow, _: &()| {
+                row_kept(
+                    conv.project_path.as_deref(),
+                    conv.repo_root.as_deref(),
+                    post,
+                )
+            },
+        )?
+    } else {
+        let r = search.list_recent_conversations(filter)?;
+        (r.rows, r.truncated)
+    };
 
     if json_output {
         // `list` rows are conversations, not messages -- there is no body to attach.
-        print_json_envelope(convs, result.truncated, None)?;
-        print_truncation_notice(result.truncated, convs.len(), "conversations");
+        print_json_envelope(&convs, truncated, None)?;
+        print_truncation_notice(truncated, convs.len(), "conversations");
         return Ok(());
     }
 
@@ -1501,16 +1831,16 @@ fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
         println!("No conversations found");
         // Before the reader concludes there is nothing here: `--limit 0` produces an empty
         // list that still has conversations behind it.
-        print_truncation_notice(result.truncated, convs.len(), "conversations");
+        print_truncation_notice(truncated, convs.len(), "conversations");
         return Ok(());
     }
 
-    print_truncation_notice(result.truncated, convs.len(), "conversations");
+    print_truncation_notice(truncated, convs.len(), "conversations");
 
     let display_days = filter.days_back.unwrap_or(7);
     println!("Recent conversations (last {} days):\n", display_days);
 
-    for conv in convs {
+    for conv in &convs {
         let last_at = conv.last_message_at.as_deref().unwrap_or("");
         let timestamp = format_timestamp(last_at, true, false);
         let source_str = conv.source.as_deref().unwrap_or("claude_code");
@@ -1521,7 +1851,11 @@ fn cmd_list(filter: &SearchFilter<'_>, json_output: bool) -> Result<()> {
 
         println!("{} [{}] {}", label, timestamp, summary);
         println!("  {} messages", msg_count);
-        println!("  {}", project);
+        println!(
+            "  {}{}",
+            project,
+            missing_marker(conv.project_path.as_deref())
+        );
         println!("  Session: {}", conv.session_id);
         println!();
     }
@@ -2066,7 +2400,8 @@ struct ResumeSpecOutput {
     source: String,
     session_id: String,
     project_path: Option<String>,
-    cwd_exists: Option<bool>,
+    project_exists: Option<bool>,
+    project_basename: Option<String>,
     binary: Option<String>,
     args: Vec<String>,
     resume_command: Option<String>,
@@ -2077,16 +2412,18 @@ struct ResumeSpecOutput {
 }
 
 fn build_resume_spec_with_cmd(target: &ResumeTarget, cmd: &str) -> ResumeSpecOutput {
-    let cwd_exists: Option<bool> = target
+    let project_exists: Option<bool> = target
         .project_path
         .as_ref()
         .map(|p| std::path::Path::new(p).exists());
+    let project_basename = project_basename(target.project_path.as_deref());
     if target.source == "opencode" || target.source == "codex" {
         return ResumeSpecOutput {
             source: target.source.clone(),
             session_id: target.session_id.clone(),
             project_path: target.project_path.clone(),
-            cwd_exists,
+            project_exists,
+            project_basename,
             binary: None,
             args: Vec::new(),
             resume_command: None,
@@ -2129,7 +2466,8 @@ fn build_resume_spec_with_cmd(target: &ResumeTarget, cmd: &str) -> ResumeSpecOut
         source: target.source.clone(),
         session_id: target.session_id.clone(),
         project_path: target.project_path.clone(),
-        cwd_exists,
+        project_exists,
+        project_basename,
         binary,
         args,
         resume_command,
@@ -2152,10 +2490,10 @@ fn cmd_resume_spec(session_id: &str, json_output: bool) -> Result<()> {
     }
 
     println!("source: {}", spec.source);
-    match (&spec.project_path, spec.cwd_exists) {
-        (Some(pp), Some(true)) => println!("cwd: {} (exists)", pp),
-        (Some(pp), Some(false)) => println!("cwd: {} (missing)", pp),
-        _ => println!("cwd: (unknown)"),
+    match (&spec.project_path, spec.project_exists) {
+        (Some(pp), Some(true)) => println!("project: {} (exists)", pp),
+        (Some(pp), Some(false)) => println!("project: {} (missing)", pp),
+        _ => println!("project: (unknown)"),
     }
     if spec.binary.is_some() && spec.resume_command.is_some() {
         let binary = spec.binary.as_deref().unwrap();
@@ -2321,7 +2659,8 @@ fn cmd_preview(
                             },
                         );
                         map.insert("matches".to_string(), serde_json::Value::Array(Vec::new()));
-                        map.insert("cwd_exists".to_string(), serde_json::Value::Null);
+                        map.insert("project_exists".to_string(), serde_json::Value::Null);
+                        map.insert("project_basename".to_string(), serde_json::Value::Null);
                     }
                     println!("{}", serde_json::to_string_pretty(&localized)?);
                 }
@@ -2333,7 +2672,7 @@ fn cmd_preview(
             return Err(e);
         }
     };
-    let cwd_exists: Option<bool> = target
+    let project_exists: Option<bool> = target
         .project_path
         .as_ref()
         .map(|p| std::path::Path::new(p).exists());
@@ -2408,9 +2747,16 @@ fn cmd_preview(
                 ),
             );
             map.insert(
-                "cwd_exists".to_string(),
-                match cwd_exists {
+                "project_exists".to_string(),
+                match project_exists {
                     Some(b) => serde_json::Value::Bool(b),
+                    None => serde_json::Value::Null,
+                },
+            );
+            map.insert(
+                "project_basename".to_string(),
+                match project_basename(target.project_path.as_deref()) {
+                    Some(b) => serde_json::Value::String(b),
                     None => serde_json::Value::Null,
                 },
             );
@@ -2431,7 +2777,11 @@ fn cmd_preview(
             } else {
                 (total.saturating_sub(returned) + 1, total)
             };
-            println!("Project: {}", project);
+            println!(
+                "Project: {}{}",
+                project,
+                missing_marker(target.project_path.as_deref())
+            );
             println!("Messages: {}-{}/{} (returned/total)", start, end, total);
             let range = if returned == 0 {
                 "(empty)".to_string()
@@ -2970,7 +3320,7 @@ mod tests {
             spec.args,
             vec!["--resume".to_string(), "abc-123".to_string()]
         );
-        assert_eq!(spec.cwd_exists, Some(true));
+        assert_eq!(spec.project_exists, Some(true));
         assert!(spec.resume_command.is_some());
         assert!(spec.error.is_none());
         assert_eq!(spec.project_path.as_deref(), Some(proj.as_str()));
@@ -3012,8 +3362,8 @@ mod tests {
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert!(spec.resume_command.is_none());
         assert_eq!(spec.error.as_deref(), Some("unsafe_path"));
-        // `cwd_exists` still reports the stat; it must not panic.
-        assert!(spec.cwd_exists.is_some());
+        // `project_exists` still reports the stat; it must not panic.
+        assert!(spec.project_exists.is_some());
     }
 
     #[test]
@@ -3026,7 +3376,165 @@ mod tests {
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert!(spec.resume_command.is_none());
         assert_eq!(spec.error.as_deref(), Some("no_project_path"));
-        assert_eq!(spec.cwd_exists, None);
+        assert_eq!(spec.project_exists, None);
+    }
+
+    #[test]
+    fn test_matches_exclude_project_partial_or_and_empty() {
+        assert!(matches_exclude_project(
+            Some("/a/.claude-mem/observer-sessions/x"),
+            &["observer".to_string()]
+        ));
+        // Multiple patterns are OR.
+        assert!(matches_exclude_project(
+            Some("/private/tmp/scratch"),
+            &["observer".to_string(), "tmp".to_string(),]
+        ));
+        // Unrelated rows survive.
+        assert!(!matches_exclude_project(
+            Some("/home/user/proj"),
+            &["observer".to_string(), "tmp".to_string()],
+        ));
+        // Empty list never excludes; None is never excluded.
+        assert!(!matches_exclude_project(Some("/tmp/x"), &[]));
+        assert!(!matches_exclude_project(None, &["tmp".to_string()]));
+        // ASCII case-insensitive, mirroring LIKE.
+        assert!(matches_exclude_project(
+            Some("/TMP/ObServer/x"),
+            &["observer".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_matches_exclude_repo_hits_repo_root_only() {
+        assert!(matches_exclude_repo(
+            Some("/repos/meetsone"),
+            &["meetsone".to_string()]
+        ));
+        assert!(!matches_exclude_repo(
+            Some("/repos/meetsone"),
+            &["other".to_string()]
+        ));
+        assert!(!matches_exclude_repo(None, &["meetsone".to_string()]));
+        assert!(!matches_exclude_repo(Some("/repos/meetsone"), &[]));
+    }
+
+    #[test]
+    fn test_project_basename_last_segment() {
+        assert_eq!(
+            project_basename(Some("/a/b/meetsone")),
+            Some("meetsone".to_string())
+        );
+        // Trailing slash still yields the real segment.
+        assert_eq!(
+            project_basename(Some("/a/b/meetsone/")),
+            Some("meetsone".to_string())
+        );
+        // Multibyte boundaries cannot panic.
+        assert_eq!(
+            project_basename(Some("/tmp/日本語プロジェクト")),
+            Some("日本語プロジェクト".to_string())
+        );
+        assert_eq!(project_basename(Some("")), None);
+        assert_eq!(project_basename(None), None);
+    }
+
+    #[test]
+    fn test_matches_here_prefix_with_boundary() {
+        assert!(matches_here(Some("/a/b"), "/a/b"));
+        assert!(matches_here(Some("/a/b/c"), "/a/b"));
+        // Sibling with a shared string prefix is not under cwd.
+        assert!(!matches_here(Some("/a/bc"), "/a/b"));
+        assert!(!matches_here(Some("/other"), "/a/b"));
+        assert!(!matches_here(None, "/a/b"));
+    }
+
+    #[test]
+    fn test_fetch_filling_refills_and_recomputes_truncated() {
+        let corpus: Vec<i64> = (1..=10).collect();
+        // Keep odd numbers only; requested 3 fills from a longer prefix.
+        let (rows, truncated) = fetch_filling(
+            3,
+            |fetch_limit| {
+                let take = (fetch_limit as usize).min(corpus.len());
+                let truncated = corpus.len() > take;
+                Ok((corpus[..take].to_vec(), truncated, ()))
+            },
+            |n: &i64, _: &()| n % 2 == 1,
+        )
+        .unwrap();
+        assert_eq!(rows, vec![1, 3, 5]);
+        assert!(truncated);
+    }
+
+    #[test]
+    fn test_fetch_filling_exhausted_is_exact() {
+        let corpus: Vec<i64> = (1..=5).collect();
+        // Requesting more than survive drains the corpus: exact, not truncated.
+        let (rows, truncated) = fetch_filling(
+            100,
+            |fetch_limit| {
+                let take = (fetch_limit as usize).min(corpus.len());
+                let truncated = corpus.len() > take;
+                Ok((corpus[..take].to_vec(), truncated, ()))
+            },
+            |n: &i64, _: &()| n % 2 == 1,
+        )
+        .unwrap();
+        assert_eq!(rows, vec![1, 3, 5]);
+        assert!(!truncated);
+    }
+
+    #[test]
+    fn test_fetch_filling_round_cap_returns_partial_truncated() {
+        // Nothing survives, corpus never exhausts: rounds stop the loop.
+        let corpus: Vec<i64> = (1..=10_000).collect();
+        let mut calls = 0;
+        let (rows, truncated) = fetch_filling(
+            3,
+            |fetch_limit| {
+                calls += 1;
+                let take = (fetch_limit as usize).min(corpus.len());
+                let truncated = corpus.len() > take;
+                Ok((corpus[..take].to_vec(), truncated, ()))
+            },
+            |_: &i64, _: &()| false,
+        )
+        .unwrap();
+        assert!(rows.is_empty());
+        assert!(truncated);
+        assert!(calls <= 3, "bounded queries, got {}", calls);
+    }
+
+    #[test]
+    fn test_inject_project_fields_null_path_is_null() {
+        let mut v = serde_json::json!([
+            {"session_id": "s1", "project_path": "/definitely/not/here-12345"},
+            {"session_id": "s2", "project_path": None::<String>},
+            {"no_session": true},
+        ]);
+        inject_project_fields(&mut v);
+        let rows = v.as_array().unwrap();
+        assert_eq!(rows[0]["project_exists"], serde_json::Value::Bool(false));
+        assert_eq!(
+            rows[0]["project_basename"],
+            serde_json::Value::String("here-12345".to_string())
+        );
+        assert!(rows[1]["project_exists"].is_null());
+        assert!(rows[1]["project_basename"].is_null());
+        // Objects without session_id are untouched.
+        assert!(rows[2].get("project_exists").is_none());
+    }
+
+    #[test]
+    fn test_resume_spec_carries_project_basename() {
+        let target = ResumeTarget {
+            source: "claude_code".to_string(),
+            session_id: "abc-123".to_string(),
+            project_path: Some("/home/user/myproj".to_string()),
+        };
+        let spec = build_resume_spec_with_cmd(&target, "claude");
+        assert_eq!(spec.project_basename.as_deref(), Some("myproj"));
     }
 
     #[test]

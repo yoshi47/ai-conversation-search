@@ -1859,6 +1859,42 @@ impl ConversationSearch {
         Ok(ListResult { rows, truncated })
     }
 
+    /// `repo_root` per session, in one query.
+    ///
+    /// Search rows (`SearchResultRow`) carry `project_path` but no `repo_root`,
+    /// and the Rust-side `--exclude-repo` post-filter needs it. Rather than
+    /// widening five SELECTs (and the JSON contract) for a filter-time value,
+    /// look it up here per fetch round: one `IN` query, not N+1.
+    pub fn repo_roots_for_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> Result<HashMap<String, Option<String>>> {
+        let mut map = HashMap::new();
+        if session_ids.is_empty() {
+            return Ok(map);
+        }
+        let placeholders = session_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT session_id, repo_root FROM conversations WHERE session_id IN ({})",
+            placeholders
+        );
+        let owned: Vec<String> = session_ids.to_vec();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
+        for (sid, root) in self.query_rows(&sql, &param_refs, |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })? {
+            map.insert(sid, root);
+        }
+        Ok(map)
+    }
+
     pub fn get_full_message_content(&self, message_uuid: &str) -> Option<String> {
         self.conn
             .query_row(

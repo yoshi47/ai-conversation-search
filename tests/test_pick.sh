@@ -331,7 +331,7 @@ else
     pass "preview drops tool nodes"
 fi
 
-# JSON shape is the `tree --json` envelope plus query/matches/cwd_exists.
+# JSON shape is the `tree --json` envelope plus query/matches/project_exists.
 PREVIEW_JSON=$("$BINARY" preview "$FIRST_SESSION" --messages 12 --content-chars 150 --json 2>/dev/null || echo "")
 if [ -n "$(printf '%s' "$PREVIEW_JSON" | jq -r '.tree // empty' 2>/dev/null)" ]; then
     pass "preview --json carries tree envelope"

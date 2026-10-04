@@ -50,7 +50,7 @@ ai-conversation-search init --no-extract
 Search conversations using full-text search on smart-extracted content.
 
 ```bash
-ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--source SOURCE] [--limit LIMIT] [--sort SORT] [--content] [--content-chars N] [--group-by-session] [-v] [--json]
+ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--exclude-project STR]... [--exclude-repo STR]... [--here] [--source SOURCE] [--limit LIMIT] [--sort SORT] [--content] [--content-chars N] [--group-by-session] [-v] [--json]
 ```
 
 **Arguments:**
@@ -64,6 +64,9 @@ ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--un
 - `--date DATE`: Specific date (YYYY-MM-DD, yesterday, today)
 - `--project PROJECT`: Filter by project path
 - `--repo REPO`: Filter by repository root (partial match)
+- `--exclude-project STR`: Drop rows whose working directory partially matches. Repeatable (OR). ASCII case-insensitive, no path normalization
+- `--exclude-repo STR`: Drop rows whose repository root partially matches. Repeatable (OR)
+- `--here`: Keep only sessions started at or under the current directory (separator-boundary prefix match)
 - `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
 - `--limit LIMIT`: Max results (default: 20). When the cap drops matches, `Note: showing first N results (more matches exist)` is printed to stderr regardless of `-v`
 - `--sort SORT`: Result order — `relevance` (bm25, default) or `recent` (newest first)
@@ -209,7 +212,7 @@ ai-conversation-search context abc-123-def --content --json
 List recent conversations.
 
 ```bash
-ai-conversation-search list [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--limit LIMIT] [--repo REPO] [--source SOURCE] [--json]
+ai-conversation-search list [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--limit LIMIT] [--project PROJECT] [--repo REPO] [--exclude-project STR]... [--exclude-repo STR]... [--here] [--source SOURCE] [--json]
 ```
 
 **Options:**
@@ -217,8 +220,11 @@ ai-conversation-search list [--days DAYS] [--since DATE] [--until DATE] [--date 
 - `--since DATE`: Start date (YYYY-MM-DD, yesterday, today)
 - `--until DATE`: End date (YYYY-MM-DD, yesterday, today)
 - `--date DATE`: Specific date (YYYY-MM-DD, yesterday, today)
-- `--limit LIMIT`: Max conversations to show (default: 20)
+- `--limit LIMIT`: Max conversations to show (default: 20). When `--exclude-project`/`--exclude-repo`/`--here` drops rows, the query is re-run with a growing limit so up to LIMIT surviving rows are still returned; `.truncated` is recomputed on the survivors
+- `--project PROJECT`: Filter by project path (exact match, same as `search`)
 - `--repo REPO`: Filter by repository root (partial match)
+- `--exclude-project STR` / `--exclude-repo STR`: Partial-match exclusion, repeatable (OR). Same semantics as `search`
+- `--here`: Keep only sessions started at or under the current directory
 - `--source SOURCE`: Filter by source (`claude_code`, `opencode`, `codex`)
 - `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions).
   `resume_command` is shell-quoted and safe to `eval`. It is `null` for OpenCode/Codex
@@ -339,7 +345,8 @@ ai-conversation-search resume-spec SESSION_ID [--json]
   "source": "claude_code",
   "session_id": "abc-123",
   "project_path": "/home/user/proj",
-  "cwd_exists": true,
+  "project_exists": true,
+  "project_basename": "proj",
   "binary": "claude",
   "args": ["--resume", "abc-123"],
   "resume_command": "cd -- /home/user/proj && claude --resume abc-123"
@@ -351,8 +358,10 @@ ai-conversation-search resume-spec SESSION_ID [--json]
   `env FOO=1 claude` → `"claude"`). `args` is `["--resume", session_id]`.
   When the command cannot be decomposed, `resume_command` still carries the
   original string for eval compatibility.
-- `cwd_exists` is a single `Path::exists()` stat. It is `null` when
-  `project_path` is `null`.
+- `project_exists` is a single `Path::exists()` stat. It is `null` when
+  `project_path` is `null`. `project_basename` is the last path segment
+  (`Path::file_name`, `null` when there is no path or no segment) — use it to
+  tell worktrees apart without reading full paths.
 - `resume_command` is shell-quoted and safe to `eval`. It is `null` for
   OpenCode/Codex sessions (with `note: "resumed with their own tools"`),
   and also `null` when the project path or session id cannot be expressed
@@ -362,7 +371,7 @@ ai-conversation-search resume-spec SESSION_ID [--json]
 
 **Example:**
 ```bash
-# Human-readable (source / cwd / run / eval)
+# Human-readable (source / project / run / eval)
 ai-conversation-search resume-spec abc-123
 
 # Structured (for programmatic use)
@@ -402,7 +411,7 @@ ai-conversation-search preview SESSION_ID [--query PHRASE] [--messages N] [--jso
 **Output (JSON):** the `tree --flat --no-tools --content --json` envelope
 unchanged (`conversation` / `tree[]` / `total_messages` /
 `returned_messages`, same node shape with `full_content` +
-`full_content_truncated`), plus three additive keys. There is no `messages`
+`full_content_truncated`), plus four additive keys. There is no `messages`
 key. `tree[]` holds the last N messages; `total_messages` still means
 "messages in the session".
 
@@ -424,7 +433,8 @@ key. `tree[]` holds the last N messages; `total_messages` still means
       "full_content_truncated": false
     }
   ],
-  "cwd_exists": true,
+  "project_exists": true,
+  "project_basename": "proj",
   "query": "auth",
   "matches": ["msg-uuid-1"]
 }
@@ -433,10 +443,11 @@ key. `tree[]` holds the last N messages; `total_messages` still means
 - `query` is the trimmed phrase, or `null` when `--query` was not given (then
   `matches` is `[]`). `matches` only covers the returned last N, judged
   against the pre-truncation body.
-- `cwd_exists` is a single `Path::exists()` stat, same as `resume-spec`
-  (`null` when `project_path` is `null`).
+- `project_exists` is a single `Path::exists()` stat, same as `resume-spec`
+  (`null` when `project_path` is `null`). `project_basename` is the last path
+  segment, same rule.
 - Unresolvable ids exit `1` with the `tree`-shaped error envelope (`.error`
-  key) plus `query`/`matches`/`cwd_exists`, and the reason on stderr.
+  key) plus `query`/`matches`/`project_exists`/`project_basename`, and the reason on stderr.
 
 **Human output:** a plain header plus bodies, no emoji-painted framing:
 
@@ -623,6 +634,8 @@ tree / context / status                    →  a command-specific object
       "message_type": "user",
       "summary": "User asks about authentication bug",
       "project_path": "/home/user/projects/myapp",
+      "project_exists": true,
+      "project_basename": "myapp",
       "conversation_summary": "Auth Bug Fix",
       "session_id": "session-xyz",
       "source": "claude_code",
