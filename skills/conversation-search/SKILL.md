@@ -216,6 +216,18 @@ claude --resume abc-123-session-id
 
 Note: OpenCode sessions have `oc:` prefix, Codex sessions have `codex:` prefix in session IDs. For these sources, resume commands are tool-specific (not `claude --resume`).
 
+**Confirmation before launch (mandatory):** never auto-start a session.
+Present `preview` and `resume-spec`, then wait for the user:
+
+```bash
+ai-conversation-search tree <SESSION_ID> --no-tools --flat --content --content-chars 300
+ai-conversation-search resume-spec <SESSION_ID> --json
+```
+
+Only after explicit confirmation, resume with the `resume_command` (or
+`eval` line). In a non-TTY agent shell, stop at presenting `resume-spec` —
+do not reach for `eval` on your own.
+
 For counting/analysis queries:
 - Parse JSON results
 - Filter by message_type if needed (user vs assistant)
