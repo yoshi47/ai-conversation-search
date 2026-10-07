@@ -319,6 +319,9 @@ pub enum Commands {
         /// Group results by session (show the top-ranked match per session)
         #[arg(long)]
         group_by_session: bool,
+        /// Hide hits on rewound-away branches (off the current leaf path)
+        #[arg(long)]
+        active_only: bool,
         /// Result order: relevance (bm25) or recent (newest first)
         #[arg(long, value_parser = ["relevance", "recent"], default_value = "relevance")]
         sort: String,
@@ -691,6 +694,7 @@ pub fn run(cli: Cli) -> Result<()> {
             content_chars,
             verbose,
             group_by_session,
+            active_only,
             sort,
             json,
         }) => {
@@ -728,6 +732,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 content_chars,
                 verbose,
                 group_by_session,
+                active_only,
                 json,
             )
         }
@@ -1493,6 +1498,7 @@ fn cmd_search(
     content_chars: usize,
     verbose: bool,
     group_by_session: bool,
+    active_only: bool,
     json_output: bool,
 ) -> Result<()> {
     maybe_background_index();
@@ -1507,13 +1513,16 @@ fn cmd_search(
             show_content,
             content_chars,
             verbose,
+            active_only,
             json_output,
         );
     }
 
     // Rust-side excludes/--here narrow each fetched prefix; refetch with a
     // growing LIMIT so `--limit N` still returns N surviving rows.
-    let (results, truncated, stats) = if post.active() {
+    // `--active-only` joins that same refetch loop so the limit still fills
+    // after rewound hits are dropped.
+    let (results, truncated, stats) = if post.active() || active_only {
         let mut last_stats = None;
         let (rows, trunc) = fetch_filling(
             filter.limit,
@@ -1530,6 +1539,9 @@ fn cmd_search(
                 Ok((r.rows, truncated, roots))
             },
             |row: &SearchResultRow, roots: &HashMap<String, Option<String>>| {
+                if active_only && row.is_abandoned {
+                    return false;
+                }
                 let repo = roots.get(&row.session_id).and_then(|o| o.as_deref());
                 row_kept(row.project_path.as_deref(), repo, post)
             },
@@ -1613,6 +1625,16 @@ fn cmd_search(
             missing_marker(result.project_path.as_deref())
         );
         println!("   Time: {}", timestamp);
+        if result.is_abandoned {
+            println!("   Note: [rewound] off the current path, kept for search");
+        }
+        if let Some(m) = result
+            .model
+            .as_deref()
+            .or(result.conversation_model.as_deref())
+        {
+            println!("   Model: {}", m);
+        }
         println!("   Message: {}", message_uuid);
 
         if show_content {
@@ -1653,9 +1675,10 @@ fn cmd_search_grouped(
     show_content: bool,
     content_chars: usize,
     verbose: bool,
+    active_only: bool,
     json_output: bool,
 ) -> Result<()> {
-    let (rows, truncated, stats) = if post.active() {
+    let (rows, truncated, stats) = if post.active() || active_only {
         let mut last_stats = None;
         let (rows, trunc) = fetch_filling(
             filter.limit,
@@ -1676,6 +1699,9 @@ fn cmd_search_grouped(
                 Ok((r.rows, truncated, roots))
             },
             |grouped: &GroupedRow, roots: &HashMap<String, Option<String>>| {
+                if active_only && grouped.representative.is_abandoned {
+                    return false;
+                }
                 let r = &grouped.representative;
                 let repo = roots.get(&r.session_id).and_then(|o| o.as_deref());
                 row_kept(r.project_path.as_deref(), repo, post)
@@ -1751,6 +1777,12 @@ fn cmd_search_grouped(
             missing_marker(r.project_path.as_deref())
         );
         println!("   Time: {}", timestamp);
+        if r.is_abandoned {
+            println!("   Note: [rewound] off the current path, kept for search");
+        }
+        if let Some(m) = r.model.as_deref().or(r.conversation_model.as_deref()) {
+            println!("   Model: {}", m);
+        }
 
         if show_content {
             if let Some(content) = search.get_full_message_content(&r.message_uuid) {
@@ -1820,6 +1852,13 @@ fn cmd_context(uuid: &str, depth: i32, show_content: bool, json_output: bool) ->
             let summary = msg.summary.as_deref().unwrap_or("No summary");
             println!("  {} {}", icon, summary);
         }
+        if let Some(m) = msg.model.as_deref() {
+            println!("  Model: {}", m);
+        } else if let Some(ref conv) = result.conversation {
+            if let Some(m) = conv.model.as_deref() {
+                println!("  Session model: {}", m);
+            }
+        }
         println!();
     }
 
@@ -1887,6 +1926,9 @@ fn cmd_list(filter: &SearchFilter<'_>, post: &PostFilter, json_output: bool) -> 
 
         println!("{} [{}] {}", label, timestamp, summary);
         println!("  {} messages", msg_count);
+        if let Some(m) = conv.model.as_deref() {
+            println!("  Model: {}", m);
+        }
         println!(
             "  {}{}",
             project,
@@ -2204,6 +2246,11 @@ fn cmd_tree(session_id: &str, opts: &TreeOpts) -> Result<()> {
             if let Some(ref warning) = tree.warning {
                 eprintln!("Warning: {}", warning);
             }
+            if let Some(ref conv) = tree.conversation {
+                if let Some(m) = conv.model.as_deref() {
+                    println!("Model: {}\n", m);
+                }
+            }
             print_tree_nodes(&tree.tree, 0, opts);
             if let Some(returned) = returned {
                 if returned != tree.total_messages {
@@ -2234,7 +2281,13 @@ fn print_tree_nodes(nodes: &[TreeNode], indent: usize, opts: &TreeOpts) {
         let summary = node.summary.as_deref().unwrap_or("");
         let truncated: String = summary.chars().take(80).collect();
         let prefix = "  ".repeat(indent);
-        println!("{}{} {}", prefix, icon, truncated);
+        // Rewound-away branches stay in the index for search but are no longer
+        // live: mark them inline so `tree` reads as current-path + history.
+        let abandoned = if node.is_abandoned { " [rewound]" } else { "" };
+        match node.model.as_deref() {
+            Some(m) => println!("{}{} {}{} ({})", prefix, icon, truncated, abandoned, m),
+            None => println!("{}{} {}{}", prefix, icon, truncated, abandoned),
+        }
         if opts.content {
             let (body, dropped) = truncate_chars(&node.full_content, opts.content_chars);
             for line in body.lines() {
@@ -2274,6 +2327,7 @@ struct ResumeTarget {
     source: String,
     session_id: String,
     project_path: Option<String>,
+    model: Option<String>,
 }
 
 /// Escape LIKE wildcards for prefix resolution (same rules as `search::escape_like`).
@@ -2289,17 +2343,20 @@ fn fetch_resume_target(
     session_id: &str,
 ) -> Result<Option<ResumeTarget>> {
     let mut stmt = conn.prepare(
-        "SELECT session_id, source, project_path FROM conversations WHERE session_id = ?",
+        "SELECT session_id, source, project_path, model FROM conversations WHERE session_id = ?",
     )?;
     let mut rows = stmt.query([session_id])?;
     if let Some(row) = rows.next()? {
         let sid: String = row.get(0)?;
         let source: Option<String> = row.get(1)?;
         let project_path: Option<String> = row.get(2)?;
+        // Tolerant: a stale handle mid-migration may lack the column.
+        let model: Option<String> = row.get::<_, Option<String>>(3).unwrap_or(None);
         return Ok(Some(ResumeTarget {
             source: source.unwrap_or_else(|| "claude_code".to_string()),
             session_id: sid,
             project_path,
+            model,
         }));
     }
     Ok(None)
@@ -2396,6 +2453,7 @@ fn resolve_resume_target_with_conn(
                 source: "claude_code".to_string(),
                 session_id,
                 project_path: msg_project,
+                model: None,
             })
         }
         Err(_) => Err(AppError::General(format!(
@@ -2442,6 +2500,8 @@ struct ResumeSpecOutput {
     args: Vec<String>,
     resume_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -2463,6 +2523,7 @@ fn build_resume_spec_with_cmd(target: &ResumeTarget, cmd: &str) -> ResumeSpecOut
             binary: None,
             args: Vec::new(),
             resume_command: None,
+            model: target.model.clone(),
             note: Some("resumed with their own tools".to_string()),
             error: None,
         };
@@ -2507,6 +2568,7 @@ fn build_resume_spec_with_cmd(target: &ResumeTarget, cmd: &str) -> ResumeSpecOut
         binary,
         args,
         resume_command,
+        model: target.model.clone(),
         note: None,
         error,
     }
@@ -2526,6 +2588,9 @@ fn cmd_resume_spec(session_id: &str, json_output: bool) -> Result<()> {
     }
 
     println!("source: {}", spec.source);
+    if let Some(m) = spec.model.as_deref() {
+        println!("model: {}", m);
+    }
     match (&spec.project_path, spec.project_exists) {
         (Some(pp), Some(true)) => println!("project: {} (exists)", pp),
         (Some(pp), Some(false)) => println!("project: {} (missing)", pp),
@@ -2734,7 +2799,23 @@ fn cmd_preview(
         };
         filter_tree(&mut tree, &opts);
         // `flatten_tree` inside `filter_tree` already sorted chronologically,
-        // so the tail is the most recent N.
+        // so the tail is the most recent N. Prefer the live path: rewound-away
+        // branches stay searchable via `search`/`tree` but would otherwise
+        // pollute the "current state" preview tail.
+        let abandoned_in_preview = tree.tree.iter().filter(|n| n.is_abandoned).count();
+        if abandoned_in_preview > 0 {
+            tree.tree.retain(|n| !n.is_abandoned);
+            tree.warning = Some(match tree.warning.take() {
+                Some(w) => format!(
+                    "{} Preview shows the current path only ({} rewound message(s) hidden; see tree).",
+                    w, abandoned_in_preview
+                ),
+                None => format!(
+                    "Preview shows the current path only ({} rewound message(s) hidden; see tree).",
+                    abandoned_in_preview
+                ),
+            });
+        }
         if tree.tree.len() > messages {
             let at = tree.tree.len() - messages;
             tree.tree = tree.tree.split_off(at);
@@ -2818,6 +2899,9 @@ fn cmd_preview(
                 project,
                 missing_marker(target.project_path.as_deref())
             );
+            if let Some(m) = tree.conversation.as_ref().and_then(|c| c.model.as_deref()) {
+                println!("Model: {}", m);
+            }
             println!("Messages: {}-{}/{} (returned/total)", start, end, total);
             let range = if returned == 0 {
                 "(empty)".to_string()
@@ -2977,6 +3061,9 @@ mod tests {
                 conversation_summary: None,
                 conversation_file: None,
                 source: Some("claude_code".to_string()),
+                model: None,
+                conversation_model: None,
+                is_abandoned: false,
             },
             match_count: 3,
         };
@@ -3354,6 +3441,7 @@ mod tests {
             source: "claude_code".to_string(),
             session_id: "abc-123".to_string(),
             project_path: Some(proj.clone()),
+            model: None,
         };
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert_eq!(spec.binary.as_deref(), Some("claude"));
@@ -3373,6 +3461,7 @@ mod tests {
             source: "opencode".to_string(),
             session_id: "oc:ses_abc".to_string(),
             project_path: Some("/tmp/proj".to_string()),
+            model: None,
         };
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert!(spec.resume_command.is_none());
@@ -3387,6 +3476,7 @@ mod tests {
             source: "codex".to_string(),
             session_id: "codex:019e72d8".to_string(),
             project_path: Some("/tmp/proj".to_string()),
+            model: None,
         };
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert!(spec.resume_command.is_none());
@@ -3399,6 +3489,7 @@ mod tests {
             source: "claude_code".to_string(),
             session_id: "abc-123".to_string(),
             project_path: Some("/tmp/a\nb".to_string()),
+            model: None,
         };
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert!(spec.resume_command.is_none());
@@ -3413,6 +3504,7 @@ mod tests {
             source: "claude_code".to_string(),
             session_id: "abc-123".to_string(),
             project_path: None,
+            model: None,
         };
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert!(spec.resume_command.is_none());
@@ -3573,6 +3665,7 @@ mod tests {
             source: "claude_code".to_string(),
             session_id: "abc-123".to_string(),
             project_path: Some("/home/user/myproj".to_string()),
+            model: None,
         };
         let spec = build_resume_spec_with_cmd(&target, "claude");
         assert_eq!(spec.project_basename.as_deref(), Some("myproj"));
@@ -4011,6 +4104,8 @@ mod tree_filter_tests {
             project_path: Some("/tmp/p".to_string()),
             summary: Some(body.chars().take(20).collect()),
             full_content: body.to_string(),
+            model: None,
+            is_abandoned: false,
             children: Vec::new(),
         }
     }
@@ -4250,6 +4345,8 @@ mod tree_json_tests {
                 project_path: None,
                 summary: Some("s".to_string()),
                 full_content: "a body that must not ship by default".to_string(),
+                model: None,
+                is_abandoned: false,
                 children,
             }
         }

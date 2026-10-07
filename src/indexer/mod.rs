@@ -41,6 +41,8 @@ pub struct Message {
     pub content: String,
     pub session_id: Option<String>,
     pub is_meta_conversation: bool,
+    /// Model that produced this message (assistant only; None for user/unknown).
+    pub model: Option<String>,
 }
 
 /// Metadata extracted from a conversation JSONL file.
@@ -50,4 +52,44 @@ pub struct ConversationMeta {
     pub leaf_uuid: Option<String>,
     pub custom_title: Option<String>,
     pub first_user_message: Option<String>,
+}
+
+/// Join distinct non-empty models in first-seen order, for `conversations.model`.
+///
+/// Returns None when no message carries a model, so "unknown" stays NULL
+/// rather than an empty string that `list` would render as a blank row.
+pub fn distinct_model_list(models: &[Option<String>]) -> Option<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for m in models.iter().flatten() {
+        let m = m.trim();
+        if !m.is_empty() && !seen.contains(&m) {
+            seen.push(m);
+        }
+    }
+    if seen.is_empty() {
+        None
+    } else {
+        Some(seen.join(","))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_distinct_model_list_dedupes_keeps_order_and_skips_blanks() {
+        assert_eq!(distinct_model_list(&[]), None);
+        assert_eq!(distinct_model_list(&[None, None]), None);
+        assert_eq!(
+            distinct_model_list(&[
+                Some("b".to_string()),
+                None,
+                Some("a".to_string()),
+                Some("b".to_string()),
+                Some("  ".to_string()),
+            ]),
+            Some("b,a".to_string())
+        );
+    }
 }

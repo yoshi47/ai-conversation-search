@@ -107,6 +107,31 @@ const MIGRATIONS: &[(i64, &str, MigrationKind)] = &[
         "add bigram FTS table for short-term/CJK search",
         MigrationKind::Custom,
     ),
+    (
+        11,
+        "add model column to messages",
+        MigrationKind::Sql("ALTER TABLE messages ADD COLUMN model TEXT"),
+    ),
+    (
+        12,
+        "add model column to conversations",
+        MigrationKind::Sql("ALTER TABLE conversations ADD COLUMN model TEXT"),
+    ),
+    (
+        13,
+        "create index on conversations(model)",
+        MigrationKind::Sql("CREATE INDEX IF NOT EXISTS idx_conv_model ON conversations(model)"),
+    ),
+    (
+        14,
+        "create index on messages(model)",
+        MigrationKind::Sql("CREATE INDEX IF NOT EXISTS idx_msg_model ON messages(model)"),
+    ),
+    (
+        15,
+        "clear sync state to backfill models",
+        MigrationKind::Custom,
+    ),
 ];
 
 /// Initialize the database schema and run migrations.
@@ -275,6 +300,9 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bo
         // The bigram triggers feed `message_content_bigram_fts`; the pre-10
         // `messages_ai` body only touches `message_content_fts`.
         10 => ("trigger", "messages_ai", "bigram"),
+        // Data-only migration: a fresh DB has empty (or absent) sync tables,
+        // so there is nothing to backfill and it counts as applied.
+        15 => return Ok(sync_tables_empty_for_model_backfill(conn)),
         v => unreachable!("unhandled custom migration version: {}", v),
     };
 
@@ -291,6 +319,54 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bo
 
     // Absent means a fresh DB, where schema.sql already creates the correct form.
     Ok(sql.is_none_or(|s| s.contains(marker)))
+}
+
+/// Whether the model-backfill migration has nothing to do.
+///
+/// Returns true when no sync table holds rows: a fresh DB (nothing indexed yet)
+/// or a DB that already ran the backfill and has not indexed since. An existing
+/// DB with index history reports false so the migration runs once and forces a
+/// reparse that fills `messages.model` / `conversations.model`.
+fn sync_tables_empty_for_model_backfill(conn: &Connection) -> bool {
+    for table in [
+        "claude_code_sync_state",
+        "codex_sync_state",
+        "opencode_sync_state",
+    ] {
+        if !table_exists(conn, table) {
+            continue;
+        }
+        let count: i64 = conn
+            .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        if count > 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Clear per-source sync cursors so the next index reparses every transcript.
+///
+/// Model columns (migrations 11-12) are NULL for rows indexed before they
+/// existed, and the incremental paths skip unchanged files/sessions. Wiping the
+/// cursors forces one full reparse; the indexers backfill NULL models in place
+/// (Claude Code updates rows, OpenCode/Codex re-insert sessions), so no data
+/// is lost. Runs inside its own transaction; a fresh DB has empty tables and
+/// this is a no-op.
+fn clear_sync_state_for_model_backfill(conn: &Connection) -> Result<()> {
+    for table in [
+        "claude_code_sync_state",
+        "codex_sync_state",
+        "opencode_sync_state",
+    ] {
+        if table_exists(conn, table) {
+            conn.execute(&format!("DELETE FROM {}", table), [])?;
+        }
+    }
+    Ok(())
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -404,6 +480,7 @@ fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
         8 => migrate_fts_to_trigram(conn),
         9 => migrate_fix_fts_delete_triggers(conn),
         10 => migrate_add_bigram_fts(conn),
+        15 => clear_sync_state_for_model_backfill(conn),
         v => unreachable!("unhandled custom migration version: {}", v),
     }
 }
@@ -689,6 +766,7 @@ mod tests {
         assert!(detect_custom_migration_applied(&conn, 8).unwrap());
         assert!(detect_custom_migration_applied(&conn, 9).unwrap());
         assert!(detect_custom_migration_applied(&conn, 10).unwrap());
+        assert!(detect_custom_migration_applied(&conn, 15).unwrap());
     }
 
     /// Counts bigram index entries whose content row is gone. Same shape as
@@ -847,8 +925,10 @@ mod tests {
 
         // Verify key columns
         assert!(column_exists(&conn, "messages", "is_meta_conversation"));
+        assert!(column_exists(&conn, "messages", "model"));
         assert!(column_exists(&conn, "conversations", "repo_root"));
         assert!(column_exists(&conn, "conversations", "source"));
+        assert!(column_exists(&conn, "conversations", "model"));
     }
 
     #[test]
@@ -975,6 +1055,98 @@ mod tests {
                 "migration {} should be recorded",
                 version
             );
+        }
+    }
+
+    /// An index built before model tracking has rows but no model columns.
+    /// Migrating must add the columns AND clear the sync cursors so the next
+    /// index reparses transcripts and backfills the models. Existing message
+    /// content must survive.
+    #[test]
+    fn test_model_migrations_add_columns_and_clear_sync_state() {
+        let conn = setup_fresh_db();
+        // Pre-model database at migration 10, built by hand so the model
+        // columns are truly absent (SCHEMA_SQL already contains them).
+        // init_schema's first SCHEMA_SQL pass fills in the FTS tables,
+        // triggers and any missing sync tables around these.
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                 message_uuid TEXT PRIMARY KEY,
+                 session_id TEXT NOT NULL,
+                 parent_uuid TEXT,
+                 is_sidechain BOOLEAN DEFAULT FALSE,
+                 depth INTEGER DEFAULT 0,
+                 timestamp TEXT NOT NULL,
+                 message_type TEXT NOT NULL,
+                 project_path TEXT,
+                 conversation_file TEXT,
+                 summary TEXT,
+                 full_content TEXT NOT NULL,
+                 is_summarized BOOLEAN DEFAULT FALSE,
+                 is_tool_noise BOOLEAN DEFAULT FALSE,
+                 is_meta_conversation BOOLEAN DEFAULT FALSE,
+                 summary_method TEXT,
+                 indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE TABLE conversations (
+                 session_id TEXT PRIMARY KEY,
+                 project_path TEXT,
+                 repo_root TEXT,
+                 conversation_file TEXT,
+                 root_message_uuid TEXT,
+                 leaf_message_uuid TEXT,
+                 conversation_summary TEXT,
+                 first_message_at TEXT,
+                 last_message_at TEXT,
+                 message_count INTEGER DEFAULT 0,
+                 source TEXT DEFAULT 'claude_code',
+                 indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
+             );
+             CREATE TABLE claude_code_sync_state (file_path TEXT PRIMARY KEY, mtime REAL NOT NULL);
+             CREATE TABLE codex_sync_state (file_path TEXT PRIMARY KEY, mtime REAL NOT NULL);
+             CREATE TABLE opencode_sync_state (key TEXT PRIMARY KEY, value TEXT);
+             CREATE TABLE schema_version (version INTEGER PRIMARY KEY);
+             INSERT INTO schema_version (version) VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+             INSERT INTO messages (message_uuid, session_id, timestamp, message_type, full_content)
+               VALUES ('m1', 'sess1', '2025-01-15T10:00:00', 'assistant', 'hello');
+             INSERT INTO conversations (session_id, message_count)
+               VALUES ('sess1', 1);
+             INSERT INTO claude_code_sync_state (file_path, mtime) VALUES ('/tmp/x.jsonl', 1.0);
+             INSERT INTO codex_sync_state (file_path, mtime) VALUES ('/tmp/y.jsonl', 2.0);
+             INSERT INTO opencode_sync_state (key, value) VALUES ('last_sync_time', '123');",
+        )
+        .unwrap();
+        assert!(!column_exists(&conn, "messages", "model"));
+
+        init_schema(&conn).unwrap();
+
+        assert!(column_exists(&conn, "messages", "model"));
+        assert!(column_exists(&conn, "conversations", "model"));
+        assert!(index_exists(&conn, "idx_conv_model"));
+        assert!(index_exists(&conn, "idx_msg_model"));
+        assert!(is_migration_applied(&conn, 11));
+        assert!(is_migration_applied(&conn, 15));
+        // Content preserved.
+        let content: String = conn
+            .query_row(
+                "SELECT full_content FROM messages WHERE message_uuid = 'm1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(content, "hello");
+        // Sync cursors cleared so the next index reparses everything.
+        for table in [
+            "claude_code_sync_state",
+            "codex_sync_state",
+            "opencode_sync_state",
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(n, 0, "{} should be cleared", table);
         }
     }
 

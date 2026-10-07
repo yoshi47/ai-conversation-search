@@ -211,8 +211,12 @@ impl CodexIndexer {
         conn.execute("DELETE FROM messages WHERE session_id = ?", [&session_id])?;
 
         // Parse events
-        let mut messages: Vec<(String, String, String)> = Vec::new(); // (role, timestamp, text)
+        // (role, timestamp, text, model). Codex records the active model on
+        // `turn_context` lines, so track the most recent one and attribute it
+        // to subsequent assistant messages until the next turn starts.
+        let mut messages: Vec<(String, String, String, Option<String>)> = Vec::new();
         let mut title_parts: Vec<String> = Vec::new();
+        let mut current_model: Option<String> = None;
 
         for line in &lines[1..] {
             let event: serde_json::Value = match serde_json::from_str(line) {
@@ -225,6 +229,20 @@ impl CodexIndexer {
                 .get("payload")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+            // `turn_context` carries the model for the turns that follow it
+            // (e.g. {"model": "gpt-5", ...}). Update the cursor and continue;
+            // it is not itself a message.
+            if event_type == "turn_context" {
+                if let Some(model) = event_payload
+                    .get("model")
+                    .and_then(|m| m.as_str())
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
+                {
+                    current_model = Some(model.to_string());
+                }
+                continue;
+            }
             let timestamp = event
                 .get("timestamp")
                 .and_then(|t| t.as_str())
@@ -244,7 +262,12 @@ impl CodexIndexer {
                                 .and_then(|m| m.as_str())
                                 .unwrap_or("");
                             if !text.trim().is_empty() {
-                                messages.push(("user".to_string(), timestamp, text.to_string()));
+                                messages.push((
+                                    "user".to_string(),
+                                    timestamp,
+                                    text.to_string(),
+                                    None,
+                                ));
                                 if title_parts.is_empty() {
                                     title_parts.push(text.chars().take(100).collect());
                                 }
@@ -260,6 +283,7 @@ impl CodexIndexer {
                                     "assistant".to_string(),
                                     timestamp,
                                     text.to_string(),
+                                    current_model.clone(),
                                 ));
                             }
                         }
@@ -273,6 +297,7 @@ impl CodexIndexer {
                                     "assistant".to_string(),
                                     timestamp,
                                     format!("[Reasoning] {}", text),
+                                    current_model.clone(),
                                 ));
                             }
                         }
@@ -316,7 +341,12 @@ impl CodexIndexer {
                                     }
                                 }
                             }
-                            messages.push(("assistant".to_string(), timestamp, tool_text));
+                            messages.push((
+                                "assistant".to_string(),
+                                timestamp,
+                                tool_text,
+                                current_model.clone(),
+                            ));
                         }
                         "function_call_output" => {
                             let output_str = event_payload
@@ -343,6 +373,7 @@ impl CodexIndexer {
                                     "assistant".to_string(),
                                     timestamp,
                                     format!("[Tool Output]\n{}", output_text),
+                                    current_model.clone(),
                                 ));
                             }
                         }
@@ -369,6 +400,7 @@ impl CodexIndexer {
                                                     "assistant".to_string(),
                                                     timestamp.clone(),
                                                     text.to_string(),
+                                                    current_model.clone(),
                                                 ));
                                             }
                                         }
@@ -387,25 +419,34 @@ impl CodexIndexer {
             return Ok(0);
         }
 
-        // Consolidate consecutive same-role messages
-        let mut consolidated: Vec<(String, String, String)> = Vec::new();
-        for (role, ts, text) in messages {
+        // Consolidate consecutive same-role messages. A model change breaks the
+        // run: turns that switched models stay as separate rows so each keeps
+        // its own attribution instead of merging into a "a,b" hybrid.
+        let mut consolidated: Vec<(String, String, String, Option<String>)> = Vec::new();
+        for (role, ts, text, model) in messages {
             if let Some(last) = consolidated.last_mut() {
-                if last.0 == role {
+                if last.0 == role && last.3 == model {
                     last.2.push('\n');
                     last.2.push_str(&text);
                     continue;
                 }
             }
-            consolidated.push((role, ts, text));
+            consolidated.push((role, ts, text, model));
         }
+
+        let session_model = super::distinct_model_list(
+            &consolidated
+                .iter()
+                .map(|(_, _, _, model)| model.clone())
+                .collect::<Vec<_>>(),
+        );
 
         // Insert messages
         let mut msg_count: usize = 0;
         let mut first_timestamp: Option<String> = None;
         let mut last_timestamp: Option<String> = None;
 
-        for (i, (role, ts, content)) in consolidated.iter().enumerate() {
+        for (i, (role, ts, content, model)) in consolidated.iter().enumerate() {
             if content.trim().is_empty() {
                 continue;
             }
@@ -418,7 +459,7 @@ impl CodexIndexer {
             last_timestamp = Some(ts.clone());
 
             conn.execute(
-                "INSERT OR REPLACE INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
                     message_uuid,
                     session_id,
@@ -432,6 +473,7 @@ impl CodexIndexer {
                     content,
                     false,
                     false,
+                    model,
                 ],
             )?;
             msg_count += 1;
@@ -454,7 +496,7 @@ impl CodexIndexer {
             .unwrap_or("");
 
         conn.execute(
-            "INSERT OR REPLACE INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex')",
+            "INSERT OR REPLACE INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, source, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'codex', ?)",
             rusqlite::params![
                 session_id,
                 cwd,
@@ -466,6 +508,7 @@ impl CodexIndexer {
                 first_timestamp.as_deref().unwrap_or(session_timestamp),
                 last_timestamp.as_deref().unwrap_or(session_timestamp),
                 msg_count as i64,
+                session_model,
             ],
         )?;
 
@@ -547,6 +590,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(first_content, "Hello world");
+    }
+
+    #[test]
+    fn test_turn_context_model_attribution() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+
+        let session_file = write_session_file(
+            dir.path(),
+            "model-test.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"bbbbbbbb-cccc-dddd-eeee-ffffffffffff","cwd":"/tmp","timestamp":"2025-01-15T10:00:00Z"}}"#,
+                r#"{"type":"turn_context","payload":{"cwd":"/tmp","model":"gpt-5","effort":"high"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"user_message","message":"Hello"},"timestamp":"2025-01-15T10:00:01Z"}"#,
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Hi"},"timestamp":"2025-01-15T10:00:02Z"}"#,
+                r#"{"type":"turn_context","payload":{"cwd":"/tmp","model":"gpt-5-codex","effort":"high"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Follow-up"},"timestamp":"2025-01-15T10:00:03Z"}"#,
+            ],
+        );
+
+        let indexer = create_indexer(dir.path());
+        indexer.index_session_file(&conn, &session_file).unwrap();
+
+        // user + 2 agent runs: the two agent messages use different models,
+        // so they must not consolidate into one row.
+        let models: Vec<Option<String>> = {
+            let mut stmt = conn
+                .prepare("SELECT model FROM messages ORDER BY depth ASC")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            models,
+            vec![
+                None,
+                Some("gpt-5".to_string()),
+                Some("gpt-5-codex".to_string())
+            ]
+        );
+        let session_model: Option<String> = conn
+            .query_row("SELECT model FROM conversations LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(session_model.as_deref(), Some("gpt-5,gpt-5-codex"));
     }
 
     /// The progress line truncates the session title by character count. `quiet` is

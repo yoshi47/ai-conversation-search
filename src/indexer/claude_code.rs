@@ -128,6 +128,32 @@ fn record_sync_state(conn: &Connection, file_path: &Path, mtime: Option<f64>) ->
     Ok(())
 }
 
+impl ConversationIndexer {
+    /// Fill `model` on rows indexed before model tracking existed.
+    ///
+    /// Only touches rows whose model IS NULL, so re-running after new messages
+    /// arrive never overwrites a recorded model. Returns the number of rows
+    /// updated. Takes the parsed transcript (the authority) rather than
+    /// re-querying distinct models from the DB.
+    fn backfill_models(
+        tx: &rusqlite::Transaction<'_>,
+        _session_id: &str,
+        messages: &[super::Message],
+    ) -> Result<usize> {
+        let mut updated = 0usize;
+        for message in messages {
+            if let Some(model) = message.model.as_deref() {
+                let n = tx.execute(
+                    "UPDATE messages SET model = ? WHERE message_uuid = ? AND model IS NULL",
+                    rusqlite::params![model, message.uuid],
+                )?;
+                updated += n;
+            }
+        }
+        Ok(updated)
+    }
+}
+
 /// JSONL message entry.
 #[derive(Debug, Deserialize)]
 struct JsonlEntry {
@@ -837,6 +863,18 @@ impl ConversationIndexer {
                 continue;
             }
 
+            // Current format: `last-prompt` rows carry the live leaf. There is one
+            // per prompt and only the last matters, so overwrite -- it wins over
+            // the legacy summary-line leaf below.
+            if entry.entry_type.as_deref() == Some("last-prompt") {
+                if let Some(leaf) = entry.leaf_uuid.clone() {
+                    if !leaf.trim().is_empty() {
+                        leaf_uuid_from_jsonl = Some(leaf);
+                    }
+                }
+                continue;
+            }
+
             // First line is the summary (older format)
             if line_num == 0 && entry.entry_type.as_deref() == Some("summary") {
                 summary_from_jsonl = entry.summary;
@@ -921,6 +959,17 @@ impl ConversationIndexer {
                 first_user_message = Some(msg_content.chars().take(100).collect());
             }
 
+            // Model that produced this message. Claude Code stores it as
+            // `message.model` on assistant entries (e.g. "claude-opus-4-6").
+            // `<synthetic>` marks non-model entries, stored as NULL so it never
+            // pollutes the session model list.
+            let model = message
+                .get("model")
+                .and_then(|m| m.as_str())
+                .map(str::trim)
+                .filter(|m| !m.is_empty() && !m.starts_with('<'))
+                .map(str::to_string);
+
             messages.push(Message {
                 uuid,
                 parent_uuid: entry.parent_uuid,
@@ -930,6 +979,7 @@ impl ConversationIndexer {
                 content: msg_content,
                 session_id: entry.session_id,
                 is_meta_conversation: false,
+                model,
             });
         }
 
@@ -1162,6 +1212,12 @@ impl ConversationIndexer {
                 |row| row.get::<_, f64>(0),
             ) {
                 if (existing_mtime - mtime).abs() < 0.001 {
+                    // Gradual leaf backfill: rows indexed before `last-prompt`
+                    // tracking hold NULL and would otherwise never get a leaf
+                    // until the transcript changes. A tail scan is far cheaper
+                    // than a full reparse and unblocks abandoned-marking.
+                    // Best-effort: failures just retry next run.
+                    let _ = self.backfill_leaf_for_skipped_file(file_path);
                     return Ok(());
                 }
             }
@@ -1171,6 +1227,58 @@ impl ConversationIndexer {
         // so a failure leaves no orphaned conversation row AND no sync_state row,
         // guaranteeing the file is retried on the next index run.
         self.do_index_conversation(file_path, file_mtime)
+    }
+
+    /// Fill `leaf_message_uuid` for transcripts skipped by mtime.
+    ///
+    /// Rows indexed before `last-prompt` tracking hold NULL and would never
+    /// get a leaf until the transcript changes. This scans only for the leaf
+    /// (no message parsing, no message writes) so the next index gradually
+    /// heals old rows without a full `--force` reparse.
+    fn backfill_leaf_for_skipped_file(&self, file_path: &Path) -> Result<()> {
+        let file_str = file_path.to_string_lossy().to_string();
+        let sessions: Vec<String> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id FROM conversations WHERE conversation_file = ? AND leaf_message_uuid IS NULL",
+            )?;
+            let mapped = stmt.query_map([file_str.as_str()], |row| row.get(0))?;
+            mapped.filter_map(|r| r.ok()).collect()
+        };
+        if sessions.is_empty() {
+            return Ok(());
+        }
+        let content = std::fs::read_to_string(file_path)?;
+        let mut leaf: Option<String> = None;
+        for line in content.lines() {
+            // Fast prefilter: most lines are user/assistant messages.
+            if !line.contains("last-prompt") || !line.contains("leafUuid") {
+                continue;
+            }
+            let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if value.get("type").and_then(|t| t.as_str()) != Some("last-prompt") {
+                continue;
+            }
+            if let Some(l) = value.get("leafUuid").and_then(|l| l.as_str()) {
+                if !l.trim().is_empty() {
+                    leaf = Some(l.to_string());
+                }
+            }
+        }
+        if let Some(leaf) = leaf {
+            for session_id in &sessions {
+                self.conn.execute(
+                    "UPDATE conversations SET leaf_message_uuid = ? WHERE session_id = ?",
+                    rusqlite::params![leaf, session_id],
+                )?;
+            }
+            self.log(&format!(
+                "  Backfilled leaf for {} session(s)",
+                sessions.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Internal indexing logic for a single conversation file.
@@ -1337,6 +1445,12 @@ impl ConversationIndexer {
         let is_update;
         let messages_to_insert;
 
+        // Distinct models in first-seen order, from the full transcript so the
+        // value stays correct on both insert and incremental update paths.
+        let session_model = super::distinct_model_list(
+            &messages.iter().map(|m| m.model.clone()).collect::<Vec<_>>(),
+        );
+
         if let Some(ref indexed_at) = existing {
             self.log(&format!(
                 "  Already indexed at {}, checking for new messages...",
@@ -1361,7 +1475,19 @@ impl ConversationIndexer {
                 .collect();
 
             if new_messages.is_empty() {
-                self.log("  No new messages, skipping");
+                // No new messages, but the model columns may still be empty for
+                // rows indexed before model tracking existed. Backfill those in
+                // place so a forced re-index repairs old sessions without
+                // deleting and re-inserting every message.
+                let backfilled = Self::backfill_models(&tx, &session_id, &messages)?;
+                if backfilled > 0 {
+                    self.log(&format!("  Backfilled model for {} messages", backfilled));
+                }
+                // Keep conversations.model in sync even when no message changed.
+                tx.execute(
+                    "UPDATE conversations SET model = ? WHERE session_id = ? AND (model IS NULL OR model != ?)",
+                    rusqlite::params![session_model, session_id, session_model],
+                )?;
                 // Still record sync_state so we don't re-parse unchanged file.
                 record_sync_state(&tx, file_path, file_mtime)?;
                 tx.commit()?;
@@ -1380,12 +1506,13 @@ impl ConversationIndexer {
             // UUIDs already exist under a different session_id — Claude Code
             // resume sessions re-emit parent messages).
             tx.execute(
-                "UPDATE conversations SET last_message_at = ?, message_count = 0, leaf_message_uuid = ?, conversation_summary = ?, project_path = ?, indexed_at = CURRENT_TIMESTAMP WHERE session_id = ?",
+                "UPDATE conversations SET last_message_at = ?, message_count = 0, leaf_message_uuid = ?, conversation_summary = ?, project_path = ?, model = ?, indexed_at = CURRENT_TIMESTAMP WHERE session_id = ?",
                 rusqlite::params![
                     messages.last().and_then(|m| m.timestamp.as_ref()),
                     conv_meta.as_ref().and_then(|m| m.leaf_uuid.as_ref()),
                     conversation_summary,
                     project_path,
+                    session_model,
                     session_id,
                 ],
             )?;
@@ -1396,7 +1523,7 @@ impl ConversationIndexer {
             // New conversation. message_count placeholder is 0; corrected after
             // message INSERTs via COUNT(*) (see comment in the UPDATE branch).
             tx.execute(
-                "INSERT INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                "INSERT INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)",
                 rusqlite::params![
                     session_id,
                     project_path,
@@ -1407,6 +1534,7 @@ impl ConversationIndexer {
                     conversation_summary,
                     messages[0].timestamp,
                     messages.last().and_then(|m| m.timestamp.as_ref()),
+                    session_model,
                 ],
             )?;
 
@@ -1430,7 +1558,7 @@ impl ConversationIndexer {
         // exactly the bug we're fixing here.
         for message in &messages_to_insert {
             tx.execute(
-                "INSERT OR IGNORE INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR IGNORE INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
                     message.uuid,
                     session_id,
@@ -1444,8 +1572,21 @@ impl ConversationIndexer {
                     message.content,
                     message.is_meta_conversation,
                     tool_noise_uuids.contains(&message.uuid),
+                    message.model,
                 ],
             )?;
+        }
+
+        // OR IGNORE skips rows whose UUID already exists under a sister session,
+        // leaving their model NULL when they predate model tracking. Backfill
+        // those in place; content is immutable so only the model is updated.
+        for message in &messages_to_insert {
+            if let Some(model) = message.model.as_deref() {
+                tx.execute(
+                    "UPDATE messages SET model = ? WHERE message_uuid = ? AND model IS NULL",
+                    rusqlite::params![model, message.uuid],
+                )?;
+            }
         }
 
         // Recompute message_count from the actual rows in messages. This is
@@ -1810,6 +1951,36 @@ mod tests {
         );
     }
 
+    fn stored_leaf(indexer: &ConversationIndexer, session: &str) -> Option<String> {
+        indexer
+            .connection()
+            .query_row(
+                "SELECT leaf_message_uuid FROM conversations WHERE session_id = ?",
+                [session],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
+    /// Current format carries the live leaf on `last-prompt` rows, not on a
+    /// first-line summary. The last row wins; empty values are ignored.
+    #[test]
+    fn test_last_prompt_leaf_wins_and_empty_ignored() {
+        let (_dir, mut indexer) = create_test_indexer();
+        let file = write_temp_jsonl(&[
+            r#"{"type":"custom-title","customTitle":"T"}"#,
+            r#"{"uuid":"u0","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"leaf1","message":{"role":"user","content":"hi"}}"#,
+            r#"{"type":"last-prompt","leafUuid":"u0","sessionId":"leaf1"}"#,
+            r#"{"uuid":"u1","parentUuid":"u0","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"leaf1","message":{"role":"assistant","content":"yo"}}"#,
+            r#"{"type":"last-prompt","leafUuid":"u1","sessionId":"leaf1"}"#,
+            r#"{"type":"last-prompt","leafUuid":"   ","sessionId":"leaf1"}"#,
+        ]);
+
+        indexer.index_conversation(file.path()).unwrap();
+
+        assert_eq!(stored_leaf(&indexer, "leaf1").as_deref(), Some("u1"));
+    }
+
     #[test]
     fn test_parse_conversation_file_basic() {
         let (_dir, indexer) = create_test_indexer();
@@ -1883,6 +2054,110 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_model_from_assistant_message() {
+        let (_dir, indexer) = create_test_indexer();
+        let file = write_temp_jsonl(&[
+            r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"s1","message":{"role":"user","content":"hi"}}"#,
+            r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"s1","message":{"role":"assistant","model":"claude-opus-4-6","content":"hello"}}"#,
+            r#"{"uuid":"u3","parentUuid":"u2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"assistant","sessionId":"s1","message":{"role":"assistant","model":"<synthetic>","content":"sys"}}"#,
+        ]);
+
+        let (_, messages) = indexer.parse_conversation_file(file.path()).unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].model, None, "user messages carry no model");
+        assert_eq!(messages[1].model.as_deref(), Some("claude-opus-4-6"));
+        assert_eq!(
+            messages[2].model, None,
+            "<synthetic> is not a model and must stay NULL"
+        );
+    }
+
+    #[test]
+    fn test_index_stores_message_and_session_models() {
+        let (_dir, mut indexer) = create_test_indexer();
+        let file = write_temp_jsonl(&[
+            r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess-model","message":{"role":"user","content":"hi"}}"#,
+            r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess-model","message":{"role":"assistant","model":"claude-opus-4-6","content":"first"}}"#,
+            r#"{"uuid":"u3","parentUuid":"u2","isSidechain":false,"timestamp":"2025-01-15T10:02:00Z","type":"assistant","sessionId":"sess-model","message":{"role":"assistant","model":"claude-opus-4-5","content":"second"}}"#,
+        ]);
+
+        indexer.index_conversation(file.path()).unwrap();
+
+        let session_model: Option<String> = indexer
+            .connection()
+            .query_row(
+                "SELECT model FROM conversations WHERE session_id = 'sess-model'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            session_model.as_deref(),
+            Some("claude-opus-4-6,claude-opus-4-5"),
+            "distinct models in first-seen order"
+        );
+        let m2: Option<String> = indexer
+            .connection()
+            .query_row(
+                "SELECT model FROM messages WHERE message_uuid = 'u2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(m2.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
+    fn test_reindex_backfills_missing_models() {
+        let (_dir, mut indexer) = create_test_indexer();
+        // v1 without models (as written before model tracking existed).
+        let file = write_temp_jsonl(&[
+            r#"{"uuid":"u1","parentUuid":null,"isSidechain":false,"timestamp":"2025-01-15T10:00:00Z","type":"user","sessionId":"sess-backfill","message":{"role":"user","content":"hi"}}"#,
+            r#"{"uuid":"u2","parentUuid":"u1","isSidechain":false,"timestamp":"2025-01-15T10:01:00Z","type":"assistant","sessionId":"sess-backfill","message":{"role":"assistant","content":"hello"}}"#,
+        ]);
+        indexer.index_conversation(file.path()).unwrap();
+        let before: Option<String> = indexer
+            .connection()
+            .query_row(
+                "SELECT model FROM messages WHERE message_uuid = 'u2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, None);
+
+        // v2 adds the model to the same UUIDs; force reparse like the
+        // post-migration sync-state clear does.
+        std::fs::write(
+            file.path(),
+            "{\"uuid\":\"u1\",\"parentUuid\":null,\"isSidechain\":false,\"timestamp\":\"2025-01-15T10:00:00Z\",\"type\":\"user\",\"sessionId\":\"sess-backfill\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n\
+             {\"uuid\":\"u2\",\"parentUuid\":\"u1\",\"isSidechain\":false,\"timestamp\":\"2025-01-15T10:01:00Z\",\"type\":\"assistant\",\"sessionId\":\"sess-backfill\",\"message\":{\"role\":\"assistant\",\"model\":\"claude-opus-4-6\",\"content\":\"hello\"}}\n",
+        )
+        .unwrap();
+        indexer.set_force(true);
+        indexer.index_conversation(file.path()).unwrap();
+
+        let after: Option<String> = indexer
+            .connection()
+            .query_row(
+                "SELECT model FROM messages WHERE message_uuid = 'u2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(after.as_deref(), Some("claude-opus-4-6"));
+        let session_model: Option<String> = indexer
+            .connection()
+            .query_row(
+                "SELECT model FROM conversations WHERE session_id = 'sess-backfill'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_model.as_deref(), Some("claude-opus-4-6"));
+    }
+
+    #[test]
     fn test_parse_content_blocks_tool_use() {
         let (_dir, indexer) = create_test_indexer();
         let file = write_temp_jsonl(&[
@@ -1936,6 +2211,7 @@ mod tests {
                 content: "msg a".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
             Message {
                 uuid: "b".to_string(),
@@ -1946,6 +2222,7 @@ mod tests {
                 content: "msg b".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
             Message {
                 uuid: "c".to_string(),
@@ -1956,6 +2233,7 @@ mod tests {
                 content: "msg c".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
         ];
 
@@ -1979,6 +2257,7 @@ mod tests {
                 content: "root".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
             Message {
                 uuid: "child1".to_string(),
@@ -1989,6 +2268,7 @@ mod tests {
                 content: "child1".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
             Message {
                 uuid: "child2".to_string(),
@@ -1999,6 +2279,7 @@ mod tests {
                 content: "child2".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
             Message {
                 uuid: "grandchild".to_string(),
@@ -2009,6 +2290,7 @@ mod tests {
                 content: "grandchild".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
         ];
 
@@ -2033,6 +2315,7 @@ mod tests {
                 content: "Find my old conversation about Rust".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
             Message {
                 uuid: "a1".to_string(),
@@ -2043,6 +2326,7 @@ mod tests {
                 content: "[Tool: Bash] ai-conversation-search search rust".to_string(),
                 session_id: Some("s1".to_string()),
                 is_meta_conversation: false,
+                model: None,
             },
         ];
 

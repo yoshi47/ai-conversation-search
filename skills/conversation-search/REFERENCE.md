@@ -50,7 +50,7 @@ ai-conversation-search init --no-extract
 Search conversations using full-text search on smart-extracted content.
 
 ```bash
-ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--exclude-project STR]... [--exclude-repo STR]... [--here] [--source SOURCE] [--limit LIMIT] [--sort SORT] [--content] [--content-chars N] [--group-by-session] [-v] [--json]
+ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--until DATE] [--date DATE] [--project PROJECT] [--repo REPO] [--exclude-project STR]... [--exclude-repo STR]... [--here] [--source SOURCE] [--limit LIMIT] [--sort SORT] [--content] [--content-chars N] [--group-by-session] [--active-only] [-v] [--json]
 ```
 
 **Arguments:**
@@ -77,6 +77,11 @@ ai-conversation-search search QUERY [--exact] [--days DAYS] [--since DATE] [--un
   Applies to JSON as well as human output — an uncapped body averages 3.5K characters, so
   `--limit 50 --content` would be ~175KB
 - `--group-by-session`: Group results by session (show the top-ranked match per session with match count)
+- `--active-only`: Hide hits on rewound-away branches (off the current leaf path).
+  By default `search` keeps rewound/retried branches for recall and flags them
+  with `is_abandoned: true` (human output: `[rewound]` note). `tree` marks the
+  same nodes `is_abandoned` and prints `[rewound]`; `preview` shows the current
+  path only.
 - `-v, --verbose`: Show search diagnostics (sessions scanned, messages matched, unindexed warnings)
 - `--json`: Output as JSON (includes `resume_command` field for Claude Code sessions).
   `resume_command` is shell-quoted and safe to `eval`. It is `null` for OpenCode/Codex

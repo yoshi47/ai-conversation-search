@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- 使っていたモデルを記録・表示するようにした。Claude Code は assistant メッセージの `message.model`、OpenCode は `data.model`（`providerID/id` 形式）、Codex は `turn_context` の `model` を `messages.model` に保存し、セッション単位の異なり一覧を `conversations.model`（初出順カンマ区切り）に持つ。`search` / `list` / `tree` / `context` / `preview` の人間向け出力に `Model:` 行（tree はノード末尾にも `(model)`）を足し、`--json` には `model`（search は `conversation_model` も、resume-spec も `model`）を足した。既存フィールドは不変。マイグレーション 11-14 で列と索引を追加し、15 で同期カーソルをクリアして次回 index 時に全量再パースで埋める（Claude Code は NULL の行だけ inplace 更新、OpenCode/Codex はセッション再挿入）。`<synthetic>` はモデルではないので NULL のまま
+
+- rewind/retry で分岐した旧枝を現行パスと区別するようにした。Claude Code の `last-prompt` 行の最終 `leafUuid` を `conversations.leaf_message_uuid` に保存し（旧形式の先頭行 `summary` も継続対応、空値は無視）、leaf から遡れない枝を `is_abandoned: true` で保持する。`tree` は該当ノードに `[rewound]` と警告文、`preview` は現行パスの末尾だけ返し（隠した分を警告に明記）、`search`（`--group-by-session` 含む）は既定で全件＋`is_abandoned` 付与、`--active-only` で破棄枝を除外できる。leaf 不明時（旧索引・非Claude等）は誤判定を避けて何も付けない。既存 DB の NULL leaf は mtime スキップ時に軽量スキャンで徐々に埋める（`--force` 不要）
+
 ## [0.18.0] - 2026-10-04
 
 ### Added

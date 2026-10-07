@@ -196,6 +196,9 @@ ai-conversation-search search "query" --since 2025-11-10 --until 2025-11-13 [--j
 # Exact phrase matching
 ai-conversation-search search "query" --exact
 
+# Hide hits on rewound-away branches (kept by default with is_abandoned:true)
+ai-conversation-search search "query" --active-only
+
 # Group results by session
 ai-conversation-search search "query" --group-by-session
 

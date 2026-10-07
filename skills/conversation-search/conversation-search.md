@@ -278,6 +278,10 @@ ai-conversation-search search "query" --exact --json
 # Group results by session (best match per session)
 ai-conversation-search search "query" --group-by-session --json
 
+# Hide hits on rewound-away branches (search keeps them by default with
+# is_abandoned:true; tree marks them [rewound], preview shows current path only)
+ai-conversation-search search "query" --active-only --json
+
 # Show search diagnostics (session/message counts)
 ai-conversation-search search "query" -v --json
 

@@ -231,7 +231,22 @@ impl OpenCodeIndexer {
             |row| row.get::<_, String>(0),
         ) {
             if existing_last == session_updated_iso {
-                return Ok(0);
+                // Up to date, but rows indexed before model tracking have NULL
+                // models. Re-index those instead of skipping, so one pass
+                // backfills them without a full database rebuild.
+                let stored_model: Option<String> = search_conn
+                    .query_row(
+                        "SELECT model FROM conversations WHERE session_id = ?",
+                        [&session_id],
+                        |row| row.get(0),
+                    )
+                    .unwrap_or(None);
+                if stored_model
+                    .as_deref()
+                    .is_some_and(|m| !m.trim().is_empty())
+                {
+                    return Ok(0);
+                }
             }
             // Delete existing for re-index
             search_conn.execute("DELETE FROM messages WHERE session_id = ?", [&session_id])?;
@@ -243,6 +258,13 @@ impl OpenCodeIndexer {
             return Ok(0);
         }
 
+        let session_model = super::distinct_model_list(
+            &messages
+                .iter()
+                .map(|(_, _, _, _, model)| model.clone())
+                .collect::<Vec<_>>(),
+        );
+
         let repo_root = if !work_dir.is_empty() {
             super::resolve_repo_root_cached(search_conn, work_dir)
         } else {
@@ -252,7 +274,7 @@ impl OpenCodeIndexer {
         let mut msg_count: usize = 0;
         let mut first_timestamp: Option<String> = None;
 
-        for (msg_id, role, msg_time_created, content) in &messages {
+        for (msg_id, role, msg_time_created, content, model) in &messages {
             if content.trim().is_empty() {
                 continue;
             }
@@ -264,7 +286,7 @@ impl OpenCodeIndexer {
                 first_timestamp = Some(timestamp.clone());
             }
             search_conn.execute(
-                "INSERT OR REPLACE INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT OR REPLACE INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
                     message_uuid,
                     session_id,
@@ -278,6 +300,7 @@ impl OpenCodeIndexer {
                     content,
                     false,
                     false,
+                    model,
                 ],
             )?;
             msg_count += 1;
@@ -296,7 +319,7 @@ impl OpenCodeIndexer {
         let session_created_iso = Self::epoch_ms_to_iso(info.time_created);
 
         search_conn.execute(
-            "INSERT OR REPLACE INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode')",
+            "INSERT OR REPLACE INTO conversations (session_id, project_path, repo_root, conversation_file, root_message_uuid, leaf_message_uuid, conversation_summary, first_message_at, last_message_at, message_count, source, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencode', ?)",
             rusqlite::params![
                 session_id,
                 work_dir,
@@ -308,6 +331,7 @@ impl OpenCodeIndexer {
                 first_timestamp.as_deref().unwrap_or(&session_created_iso),
                 session_updated_iso,
                 msg_count as i64,
+                session_model,
             ],
         )?;
 
@@ -360,8 +384,33 @@ fn fetch_sessions(conn: &Connection, cutoff_ms: i64) -> Result<Vec<SessionRow>> 
     Ok(rows)
 }
 
-/// (message id, role, time_created, content) for user/assistant messages, in order.
-type MessageRow = (String, String, i64, String);
+/// (message id, role, time_created, content, model) for user/assistant messages, in order.
+type MessageRow = (String, String, i64, String, Option<String>);
+
+/// Extract `provider/id` from an OpenCode assistant message envelope.
+///
+/// Returns None for user messages (no `model` key) and for empty ids, so
+/// "unknown" stays NULL rather than an empty string in the index.
+fn extract_model(data: &serde_json::Value, role: &str) -> Option<String> {
+    if role != "assistant" {
+        return None;
+    }
+    let model = data.get("model")?;
+    let id = model
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let provider = model
+        .get("providerID")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match provider {
+        Some(p) => Some(format!("{}/{}", p, id)),
+        None => Some(id.to_string()),
+    }
+}
 
 fn fetch_messages(conn: &Connection, session_id: &str) -> Result<Vec<MessageRow>> {
     let mut stmt = conn.prepare(
@@ -395,7 +444,8 @@ fn fetch_messages(conn: &Connection, session_id: &str) -> Result<Vec<MessageRow>
                     .unwrap_or(&[]);
                 OpenCodeIndexer::build_message_content(parts)
             };
-            Some((id, role, time_created, content))
+            let model = extract_model(&data, &role);
+            Some((id, role, time_created, content, model))
         })
         .collect();
     Ok(rows)
@@ -486,15 +536,35 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                ("m1".into(), "user".into(), 110, "question".into()),
+                ("m1".into(), "user".into(), 110, "question".into(), None),
                 (
                     "m3".into(),
                     "assistant".into(),
                     150,
-                    "answer\n[Tool: shell]\nls".into()
+                    "answer\n[Tool: shell]\nls".into(),
+                    None,
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn test_extract_model_provider_and_id() {
+        let data: serde_json::Value = serde_json::from_str(
+            r#"{"model":{"id":"muse-spark-1.3-contributor-free","providerID":"opencode","variant":"default"},"content":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_model(&data, "assistant").as_deref(),
+            Some("opencode/muse-spark-1.3-contributor-free")
+        );
+        // User messages never carry a model, even if the envelope has one.
+        assert_eq!(extract_model(&data, "user"), None);
+        let bare: serde_json::Value =
+            serde_json::from_str(r#"{"model":{"id":"gpt-5"},"content":[]}"#).unwrap();
+        assert_eq!(extract_model(&bare, "assistant").as_deref(), Some("gpt-5"));
+        let empty: serde_json::Value = serde_json::from_str(r#"{"content":[]}"#).unwrap();
+        assert_eq!(extract_model(&empty, "assistant"), None);
     }
 
     #[test]

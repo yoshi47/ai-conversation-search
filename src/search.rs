@@ -66,6 +66,15 @@ pub struct SearchResultRow {
     pub conversation_summary: Option<String>,
     pub conversation_file: Option<String>,
     pub source: Option<String>,
+    /// Model that produced the matched message (None for user messages/unknown).
+    pub model: Option<String>,
+    /// Distinct models used across the whole session (conversations.model).
+    pub conversation_model: Option<String>,
+    /// True when the hit is off the current (leaf-reachable) path. Always
+    /// false when the leaf is unknown. Populated post-query by
+    /// `annotate_abandoned`, never by SQL directly.
+    #[serde(default)]
+    pub is_abandoned: bool,
 }
 
 impl SearchResultRow {
@@ -84,6 +93,12 @@ impl SearchResultRow {
             conversation_summary: row.get("conversation_summary")?,
             conversation_file: row.get("conversation_file")?,
             source: row.get("source")?,
+            // Tolerant: older SELECTs and tests may not project these yet.
+            model: row.get::<_, Option<String>>("model").unwrap_or(None),
+            conversation_model: row
+                .get::<_, Option<String>>("conversation_model")
+                .unwrap_or(None),
+            is_abandoned: false,
         })
     }
 }
@@ -103,6 +118,7 @@ pub struct ConversationRow {
     pub message_count: i64,
     pub source: Option<String>,
     pub indexed_at: Option<String>,
+    pub model: Option<String>,
 }
 
 impl ConversationRow {
@@ -120,6 +136,8 @@ impl ConversationRow {
             message_count: row.get("message_count")?,
             source: row.get("source")?,
             indexed_at: row.get("indexed_at")?,
+            // Tolerant: partial SELECTs (e.g. load_context) don't project this.
+            model: row.get::<_, Option<String>>("model").unwrap_or(None),
         })
     }
 }
@@ -141,6 +159,7 @@ pub struct MessageRow {
     pub is_summarized: bool,
     pub is_tool_noise: bool,
     pub is_meta_conversation: bool,
+    pub model: Option<String>,
 }
 
 impl MessageRow {
@@ -160,6 +179,9 @@ impl MessageRow {
             is_summarized: row.get("is_summarized")?,
             is_tool_noise: row.get("is_tool_noise")?,
             is_meta_conversation: row.get("is_meta_conversation")?,
+            // Tolerant: SELECT * always has this post-migration, but a stale
+            // DB handle mid-migration may not.
+            model: row.get::<_, Option<String>>("model").unwrap_or(None),
         })
     }
 }
@@ -201,7 +223,57 @@ pub struct TreeNode {
     pub project_path: Option<String>,
     pub summary: Option<String>,
     pub full_content: String,
+    pub model: Option<String>,
+    /// True when the message is not on the current (leaf-reachable) path --
+    /// i.e. a rewound-away or retried branch that is kept for search but is
+    /// no longer live in the transcript. Always false when the leaf is
+    /// unknown (older transcripts, non-Claude sources).
+    #[serde(default)]
+    pub is_abandoned: bool,
     pub children: Vec<TreeNode>,
+}
+
+/// UUIDs on the live path: walk back from `leaf` via `parent_of`.
+/// Returns an empty set when `leaf` is unknown or not in the map, in which
+/// case callers must mark nothing abandoned.
+fn active_path_uuids(
+    parent_of: &HashMap<String, Option<String>>,
+    leaf: &str,
+) -> std::collections::HashSet<String> {
+    let mut active = std::collections::HashSet::new();
+    if !parent_of.contains_key(leaf) {
+        return active;
+    }
+    let mut cur = Some(leaf.to_string());
+    // Guard against a corrupt parent cycle: the walk can visit at most N+1.
+    let mut budget = parent_of.len() + 1;
+    while let Some(uuid) = cur {
+        if !active.insert(uuid.clone()) {
+            break;
+        }
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+        cur = parent_of.get(&uuid).and_then(|p| p.clone());
+    }
+    active
+}
+
+/// Mark nodes off the active path as abandoned. Returns the count marked.
+fn mark_abandoned(nodes: &mut [TreeNode], active: &std::collections::HashSet<String>) -> usize {
+    if active.is_empty() {
+        return 0;
+    }
+    let mut marked = 0;
+    for node in nodes.iter_mut() {
+        if !active.contains(&node.message_uuid) {
+            node.is_abandoned = true;
+            marked += 1;
+        }
+        marked += mark_abandoned(&mut node.children, active);
+    }
+    marked
 }
 
 /// Search statistics for verbose output.
@@ -818,7 +890,7 @@ impl ConversationSearch {
                 // path (OR + bm25): a 2-character term ORed against anything matches nearly
                 // the whole corpus, and without ranking that is pure noise. Deliberate.
                 let mut sql = String::from(
-                    "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
+                    "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, SUBSTR(m.full_content, 1, 500) as context_snippet, c.conversation_summary, c.conversation_file, c.source, m.model, c.model AS conversation_model FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.is_meta_conversation = FALSE"
                 );
 
                 for term in &terms {
@@ -836,6 +908,7 @@ impl ConversationSearch {
                 let mut rows = self.execute_search_typed(&sql, &params)?;
                 let truncated = rows.len() as i64 > limit;
                 rows.truncate(limit as usize);
+                self.annotate_abandoned(&mut rows);
                 let matched = rows.len() as i64;
                 let stats = self.gather_search_stats(filter, matched, truncated)?;
                 return Ok(SearchResult { rows, stats });
@@ -903,7 +976,7 @@ impl ConversationSearch {
 
             let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
             let mut sql = format!(
-                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, c.conversation_summary, c.conversation_file, c.source FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
+                "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, c.conversation_summary, c.conversation_file, c.source, m.model, c.model AS conversation_model FROM messages m JOIN conversations c ON m.session_id = c.session_id WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
                 placeholders
             );
 
@@ -1016,6 +1089,7 @@ impl ConversationSearch {
         for row in &mut all_results {
             row.context_snippet = extract_snippet(&row.context_snippet, &search_terms, 200);
         }
+        self.annotate_abandoned(&mut all_results);
         let matched = all_results.len() as i64;
         let stats = self.gather_search_stats(filter, matched, truncated)?;
         Ok(SearchResult {
@@ -1073,7 +1147,7 @@ impl ConversationSearch {
                     "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, \
                      m.message_type, m.project_path, m.depth, m.is_sidechain, \
                      SUBSTR(m.full_content, 1, 500) AS context_snippet, \
-                     c.conversation_summary, c.conversation_file, c.source, \
+                     c.conversation_summary, c.conversation_file, c.source, m.model, c.model AS conversation_model, \
                      ROW_NUMBER() OVER (PARTITION BY m.session_id ORDER BY m.timestamp DESC) AS rn, \
                      COUNT(*) OVER (PARTITION BY m.session_id) AS match_count \
                      FROM messages m JOIN conversations c ON m.session_id = c.session_id \
@@ -1106,6 +1180,7 @@ impl ConversationSearch {
 
                 let truncated = rows.len() as i64 > limit;
                 rows.truncate(limit_usize);
+                self.annotate_grouped_abandoned(&mut rows);
                 let matched_total: i64 = rows.iter().map(|g| g.match_count).sum();
                 let stats = self.gather_search_stats(filter, matched_total, truncated)?;
                 return Ok(GroupedSearchResult { rows, stats });
@@ -1161,7 +1236,7 @@ impl ConversationSearch {
             let mut sql = format!(
                 "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, m.timestamp, m.message_type, \
                  m.project_path, m.depth, m.is_sidechain, m.full_content as context_snippet, \
-                 c.conversation_summary, c.conversation_file, c.source \
+                 c.conversation_summary, c.conversation_file, c.source, m.model, c.model AS conversation_model \
                  FROM messages m JOIN conversations c ON m.session_id = c.session_id \
                  WHERE m.rowid IN ({}) AND m.is_meta_conversation = FALSE",
                 placeholders
@@ -1252,7 +1327,7 @@ impl ConversationSearch {
         // comparison below is exact rather than a lower bound.
         let truncated = order.len() > limit_usize;
         order.truncate(limit_usize);
-        let rows: Vec<GroupedRow> = order
+        let mut rows: Vec<GroupedRow> = order
             .into_iter()
             .map(|sid| {
                 let (rep, count) = session_data.remove(&sid).expect(
@@ -1264,6 +1339,7 @@ impl ConversationSearch {
                 }
             })
             .collect();
+        self.annotate_grouped_abandoned(&mut rows);
 
         let stats = self.gather_search_stats(filter, total_matched_messages, truncated)?;
         Ok(GroupedSearchResult { rows, stats })
@@ -1411,7 +1487,7 @@ impl ConversationSearch {
             "SELECT m.rowid AS message_rowid, m.message_uuid, m.session_id, m.parent_uuid, \
                     m.timestamp, m.message_type, m.project_path, m.depth, m.is_sidechain, \
                     c.conversation_summary AS context_snippet, \
-                    c.conversation_summary, c.conversation_file, c.source \
+                    c.conversation_summary, c.conversation_file, c.source, m.model, c.model AS conversation_model \
              FROM conversations c \
              JOIN messages m ON m.message_uuid = ( \
                  SELECT m2.message_uuid FROM messages m2 \
@@ -1721,13 +1797,38 @@ impl ConversationSearch {
             return Self::get_conversation_tree_from_raw(session_id, conversation);
         }
 
-        let tree = Self::build_tree(&messages);
+        let mut tree = Self::build_tree(&messages);
+
+        // Mark rewound-away branches. Leaf comes from `last-prompt` rows;
+        // when it is missing (old transcripts, non-Claude sources) nothing
+        // is marked rather than risking false positives.
+        let warning = {
+            let parent_of: HashMap<String, Option<String>> = messages
+                .iter()
+                .map(|m| (m.message_uuid.clone(), m.parent_uuid.clone()))
+                .collect();
+            let active = conversation
+                .as_ref()
+                .and_then(|c| c.leaf_message_uuid.as_deref())
+                .map(|leaf| active_path_uuids(&parent_of, leaf))
+                .unwrap_or_default();
+            let abandoned = mark_abandoned(&mut tree, &active);
+            if abandoned > 0 {
+                Some(format!(
+                    "{} of {} messages are off the current path (rewound/retried branches, marked is_abandoned) but kept for search",
+                    abandoned,
+                    messages.len()
+                ))
+            } else {
+                None
+            }
+        };
 
         Ok(ConversationTree {
             conversation,
             tree,
             total_messages: messages.len(),
-            warning: None,
+            warning,
             error: None,
         })
     }
@@ -1768,7 +1869,7 @@ impl ConversationSearch {
         };
 
         let path = std::path::Path::new(&conversation_file);
-        let (_, raw_messages, skipped_lines) =
+        let (raw_meta, raw_messages, skipped_lines) =
             match ConversationIndexer::parse_conversation_file_raw(path) {
                 Ok(parsed) => parsed,
                 Err(e) => {
@@ -1806,8 +1907,25 @@ impl ConversationSearch {
             return Ok(Self::raw_tree_error(conv, &reason));
         }
 
-        let tree =
+        let mut tree =
             Self::build_tree_from_raw_messages(&messages, conv.project_path.as_deref(), session_id);
+
+        // Same abandoned marking as the DB path. Prefer the freshly parsed
+        // leaf (the DB row may predate `last-prompt` tracking and hold NULL).
+        let abandoned_count = {
+            let parent_of: HashMap<String, Option<String>> = messages
+                .iter()
+                .map(|m| (m.uuid.clone(), m.parent_uuid.clone()))
+                .collect();
+            let leaf = conv
+                .leaf_message_uuid
+                .as_deref()
+                .or_else(|| raw_meta.as_ref().and_then(|m| m.leaf_uuid.as_deref()));
+            let active = leaf
+                .map(|l| active_path_uuids(&parent_of, l))
+                .unwrap_or_default();
+            mark_abandoned(&mut tree, &active)
+        };
 
         let mut warning = if conv.message_count == 0 {
             // Resume handling can legitimately attribute all of a session's
@@ -1827,6 +1945,13 @@ impl ConversationSearch {
             warning.push_str(&format!(
                 " {} malformed line(s) were skipped; the transcript may be partially unreadable.",
                 skipped_lines
+            ));
+        }
+        if abandoned_count > 0 {
+            warning.push_str(&format!(
+                " {} of {} messages are off the current path (rewound/retried branches, marked is_abandoned) but kept for search.",
+                abandoned_count,
+                messages.len()
             ));
         }
 
@@ -1914,6 +2039,8 @@ impl ConversationSearch {
                     .filter(|s| !s.trim().is_empty())
                     .or_else(|| Some(summary_from_content(&msg.full_content))),
                 full_content: msg.full_content.clone(),
+                model: msg.model.clone(),
+                is_abandoned: false,
                 children,
             }
         }
@@ -1992,6 +2119,8 @@ impl ConversationSearch {
                 project_path: project_path.map(str::to_string),
                 summary: Some(summary_from_content(&msg.content)),
                 full_content: msg.content.clone(),
+                model: msg.model.clone(),
+                is_abandoned: false,
                 children,
             }
         }
@@ -2136,6 +2265,110 @@ impl ConversationSearch {
                 |row| row.get(0),
             )
             .ok()
+    }
+
+    /// Active (leaf-reachable) UUID sets per session, for sessions with a
+    /// known leaf. Sessions with an unknown leaf are absent: callers must
+    /// leave those rows unmarked rather than risking false positives.
+    fn active_sets_for_sessions(
+        &self,
+        session_ids: &[String],
+    ) -> HashMap<String, std::collections::HashSet<String>> {
+        let mut out: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
+        if session_ids.is_empty() {
+            return out;
+        }
+        let placeholders = session_ids
+            .iter()
+            .map(|_| "?")
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT session_id, leaf_message_uuid FROM conversations WHERE session_id IN ({})",
+            placeholders
+        );
+        let owned: Vec<String> = session_ids.to_vec();
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = owned
+            .iter()
+            .map(|p| p as &dyn rusqlite::types::ToSql)
+            .collect();
+        let leaves: HashMap<String, Option<String>> = self
+            .query_rows(&sql, &param_refs, |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        for session_id in session_ids {
+            let leaf = leaves.get(session_id).and_then(|l| l.as_deref());
+            let Some(leaf) = leaf else { continue };
+            let parent_of: HashMap<String, Option<String>> = self
+                .query_rows(
+                    "SELECT message_uuid, parent_uuid FROM messages WHERE session_id = ?",
+                    &[session_id as &dyn rusqlite::types::ToSql],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
+            if parent_of.is_empty() {
+                continue;
+            }
+            let active = active_path_uuids(&parent_of, leaf);
+            if !active.is_empty() {
+                out.insert(session_id.clone(), active);
+            }
+        }
+        out
+    }
+
+    /// Fill `is_abandoned` on search hits without extra per-row cost.
+    ///
+    /// Batches by session: one `IN` query for leaves, then one parent-map
+    /// query per session that has a known leaf. Sessions with an unknown
+    /// leaf (old transcripts, non-Claude sources) keep `false` rather than
+    /// risking false positives. Best-effort: any query error leaves the
+    /// flags untouched so search never fails because of a badge.
+    pub fn annotate_abandoned(&self, rows: &mut [SearchResultRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut session_ids: Vec<String> = rows.iter().map(|r| r.session_id.clone()).collect();
+        session_ids.sort();
+        session_ids.dedup();
+        let active_sets = self.active_sets_for_sessions(&session_ids);
+        if active_sets.is_empty() {
+            return;
+        }
+        for row in rows.iter_mut() {
+            if let Some(active) = active_sets.get(&row.session_id) {
+                row.is_abandoned = !active.contains(&row.message_uuid);
+            }
+        }
+    }
+
+    /// Same as `annotate_abandoned` for grouped results (flags live on the
+    /// representative row, which serde-flattens into the grouped JSON shape).
+    pub fn annotate_grouped_abandoned(&self, rows: &mut [GroupedRow]) {
+        if rows.is_empty() {
+            return;
+        }
+        let mut session_ids: Vec<String> = rows
+            .iter()
+            .map(|g| g.representative.session_id.clone())
+            .collect();
+        session_ids.sort();
+        session_ids.dedup();
+        let active_sets = self.active_sets_for_sessions(&session_ids);
+        if active_sets.is_empty() {
+            return;
+        }
+        for grouped in rows.iter_mut() {
+            if let Some(active) = active_sets.get(&grouped.representative.session_id) {
+                grouped.representative.is_abandoned =
+                    !active.contains(&grouped.representative.message_uuid);
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -5255,6 +5488,184 @@ mod tests {
             content,
             None,
         );
+    }
+
+    #[test]
+    fn test_tree_marks_rewound_branch_abandoned_but_keeps_it() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess-rewind",
+            "/proj",
+            "rewind test",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        // root -> old (rewound away) and root -> new (live leaf).
+        insert_test_message(
+            &conn,
+            "root",
+            "sess-rewind",
+            "root",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        conn.execute(
+            "INSERT INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, ?, FALSE, 1, ?, ?, ?, 'test.jsonl', ?, FALSE, FALSE)",
+            rusqlite::params!["old", "sess-rewind", "root", "2025-01-15T10:01:00", "assistant", "/proj", "old attempt"],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, ?, FALSE, 1, ?, ?, ?, 'test.jsonl', ?, FALSE, FALSE)",
+            rusqlite::params!["new", "sess-rewind", "root", "2025-01-15T10:02:00", "assistant", "/proj", "retry"],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE conversations SET leaf_message_uuid = 'new', message_count = 3 WHERE session_id = 'sess-rewind'",
+            [],
+        )
+        .unwrap();
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-rewind").unwrap();
+
+        assert!(result.error.is_none(), "error: {:?}", result.error);
+        assert_eq!(result.total_messages, 3);
+        // Both branches stay in the tree for search...
+        fn find<'a>(nodes: &'a [TreeNode], uuid: &str) -> Option<&'a TreeNode> {
+            for n in nodes {
+                if n.message_uuid == uuid {
+                    return Some(n);
+                }
+                if let Some(hit) = find(&n.children, uuid) {
+                    return Some(hit);
+                }
+            }
+            None
+        }
+        assert!(find(&result.tree, "old").unwrap().is_abandoned);
+        assert!(!find(&result.tree, "new").unwrap().is_abandoned);
+        assert!(!find(&result.tree, "root").unwrap().is_abandoned);
+        // ...and the warning says so.
+        let warning = result.warning.expect("rewound branch must warn");
+        assert!(warning.contains("1 of 3"), "got: {}", warning);
+        assert!(warning.contains("is_abandoned"), "got: {}", warning);
+    }
+
+    #[test]
+    fn test_tree_without_leaf_marks_nothing() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess-noleaf",
+            "/proj",
+            "no leaf",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "root",
+            "sess-noleaf",
+            "root",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        // leaf_message_uuid stays NULL: old transcript, unknown live path.
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-noleaf").unwrap();
+
+        assert!(result.error.is_none());
+        assert!(
+            result.warning.is_none(),
+            "no false positives without a leaf"
+        );
+        assert!(!result.tree[0].is_abandoned);
+    }
+
+    #[test]
+    fn test_annotate_abandoned_flags_only_off_path_hits() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess-ann",
+            "/proj",
+            "annotate test",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "claude_code",
+        );
+        insert_test_message(
+            &conn,
+            "root",
+            "sess-ann",
+            "root body",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        for (uuid, body, ts) in [
+            ("old", "old attempt body", "2025-01-15T10:01:00"),
+            ("new", "retry body", "2025-01-15T10:02:00"),
+        ] {
+            conn.execute(
+                "INSERT INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise) VALUES (?, ?, ?, FALSE, 1, ?, ?, ?, 'test.jsonl', ?, FALSE, FALSE)",
+                rusqlite::params![uuid, "sess-ann", "root", ts, "assistant", "/proj", body],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "UPDATE conversations SET leaf_message_uuid = 'new', message_count = 3 WHERE session_id = 'sess-ann'",
+            [],
+        )
+        .unwrap();
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let mut rows = vec![
+            SearchResultRow {
+                rowid: 1,
+                message_uuid: "old".to_string(),
+                session_id: "sess-ann".to_string(),
+                parent_uuid: Some("root".to_string()),
+                timestamp: "2025-01-15T10:01:00".to_string(),
+                message_type: "assistant".to_string(),
+                project_path: Some("/proj".to_string()),
+                depth: 1,
+                is_sidechain: false,
+                context_snippet: "old".to_string(),
+                conversation_summary: None,
+                conversation_file: None,
+                source: Some("claude_code".to_string()),
+                model: None,
+                conversation_model: None,
+                is_abandoned: false,
+            },
+            SearchResultRow {
+                rowid: 2,
+                message_uuid: "new".to_string(),
+                session_id: "sess-ann".to_string(),
+                parent_uuid: Some("root".to_string()),
+                timestamp: "2025-01-15T10:02:00".to_string(),
+                message_type: "assistant".to_string(),
+                project_path: Some("/proj".to_string()),
+                depth: 1,
+                is_sidechain: false,
+                context_snippet: "new".to_string(),
+                conversation_summary: None,
+                conversation_file: None,
+                source: Some("claude_code".to_string()),
+                model: None,
+                conversation_model: None,
+                is_abandoned: false,
+            },
+        ];
+        searcher.annotate_abandoned(&mut rows);
+        assert!(rows[0].is_abandoned, "rewound hit must be flagged");
+        assert!(!rows[1].is_abandoned, "live hit must not be flagged");
     }
 
     #[test]

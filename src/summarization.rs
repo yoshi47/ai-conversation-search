@@ -313,6 +313,7 @@ mod tests {
             content: content.to_string(),
             session_id: Some("test-session".to_string()),
             is_meta_conversation: false,
+            model: None,
         }
     }
 
