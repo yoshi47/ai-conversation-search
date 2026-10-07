@@ -12,6 +12,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - rewind/retry で分岐した旧枝を現行パスと区別するようにした。Claude Code の `last-prompt` 行の最終 `leafUuid` を `conversations.leaf_message_uuid` に保存し（旧形式の先頭行 `summary` も継続対応、空値は無視）、leaf から遡れない枝を `is_abandoned: true` で保持する。`tree` は該当ノードに `[rewound]` と警告文、`preview` は現行パスの末尾だけ返し（隠した分を警告に明記）、`search`（`--group-by-session` 含む）は既定で全件＋`is_abandoned` 付与、`--active-only` で破棄枝を除外できる。leaf 不明時（旧索引・非Claude等）は誤判定を避けて何も付けない。既存 DB の NULL leaf は mtime スキップ時に軽量スキャンで徐々に埋める（`--force` 不要）
 
+- 索引DBが自分より新しい書き込み側の版を要求しているとき（`PRAGMA user_version`）、黙って失敗せず、plugin／wrapper の更新を促すエラーで止まるようにした。後方互換なマイグレーションでは止めない。0.18.0 以前のバイナリにはこの検査がない
+- バックグラウンド索引の stderr を `~/.conversation-search/background-index.log` に追記するようにした（64KB を超えたら作り直す）。直近の実行が失敗していれば `status` に出す。`index --quiet` でもファイル単位の索引エラーを表示する。0.18.0 以前が起動したバックグラウンド索引の失敗は、従来どおりどこにも残らない
+
+### Fixed
+
+- 0.17.0 以前と索引DBを共有していると、0.18.0 が移行したDBへの旧版の書き込みがすべて `no such function: bigram_analyze` で失敗し、最近の会話が検索に出なくなっていた。hook はバックグラウンドで stderr を捨てるため、失敗は表に出ていなかった。FTS 同期トリガーを SQL だけにし、bigram 化は待ち行列（`message_bigram_pending`）に積んで、新版の `index` の終わりにまとめて処理するようにした（マイグレーション 16）。旧版の書き込みは成功し、その行は次に新版の index が走るまで 2 文字検索に出ないだけになる。`model` 列だけの UPDATE では FTS を作り直さないようにした
+  - 必要な対応: なし。新版で一度 index が走れば、失敗していた会話は次の索引で取り込まれる（Claude Code・Codex は失敗分の同期状態を記録していない。OpenCode は定期の全量索引が拾う）
+  - マイグレーション 10 より前に索引した行の bigram は、従来どおり `backfill-bigram` で埋める
+  - 0.18.0 に戻しても書き込みは成功する。ただし待ち行列は処理されないので、その間に書いた行は 2 文字検索に出ない（0.18.0 の `backfill-bigram` で埋まる）
+  - 旧版の `prune-observer` がトリガーを古い形に戻しても、新版の次の index で直す
+
 ## [0.18.0] - 2026-10-04
 
 ### Added

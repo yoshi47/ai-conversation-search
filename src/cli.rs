@@ -21,6 +21,11 @@ const FULL_INDEX_TTL_SECS: u64 = 86400;
 const HOOK_INDEX_TTL_SECS: u64 = 60;
 const STAMP_FILE_PATH: &str = "~/.conversation-search/.last-auto-index";
 const FULL_STAMP_FILE_PATH: &str = "~/.conversation-search/.last-full-index";
+/// stderr of the detached indexer: the hook spawns it with no terminal, so without this
+/// file its errors are lost.
+const BACKGROUND_LOG_PATH: &str = "~/.conversation-search/background-index.log";
+const BACKGROUND_LOG_MAX_BYTES: u64 = 64 * 1024;
+const BACKGROUND_LOG_HEADER: &str = "--- background index";
 
 fn source_label(source: &str) -> &str {
     SOURCE_LABELS
@@ -466,6 +471,15 @@ fn index_other_sources(days_back: Option<i64>, quiet: bool) {
     }
 }
 
+/// Analyze the rows the FTS triggers queued for the bigram table during this run,
+/// including rows written by older binaries, which queue but never drain. A failure only delays 2-char search for those
+/// rows: the queue keeps them for the next run.
+fn drain_bigram_queue(indexer: &ConversationIndexer) {
+    if let Err(e) = crate::schema::drain_bigram_pending(indexer.connection()) {
+        eprintln!("Warning: bigram queue drain failed: {}", e);
+    }
+}
+
 fn touch_stamp_file() {
     touch_stamp_at(&db::expand_path(STAMP_FILE_PATH));
 }
@@ -549,11 +563,64 @@ fn try_background_index(incremental_ttl_override: Option<u64>) -> Option<()> {
         cmd.args(["index", "--days", "1", "--quiet"]);
     }
     cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    let log = open_background_log(&db::expand_path(BACKGROUND_LOG_PATH), needs_full);
+    let mut spawn_err_log = log.as_ref().and_then(|f| f.try_clone().ok());
+    cmd.stderr(log.map_or_else(std::process::Stdio::null, std::process::Stdio::from));
     cmd.stdin(std::process::Stdio::null());
 
-    let _ = cmd.spawn();
+    if let Err(e) = cmd.spawn() {
+        if let Some(f) = spawn_err_log.as_mut() {
+            use std::io::Write;
+            let _ = writeln!(f, "Error: failed to start background index: {}", e);
+        }
+    }
     Some(())
+}
+
+/// Open the background-index log for appending, after writing this run's header.
+///
+/// Append rather than truncate-per-run: spawns overlap (several sessions, several
+/// installed versions), and truncating under a running child would punch a hole in its
+/// output and erase the failure `status` is meant to surface. Rotation renames instead,
+/// so a child still writing keeps its output in `.1`; `status` then misses it until the
+/// next run, accepted at one rotation per 64KB.
+fn open_background_log(path: &std::path::Path, full: bool) -> Option<std::fs::File> {
+    use std::io::Write;
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > BACKGROUND_LOG_MAX_BYTES) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()?;
+    let _ = writeln!(
+        file,
+        "{} {} v{} ({})",
+        BACKGROUND_LOG_HEADER,
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+        env!("CARGO_PKG_VERSION"),
+        if full { "full" } else { "incremental" }
+    );
+    Some(file)
+}
+
+/// The header line of the most recent run in the background-index log and that run's
+/// failure lines, or `None` when it reported none.
+///
+/// A heuristic: lines are matched by wording, and overlapping runs can interleave
+/// under the last header.
+fn last_background_failures(log: &str) -> Option<(&str, Vec<&str>)> {
+    let last_run = log.rfind(BACKGROUND_LOG_HEADER).map_or(log, |i| &log[i..]);
+    let mut lines = last_run.lines();
+    let header = lines.next().unwrap_or_default();
+    let failures: Vec<&str> = lines
+        .filter(|l| {
+            let l = l.to_ascii_lowercase();
+            l.contains("error") || l.contains("failed") || l.contains("panicked")
+        })
+        .collect();
+    (!failures.is_empty()).then_some((header, failures))
 }
 
 /// Normalise `session_id` into the stem a Claude Code transcript would carry, or `None`
@@ -871,6 +938,7 @@ fn cmd_init(days: i64, force: bool, quiet: bool) -> Result<()> {
     }
 
     index_other_sources(Some(days), quiet);
+    drain_bigram_queue(&indexer);
     touch_stamp_file();
     touch_stamp_at(&db::expand_path(FULL_STAMP_FILE_PATH));
 
@@ -933,10 +1001,10 @@ fn cmd_index(days: i64, all: bool, force: bool, quiet: bool) -> Result<()> {
                         .unwrap_or_default()
                 );
             }
+            // Even under --quiet: the background indexer runs quiet, and its stderr is
+            // the only record that a write failed.
             if let Err(e) = indexer.index_conversation(&conv_file) {
-                if !quiet {
-                    eprintln!("\nError indexing {}: {}", conv_file.display(), e);
-                }
+                eprintln!("\nError indexing {}: {}", conv_file.display(), e);
             }
         }
         if !quiet {
@@ -946,6 +1014,7 @@ fn cmd_index(days: i64, all: bool, force: bool, quiet: bool) -> Result<()> {
 
     let other_days = if all { Some(9999i64) } else { Some(days) };
     index_other_sources(other_days, quiet);
+    drain_bigram_queue(&indexer);
     touch_stamp_file();
     if all {
         touch_stamp_at(&db::expand_path(FULL_STAMP_FILE_PATH));
@@ -1080,9 +1149,11 @@ fn cmd_backfill_bigram(dry_run: bool) -> Result<()> {
     // init_schema first: on a pre-10 database this creates the bigram table
     // and repairs the triggers (recording migration 10), so the fill below
     // sees the post-migration shape. It also registers `bigram_analyze`,
-    // which the fill statement calls.
+    // which the fill statement calls. Drain first, or queued rows count as
+    // missing and get analyzed twice.
     let conn = db::connect(db::DEFAULT_DB_PATH, false)?;
     crate::schema::init_schema(&conn)?;
+    crate::schema::drain_bigram_pending(&conn)?;
 
     let missing = crate::schema::count_bigram_missing(&conn)?;
     if dry_run {
@@ -1110,8 +1181,20 @@ fn cmd_status(json_output: bool) -> Result<()> {
     let files_on_disk = count_conversation_files_on_disk();
     let status = search.get_index_status(files_on_disk)?;
 
+    let log_path = db::expand_path(BACKGROUND_LOG_PATH);
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let background = last_background_failures(&log);
+
     if json_output {
-        let json_val = serde_json::to_value(&status)?;
+        let mut json_val = serde_json::to_value(&status)?;
+        json_val["background_index_failures"] = match &background {
+            Some((run, failures)) => serde_json::json!({
+                "log": log_path.display().to_string(),
+                "run": run.trim_start_matches(BACKGROUND_LOG_HEADER).trim(),
+                "lines": failures,
+            }),
+            None => serde_json::Value::Null,
+        };
         let localized = localize_timestamps(json_val);
         println!("{}", serde_json::to_string_pretty(&localized)?);
         return Ok(());
@@ -1170,6 +1253,16 @@ fn cmd_status(json_output: bool) -> Result<()> {
     let unindexed = status.files_on_disk as i64 - status.indexed_files;
     if unindexed > 0 {
         eprintln!("  \u{26a0} {} files not indexed. Run 'ai-conversation-search index --all' to include them.", unindexed);
+    }
+
+    if let Some((run, failures)) = background {
+        eprintln!(
+            "\n\u{26a0} The last background index ({}) reported {} failure(s), e.g.: {}\n  Full log: {}",
+            run.trim_start_matches(BACKGROUND_LOG_HEADER).trim(),
+            failures.len(),
+            failures[0].trim(),
+            log_path.display()
+        );
     }
 
     Ok(())
@@ -2959,6 +3052,36 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    #[test]
+    fn test_last_background_failures_reads_only_the_latest_run() {
+        let log = format!(
+            "{h} 2026-10-07 10:00:00 v0.18.0 (incremental)\n\
+             Error: Database error: no such function: bigram_analyze\n\
+             {h} 2026-10-07 10:05:00 v0.19.0 (incremental)\n\
+             Warning: OBSERVER flag unrecognised\n\
+             \nError indexing /a.jsonl: disk full\n\
+             Warning: failed to index Codex CLI conversations: locked\n\
+             thread 'main' panicked at src/indexer/claude_code.rs:1:1:\n",
+            h = BACKGROUND_LOG_HEADER
+        );
+        let (run, failures) = last_background_failures(&log).unwrap();
+        assert!(run.contains("v0.19.0"), "{}", run);
+        assert_eq!(
+            failures,
+            vec![
+                "Error indexing /a.jsonl: disk full",
+                "Warning: failed to index Codex CLI conversations: locked",
+                "thread 'main' panicked at src/indexer/claude_code.rs:1:1:",
+            ]
+        );
+        let clean = format!(
+            "{} 2026-10-07 10:05:00 v0.19.0 (full)\n",
+            BACKGROUND_LOG_HEADER
+        );
+        assert!(last_background_failures(&clean).is_none());
+        assert!(last_background_failures("").is_none());
+    }
+
     fn unique_stamp_path(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("conv-search-{}-{}", name, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -3006,9 +3129,6 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute_batch(include_str!("../data/schema.sql"))
             .unwrap();
-        // Triggers call `bigram_analyze`; schema.sql alone does not register it
-        // (production gets it via `db::connect`, other tests via `init_schema`).
-        crate::bigram::register_sql_function(&conn).unwrap();
         conn.execute(
             "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content)
              VALUES (?, 'sess1', 0, '2025-01-15T10:00:00', 'user', '/proj', ?)",
@@ -3406,8 +3526,6 @@ mod tests {
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute_batch(include_str!("../data/schema.sql"))
             .unwrap();
-        // See `search_with_message`: triggers need the scalar function.
-        crate::bigram::register_sql_function(&conn).unwrap();
         conn
     }
 

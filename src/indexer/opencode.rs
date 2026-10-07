@@ -198,7 +198,8 @@ impl OpenCodeIndexer {
                     }
                 }
                 Err(e) => {
-                    self.log(&format!("  Error indexing session {}: {}", id, e));
+                    // Even under --quiet: the background indexer's stderr is its only record.
+                    eprintln!("  Error indexing session {}: {}", id, e);
                 }
             }
         }

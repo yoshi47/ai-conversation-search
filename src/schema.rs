@@ -8,32 +8,45 @@ const SCHEMA_SQL: &str = include_str!("../data/schema.sql");
 /// `message_content_bigram_fts` in sync with `messages`.
 ///
 /// Must stay identical to the copy in data/schema.sql, which is what fresh databases
-/// get; `test_migration_triggers_match_schema_sql` enforces that. Migrations 9 and 10
-/// recreate the triggers from here, since `CREATE TRIGGER IF NOT EXISTS` cannot
-/// update an existing database.
+/// get; `test_migration_triggers_match_schema_sql` enforces that. Migrations 9, 10 and 16,
+/// the trigger repair in `init_schema` and prune-observer recreate the triggers from here,
+/// since `CREATE TRIGGER IF NOT EXISTS` cannot update an existing database.
 pub const FTS_SYNC_TRIGGERS: &str = "
     CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
         INSERT INTO message_content_fts(rowid, message_uuid, full_content)
         VALUES (new.rowid, new.message_uuid, new.full_content);
-        INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
-        VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
+        INSERT OR IGNORE INTO message_bigram_pending(msg_rowid) VALUES (new.rowid);
     END;
 
     CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
         INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
         VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
         DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
+        DELETE FROM message_bigram_pending WHERE msg_rowid = old.rowid;
     END;
 
-    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+    CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF full_content, message_uuid ON messages BEGIN
         INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
         VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
         INSERT INTO message_content_fts(rowid, message_uuid, full_content)
         VALUES (new.rowid, new.message_uuid, new.full_content);
         DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
-        INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
-        VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
+        INSERT OR IGNORE INTO message_bigram_pending(msg_rowid) VALUES (new.rowid);
     END;";
+
+/// Oldest schema a writer must understand, stored in `PRAGMA user_version`.
+///
+/// Why not refuse whenever the DB has a migration this binary does not know: most
+/// migrations (new columns, indexes) leave older writers working, and refusing on them
+/// would break every session that outlives a plugin update. Raise this only for a
+/// migration that makes writes from older binaries unsafe, as migration 10 did.
+/// 16 is the first schema whose writers check it; binaries before that ignore
+/// `user_version`, so today it gates nothing.
+const MIN_WRITER_SCHEMA: i64 = 16;
+
+/// Rows analyzed per transaction by `drain_bigram_pending`, so a long backlog never
+/// holds the write lock for the whole run.
+const BIGRAM_DRAIN_BATCH: usize = 2000;
 
 /// Migration kinds.
 enum MigrationKind {
@@ -132,6 +145,11 @@ const MIGRATIONS: &[(i64, &str, MigrationKind)] = &[
         "clear sync state to backfill models",
         MigrationKind::Custom,
     ),
+    (
+        16,
+        "queue bigram indexing instead of calling bigram_analyze in triggers",
+        MigrationKind::Custom,
+    ),
 ];
 
 /// Initialize the database schema and run migrations.
@@ -144,13 +162,26 @@ const MIGRATIONS: &[(i64, &str, MigrationKind)] = &[
 /// 3. Bootstrap: detect already-applied migrations in existing DBs (no schema_version yet).
 /// 4. Run any unapplied migrations (adding columns, tables, indexes, FTS changes).
 /// 5. Re-run schema.sql to ensure all indexes/triggers exist (now that columns are present).
+/// 6. Repair FTS triggers an older binary reverted, then raise `user_version`.
+///
+/// Before step 1, refuse a DB whose `user_version` requires a newer writer.
 pub fn init_schema(conn: &Connection) -> Result<()> {
-    // The FTS sync triggers call `bigram_analyze`, so the function must exist
-    // before any write fires them -- including writes made by migrations and
-    // by test helpers that insert directly. Production connections also get it
-    // via `db::connect`; registering twice on the same connection is harmless
-    // (it replaces the previous definition).
+    // For `drain_bigram_pending` / `fill_bigram_missing` on connections that did not
+    // come from `db::connect` (tests, in-memory). Registering twice is harmless.
     crate::bigram::register_sql_function(conn)?;
+
+    // Before the first write below: the schema.sql pass already writes.
+    let required_writer: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+    let latest = latest_known_migration();
+    if required_writer > latest {
+        return Err(AppError::General(format!(
+            "the index at {} needs a newer ai-conversation-search (schema {} or later; \
+             this binary knows up to {}). Update the plugin or the wrapper, then restart the session.",
+            conn.path().unwrap_or("<in-memory>"),
+            required_writer,
+            latest
+        )));
+    }
 
     // First pass: create base tables. Errors from indexes on missing columns are expected
     // for pre-migration databases and will be resolved after migrations run.
@@ -183,7 +214,33 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Second pass: now that all migrations have run, ensure all indexes/triggers exist
     conn.execute_batch(SCHEMA_SQL)?;
 
+    // An older binary's prune-observer recreates `messages_ad` without the queue cleanup.
+    // Migration 16 is already recorded and will not rerun, so check the shape every time.
+    if !fts_triggers_use_pending_queue(conn)? {
+        eprintln!("Repairing FTS sync triggers reverted by an older ai-conversation-search");
+        migrate_bigram_pending_queue(conn)?;
+    }
+
+    if required_writer < MIN_WRITER_SCHEMA {
+        conn.execute_batch(&format!("PRAGMA user_version = {};", MIN_WRITER_SCHEMA))?;
+    }
+
     Ok(())
+}
+
+fn latest_known_migration() -> i64 {
+    MIGRATIONS.last().map_or(0, |m| m.0)
+}
+
+fn fts_triggers_use_pending_queue(conn: &Connection) -> Result<bool> {
+    let current: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger'
+         AND name IN ('messages_ai', 'messages_ad', 'messages_au')
+         AND sql LIKE '%message_bigram_pending%'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(current == 3)
 }
 
 fn ensure_schema_version_table(conn: &Connection) -> Result<()> {
@@ -300,6 +357,8 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bo
         // The bigram triggers feed `message_content_bigram_fts`; the pre-10
         // `messages_ai` body only touches `message_content_fts`.
         10 => ("trigger", "messages_ai", "bigram"),
+        // Pre-16 `messages_ai` called `bigram_analyze` instead of queueing.
+        16 => ("trigger", "messages_ai", "message_bigram_pending"),
         // Data-only migration: a fresh DB has empty (or absent) sync tables,
         // so there is nothing to backfill and it counts as applied.
         15 => return Ok(sync_tables_empty_for_model_backfill(conn)),
@@ -474,6 +533,43 @@ pub fn fill_bigram_missing(conn: &Connection) -> Result<usize> {
     Ok(filled)
 }
 
+/// Build bigram entries for rows queued by the FTS sync triggers.
+///
+/// Runs in batches of `BIGRAM_DRAIN_BATCH`, one IMMEDIATE transaction each, so a
+/// long backlog never blocks other writers for the whole run; each batch removes
+/// only the queue rows it read. Queue rows whose message is gone (deleted with the trigger
+/// dropped, as prune-observer does) drop out of the JOIN and are just cleared.
+/// Returns the number of bigram entries written.
+pub fn drain_bigram_pending(conn: &Connection) -> Result<usize> {
+    let mut filled = 0;
+    loop {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS temp.bigram_batch;
+             CREATE TEMP TABLE bigram_batch AS
+             SELECT msg_rowid FROM message_bigram_pending LIMIT {};",
+            BIGRAM_DRAIN_BATCH
+        ))?;
+        filled += tx.execute(
+            "INSERT OR REPLACE INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
+             SELECT m.rowid, m.message_uuid, bigram_analyze(m.full_content)
+             FROM temp.bigram_batch b JOIN messages m ON m.rowid = b.msg_rowid",
+            [],
+        )?;
+        let batch = tx.execute(
+            "DELETE FROM message_bigram_pending
+             WHERE msg_rowid IN (SELECT msg_rowid FROM temp.bigram_batch)",
+            [],
+        )?;
+        tx.execute_batch("DROP TABLE temp.bigram_batch;")?;
+        tx.commit()?;
+        if batch < BIGRAM_DRAIN_BATCH {
+            return Ok(filled);
+        }
+    }
+}
+
 /// Run custom migration by version.
 fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
     match version {
@@ -481,6 +577,7 @@ fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
         9 => migrate_fix_fts_delete_triggers(conn),
         10 => migrate_add_bigram_fts(conn),
         15 => clear_sync_state_for_model_backfill(conn),
+        16 => migrate_bigram_pending_queue(conn),
         v => unreachable!("unhandled custom migration version: {}", v),
     }
 }
@@ -520,6 +617,24 @@ fn migrate_add_bigram_fts(conn: &Connection) -> Result<()> {
     tx.execute_batch("DROP TRIGGER IF EXISTS messages_ai;")?;
     tx.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
     tx.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
+    tx.execute_batch(FTS_SYNC_TRIGGERS)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Make the FTS sync triggers pure SQL, queueing bigram work in `message_bigram_pending`.
+///
+/// No rows are queued here: under the pre-16 triggers a write either filled its bigram
+/// entry or failed and rolled back as a whole. Rows older than migration 10 remain
+/// `backfill-bigram`'s job.
+fn migrate_bigram_pending_queue(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS message_bigram_pending (msg_rowid INTEGER PRIMARY KEY);
+         DROP TRIGGER IF EXISTS messages_ai;
+         DROP TRIGGER IF EXISTS messages_ad;
+         DROP TRIGGER IF EXISTS messages_au;",
+    )?;
     tx.execute_batch(FTS_SYNC_TRIGGERS)?;
     tx.commit()?;
     Ok(())
@@ -744,6 +859,7 @@ mod tests {
         init_schema(&conn).unwrap();
 
         insert_message(&conn, "m1", "zebra crossing");
+        drain_bigram_pending(&conn).unwrap();
         assert_eq!(
             bigram_hits(&conn, "zebra"),
             1,
@@ -767,6 +883,7 @@ mod tests {
         assert!(detect_custom_migration_applied(&conn, 9).unwrap());
         assert!(detect_custom_migration_applied(&conn, 10).unwrap());
         assert!(detect_custom_migration_applied(&conn, 15).unwrap());
+        assert!(detect_custom_migration_applied(&conn, 16).unwrap());
     }
 
     /// Counts bigram index entries whose content row is gone. Same shape as
@@ -793,37 +910,6 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn test_bigram_triggers_insert_delete_update() {
-        let conn = setup_fresh_db();
-        init_schema(&conn).unwrap();
-        insert_message(&conn, "m1", "alphabet soup 失敗");
-
-        assert_eq!(bigram_hits(&conn, "alphabet"), 1);
-        assert_eq!(bigram_hits(&conn, "失敗"), 1);
-
-        conn.execute(
-            "UPDATE messages SET full_content = 'zebra crossing' WHERE message_uuid = 'm1'",
-            [],
-        )
-        .unwrap();
-        assert_eq!(
-            bigram_hits(&conn, "alphabet"),
-            0,
-            "old bigram terms must not survive an update"
-        );
-        assert_eq!(
-            bigram_hits(&conn, "失敗"),
-            0,
-            "old CJK bigram must not survive an update"
-        );
-        assert_eq!(bigram_hits(&conn, "zebra"), 1);
-
-        conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
-            .unwrap();
-        assert_eq!(orphan_bigram_rows(&conn, "zebra"), 0);
-    }
-
     /// A database still carrying the pre-10 single-table triggers must be
     /// repaired by migration 10: new writes have to reach the bigram table.
     #[test]
@@ -847,6 +933,7 @@ mod tests {
         init_schema(&conn).unwrap();
 
         insert_message(&conn, "m1", "alphabet soup");
+        drain_bigram_pending(&conn).unwrap();
         assert_eq!(
             bigram_hits(&conn, "alphabet"),
             1,
@@ -903,6 +990,263 @@ mod tests {
             .unwrap();
 
         assert!(detect_custom_migration_applied(&conn, 9).unwrap());
+    }
+
+    fn pending_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM message_bigram_pending", [], |r| {
+            r.get(0)
+        })
+        .unwrap()
+    }
+
+    /// A migrated file DB plus a second connection that, like a pre-0.18 binary,
+    /// never registers `bigram_analyze`.
+    fn migrated_db_and_old_writer() -> (tempfile::TempDir, Connection, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let new_conn = Connection::open(&path).unwrap();
+        init_schema(&new_conn).unwrap();
+        let old_conn = Connection::open(&path).unwrap();
+        (dir, new_conn, old_conn)
+    }
+
+    #[test]
+    fn test_writer_without_bigram_function_can_insert_and_update() {
+        let (_dir, _new_conn, old_conn) = migrated_db_and_old_writer();
+
+        insert_message(&old_conn, "m1", "alphabet soup");
+        old_conn
+            .execute(
+                "UPDATE messages SET full_content = 'mo 認証に失敗した' WHERE message_uuid = 'm1'",
+                [],
+            )
+            .unwrap();
+        old_conn
+            .execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_drain_makes_rows_from_old_writer_searchable() {
+        let (_dir, new_conn, old_conn) = migrated_db_and_old_writer();
+        insert_message(&old_conn, "m1", "mo 認証に失敗した");
+        assert_eq!(bigram_hits(&new_conn, "失敗"), 0);
+        assert_eq!(pending_count(&new_conn), 1);
+
+        assert_eq!(drain_bigram_pending(&new_conn).unwrap(), 1);
+
+        assert_eq!(bigram_hits(&new_conn, "失敗"), 1);
+        assert_eq!(bigram_hits(&new_conn, "mo"), 1);
+        assert_eq!(pending_count(&new_conn), 0);
+        assert_eq!(drain_bigram_pending(&new_conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn test_drain_processes_queues_larger_than_one_batch() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        let n = BIGRAM_DRAIN_BATCH + 3;
+        for i in 0..n {
+            insert_message(&conn, &format!("m{}", i), "失敗");
+        }
+        assert_eq!(drain_bigram_pending(&conn).unwrap(), n);
+        assert_eq!(bigram_hits(&conn, "失敗"), n as i64);
+        assert_eq!(pending_count(&conn), 0);
+    }
+
+    #[test]
+    fn test_update_removes_old_terms_from_both_fts_before_drain() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "alphabet soup 失敗");
+        drain_bigram_pending(&conn).unwrap();
+
+        conn.execute(
+            "UPDATE messages SET full_content = 'zebra crossing' WHERE message_uuid = 'm1'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(bigram_hits(&conn, "alphabet"), 0);
+        assert_eq!(bigram_hits(&conn, "失敗"), 0);
+        let stale_trigram: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_content_fts WHERE message_content_fts MATCH 'alp'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale_trigram, 0);
+
+        drain_bigram_pending(&conn).unwrap();
+        assert_eq!(bigram_hits(&conn, "zebra"), 1);
+    }
+
+    #[test]
+    fn test_model_only_update_keeps_bigram_and_queues_nothing() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "認証に失敗した");
+        drain_bigram_pending(&conn).unwrap();
+
+        conn.execute(
+            "UPDATE messages SET model = 'claude-x' WHERE message_uuid = 'm1'",
+            [],
+        )
+        .unwrap();
+
+        assert_eq!(bigram_hits(&conn, "失敗"), 1);
+        assert_eq!(pending_count(&conn), 0);
+    }
+
+    #[test]
+    fn test_delete_before_drain_leaves_no_pending_or_bigram_row() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "失敗");
+        conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
+            .unwrap();
+
+        assert_eq!(pending_count(&conn), 0);
+        drain_bigram_pending(&conn).unwrap();
+        assert_eq!(bigram_hits(&conn, "失敗"), 0);
+    }
+
+    /// v0.18.0 shape: triggers call `bigram_analyze`, no queue table, version 16 unrecorded.
+    #[test]
+    fn test_migration_16_from_v10_db_lets_old_writer_insert() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let new_conn = Connection::open(&path).unwrap();
+        init_schema(&new_conn).unwrap();
+        new_conn
+            .execute_batch(
+                "DROP TRIGGER messages_ai; DROP TRIGGER messages_ad; DROP TRIGGER messages_au;
+                 DROP TABLE message_bigram_pending;
+                 CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+                     INSERT INTO message_content_fts(rowid, message_uuid, full_content)
+                     VALUES (new.rowid, new.message_uuid, new.full_content);
+                     INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
+                     VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
+                 END;
+                 CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                     INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
+                     VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
+                     DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
+                 END;
+                 CREATE TRIGGER messages_au AFTER UPDATE ON messages BEGIN
+                     INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
+                     VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
+                     INSERT INTO message_content_fts(rowid, message_uuid, full_content)
+                     VALUES (new.rowid, new.message_uuid, new.full_content);
+                     DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
+                     INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
+                     VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
+                 END;
+                 DELETE FROM schema_version WHERE version = 16;
+                 PRAGMA user_version = 0;",
+            )
+            .unwrap();
+        insert_message(&new_conn, "v10", "既存の失敗");
+        let doomed_writer = Connection::open(&path).unwrap();
+        assert!(
+            doomed_writer
+                .execute(
+                    "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, full_content) VALUES ('x', 's', 0, 't', 'user', 'x')",
+                    [],
+                )
+                .is_err(),
+            "the v10 trigger should reject a writer without bigram_analyze"
+        );
+        assert!(!detect_custom_migration_applied(&new_conn, 16).unwrap());
+
+        init_schema(&new_conn).unwrap();
+
+        // A fresh connection, as each index run is a new process: one whose prepare
+        // already failed keeps its cached schema until something makes it re-read.
+        let old_conn = Connection::open(&path).unwrap();
+        insert_message(&old_conn, "m1", "新しい失敗");
+        drain_bigram_pending(&new_conn).unwrap();
+        assert_eq!(
+            bigram_hits(&new_conn, "失敗"),
+            2,
+            "v10 entry kept, new row added"
+        );
+    }
+
+    /// Pre-fix prune-observer recreates `messages_ad` from its own constant.
+    #[test]
+    fn test_init_schema_repairs_trigger_reverted_by_old_binary() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER messages_ad;
+             CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+                 INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
+                 VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
+             END;",
+        )
+        .unwrap();
+
+        init_schema(&conn).unwrap();
+
+        insert_message(&conn, "m1", "失敗");
+        conn.execute("DELETE FROM messages WHERE message_uuid = 'm1'", [])
+            .unwrap();
+        assert_eq!(pending_count(&conn), 0);
+    }
+
+    #[test]
+    fn test_db_requiring_newer_writer_is_rejected_with_update_hint() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        conn.execute_batch("PRAGMA user_version = 9999;").unwrap();
+
+        let err = init_schema(&conn).unwrap_err().to_string();
+        assert!(err.contains("newer ai-conversation-search"), "{}", err);
+    }
+
+    #[test]
+    fn test_init_schema_records_min_writer_schema() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        let user_version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(user_version, MIN_WRITER_SCHEMA);
+        // "Never lowered" is untestable while MIN_WRITER_SCHEMA is the latest
+        // migration: any larger value is rejected by the gate.
+    }
+
+    /// `backfill-bigram` fills rows still in the queue; the next drain re-analyzes them.
+    #[test]
+    fn test_drain_tolerates_rows_already_filled_by_backfill() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "失敗");
+        fill_bigram_missing(&conn).unwrap();
+
+        drain_bigram_pending(&conn).unwrap();
+
+        assert_eq!(pending_count(&conn), 0);
+        assert_eq!(bigram_hits(&conn, "失敗"), 1);
+    }
+
+    /// prune-observer deletes with `messages_ad` dropped, leaving queue rows behind.
+    #[test]
+    fn test_drain_clears_queue_rows_whose_message_is_gone() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        insert_message(&conn, "m1", "失敗");
+        conn.execute_batch(
+            "DROP TRIGGER messages_ad; DELETE FROM messages WHERE message_uuid = 'm1';",
+        )
+        .unwrap();
+        conn.execute_batch(FTS_SYNC_TRIGGERS).unwrap();
+        assert_eq!(pending_count(&conn), 1);
+
+        assert_eq!(drain_bigram_pending(&conn).unwrap(), 0);
+        assert_eq!(pending_count(&conn), 0);
     }
 
     #[test]

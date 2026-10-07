@@ -136,15 +136,16 @@ impl CodexIndexer {
                     indexed_count += 1;
                 }
                 Ok(_) => {}
+                // Even under --quiet: the background indexer's stderr is its only record.
                 Err(e) => {
-                    self.log(&format!(
+                    eprintln!(
                         "  Error indexing {}: {}",
                         session_file
                             .file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_default(),
                         e
-                    ));
+                    );
                     continue;
                 }
             }

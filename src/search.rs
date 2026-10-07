@@ -3649,6 +3649,8 @@ mod tests {
             rusqlite::params![uuid, session_id, is_sidechain, timestamp, msg_type, project_path, content, is_meta_conversation],
         )
         .unwrap();
+        // Production index runs end with this drain; searches assume it happened.
+        crate::schema::drain_bigram_pending(conn).unwrap();
     }
 
     fn insert_test_conversation(
@@ -5468,6 +5470,8 @@ mod tests {
             rusqlite::params![uuid, session_id, content, summary],
         )
         .unwrap();
+        // Production index runs end with this drain; searches assume it happened.
+        crate::schema::drain_bigram_pending(conn).unwrap();
     }
 
     /// Registers a conversation plus one message so `tree` has something to return.

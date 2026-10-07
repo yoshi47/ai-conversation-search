@@ -205,16 +205,15 @@ pub fn analyze_for_query(term: &str) -> Option<String> {
 
 /// Register `bigram_analyze(text)` as a SQLite scalar function on `conn`.
 ///
-/// The `messages_ai` / `messages_au` triggers call this to fill the bigram
-/// FTS table from `messages.full_content`. A scalar function (rusqlite
-/// built-in) is used rather than duplicating the analysis in SQL or in every
-/// indexer: triggers cannot run Rust any other way, and routing all three
-/// indexers (`claude_code`, `codex`, `opencode`) through the triggers keeps a
-/// single write path. No SQLite extension (`.so`) is involved.
+/// `schema::drain_bigram_pending` and `schema::fill_bigram_missing` call this
+/// to fill the bigram FTS table from `messages.full_content`. The FTS sync
+/// triggers must NOT call it: the index DB is shared with older binaries that
+/// never register it, and every write of theirs would fail. They queue rows
+/// instead, so all three indexers still share a single write path.
+/// No SQLite extension (`.so`) is involved.
 ///
-/// Every connection that writes to `messages` must register this. Production
-/// connections get it via `db::connect`; test / in-memory connections via
-/// `schema::init_schema`. Both call this function.
+/// Production connections get it via `db::connect`; test / in-memory
+/// connections via `schema::init_schema`.
 pub fn register_sql_function(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.create_scalar_function(
         "bigram_analyze",
