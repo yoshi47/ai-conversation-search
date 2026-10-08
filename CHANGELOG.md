@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-10-08
+
 ### Added
 
 - 使っていたモデルを記録・表示するようにした。Claude Code は assistant メッセージの `message.model`、OpenCode は `data.model`（`providerID/id` 形式）、Codex は `turn_context` の `model` を `messages.model` に保存し、セッション単位の異なり一覧を `conversations.model`（初出順カンマ区切り）に持つ。`search` / `list` / `tree` / `context` / `preview` の人間向け出力に `Model:` 行（tree はノード末尾にも `(model)`）を足し、`--json` には `model`（search は `conversation_model` も、resume-spec も `model`）を足した。既存フィールドは不変。マイグレーション 11-14 で列と索引を追加し、15 で同期カーソルをクリアして次回 index 時に全量再パースで埋める（Claude Code は NULL の行だけ inplace 更新、OpenCode/Codex はセッション再挿入）。`<synthetic>` はモデルではないので NULL のまま
