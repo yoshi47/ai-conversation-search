@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- `status` and the search-time warning no longer report claude-mem observer transcripts as
+  "not indexed". The on-disk count now walks the same profile directories as the indexer
+  (`~/.claude*/projects` and `CONVERSATION_SEARCH_EXTRA_DIRS`) and skips the observer
+  directory the indexer skips, so the warning shows only files a full index would pick up.
+
 ## [0.18.1] - 2026-10-08
 
 ### Added

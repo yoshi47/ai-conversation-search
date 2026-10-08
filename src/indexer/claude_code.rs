@@ -257,55 +257,122 @@ pub(crate) fn find_session_transcript(paths: &[PathBuf], session_id: &str) -> Tr
     }
 }
 
-/// Count conversation files on disk without needing a DB connection.
-/// Used by `status` command and unindexed file warnings.
-pub fn count_conversation_files_on_disk() -> usize {
-    let projects_dir = match dirs::home_dir() {
-        Some(h) => h.join(".claude").join("projects"),
+/// Discover all Claude project directories to scan.
+/// Auto-discovers ~/.claude/projects and ~/.claude-*/projects,
+/// plus any directories specified in CONVERSATION_SEARCH_EXTRA_DIRS (colon-separated).
+fn discover_project_dirs(log: &dyn Fn(&str)) -> Vec<PathBuf> {
+    let home = match dirs::home_dir() {
+        Some(h) => h,
         None => {
-            eprintln!("Warning: could not determine home directory; file count unavailable");
-            return 0;
+            log("Warning: could not determine home directory");
+            return vec![];
         }
     };
 
-    if !projects_dir.exists() {
-        return 0;
-    }
+    let mut dirs = Vec::new();
 
-    let entries = match std::fs::read_dir(&projects_dir) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Warning: could not read {}: {}", projects_dir.display(), e);
-            return 0;
-        }
-    };
-
-    let mut count = 0;
-    for entry in entries.flatten() {
-        let project_dir = entry.path();
-        if !project_dir.is_dir() {
-            continue;
-        }
-
-        let dir_entries = match std::fs::read_dir(&project_dir) {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-
-        for file_entry in dir_entries.flatten() {
-            let conv_file = file_entry.path();
-            if conv_file.extension().is_none_or(|e| e != "jsonl") {
-                continue;
-            }
-            if let Some(stem) = conv_file.file_stem() {
-                if stem.to_string_lossy().starts_with("agent-") {
-                    continue;
+    // Auto-discover: ~/.claude/projects, ~/.claude-*/projects
+    match std::fs::read_dir(&home) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        log(&format!(
+                            "Warning: failed to read entry in {}: {}",
+                            home.display(),
+                            e
+                        ));
+                        continue;
+                    }
+                };
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if (name_str == ".claude" || name_str.starts_with(".claude-"))
+                    && entry.path().is_dir()
+                {
+                    let projects = entry.path().join("projects");
+                    if projects.is_dir() {
+                        dirs.push(projects);
+                    }
                 }
             }
-            count += 1;
+        }
+        Err(e) => {
+            log(&format!(
+                "Warning: failed to read home directory {}: {}",
+                home.display(),
+                e
+            ));
         }
     }
 
+    // Extra dirs from env var (colon-separated, supports ~ expansion)
+    if let Ok(extra) = std::env::var("CONVERSATION_SEARCH_EXTRA_DIRS") {
+        for dir in extra.split(':').filter(|s| !s.is_empty()) {
+            let expanded = if dir == "~" {
+                home.clone()
+            } else if let Some(rest) = dir.strip_prefix("~/") {
+                home.join(rest)
+            } else {
+                PathBuf::from(dir)
+            };
+            if expanded.is_dir() {
+                dirs.push(expanded);
+            } else {
+                log(&format!(
+                    "Warning: CONVERSATION_SEARCH_EXTRA_DIRS entry '{}' (resolved to '{}') is not a directory, skipping",
+                    dir, expanded.display()
+                ));
+            }
+        }
+    }
+
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+/// Count conversation files on disk without needing a DB connection.
+/// Used by `status` command and unindexed file warnings.
+///
+/// Walks the same roots and skips the observer directory the same way `scan_project_dirs`
+/// does, because the count is compared with `claude_code_sync_state`: a directory the
+/// indexer never stamps would show up as permanently "not indexed". The summarizer
+/// project is not skipped -- finding it means parsing transcripts, too slow for `status`.
+pub fn count_conversation_files_on_disk() -> usize {
+    count_conversation_files(&discover_project_dirs(&|_| {}), observer_indexing_enabled())
+}
+
+fn count_conversation_files(project_dirs: &[PathBuf], index_observer: bool) -> usize {
+    let mut count = 0;
+    for projects_dir in project_dirs {
+        let Ok(entries) = std::fs::read_dir(projects_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let project_dir = entry.path();
+            if !project_dir.is_dir()
+                || (!index_observer
+                    && is_observer_project_dir_name(&entry.file_name().to_string_lossy()))
+            {
+                continue;
+            }
+            let Ok(dir_entries) = std::fs::read_dir(&project_dir) else {
+                continue;
+            };
+            count += dir_entries
+                .flatten()
+                .filter(|f| {
+                    let path = f.path();
+                    path.extension().is_some_and(|e| e == "jsonl")
+                        && !path
+                            .file_stem()
+                            .is_some_and(|s| s.to_string_lossy().starts_with("agent-"))
+                })
+                .count();
+        }
+    }
     count
 }
 
@@ -560,80 +627,8 @@ impl ConversationIndexer {
         }
     }
 
-    /// Discover all Claude project directories to scan.
-    /// Auto-discovers ~/.claude/projects and ~/.claude-*/projects,
-    /// plus any directories specified in CONVERSATION_SEARCH_EXTRA_DIRS (colon-separated).
     pub(crate) fn discover_project_dirs(&self) -> Vec<PathBuf> {
-        let home = match dirs::home_dir() {
-            Some(h) => h,
-            None => {
-                self.log("Warning: could not determine home directory");
-                return vec![];
-            }
-        };
-
-        let mut dirs = Vec::new();
-
-        // Auto-discover: ~/.claude/projects, ~/.claude-*/projects
-        match std::fs::read_dir(&home) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(e) => {
-                            self.log(&format!(
-                                "Warning: failed to read entry in {}: {}",
-                                home.display(),
-                                e
-                            ));
-                            continue;
-                        }
-                    };
-                    let name = entry.file_name();
-                    let name_str = name.to_string_lossy();
-                    if (name_str == ".claude" || name_str.starts_with(".claude-"))
-                        && entry.path().is_dir()
-                    {
-                        let projects = entry.path().join("projects");
-                        if projects.is_dir() {
-                            dirs.push(projects);
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                self.log(&format!(
-                    "Warning: failed to read home directory {}: {}",
-                    home.display(),
-                    e
-                ));
-            }
-        }
-
-        // Extra dirs from env var (colon-separated, supports ~ expansion)
-        if let Ok(extra) = std::env::var("CONVERSATION_SEARCH_EXTRA_DIRS") {
-            for dir in extra.split(':').filter(|s| !s.is_empty()) {
-                let expanded = if dir == "~" {
-                    home.clone()
-                } else if let Some(rest) = dir.strip_prefix("~/") {
-                    home.join(rest)
-                } else {
-                    PathBuf::from(dir)
-                };
-                if expanded.is_dir() {
-                    dirs.push(expanded);
-                } else {
-                    self.log(&format!(
-                        "Warning: CONVERSATION_SEARCH_EXTRA_DIRS entry '{}' (resolved to '{}') is not a directory, skipping",
-                        dir, expanded.display()
-                    ));
-                }
-            }
-        }
-
-        dirs.sort();
-        dirs.dedup();
-        dirs
+        discover_project_dirs(&|msg| self.log(msg))
     }
 
     /// Scan Claude project directories for conversation files.
@@ -2981,6 +2976,23 @@ mod tests {
         indexer.index_conversation(&file).unwrap();
 
         assert_eq!(count_messages(&indexer), 2);
+    }
+
+    #[test]
+    fn test_count_conversation_files_matches_scan_skip_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("-Users-me-repo");
+        let observer = root.path().join("-Users-me--claude-mem-observer-sessions");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&observer).unwrap();
+        for name in ["a.jsonl", "b.jsonl", "agent-x.jsonl", "notes.txt"] {
+            std::fs::write(project.join(name), "").unwrap();
+        }
+        std::fs::write(observer.join("o.jsonl"), "").unwrap();
+        let dirs = [root.path().to_path_buf()];
+
+        assert_eq!(count_conversation_files(&dirs, false), 2);
+        assert_eq!(count_conversation_files(&dirs, true), 3);
     }
 
     /// Path-based and marker-based detection must agree, since the scan-time check
