@@ -62,29 +62,32 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_content_fts USING fts5(
 -- Bigram rescue index for short (2-char) terms. Standalone table (no
 -- content=): the indexed text is Rust-analyzed (`bigram_analyze`), not a
 -- `messages` column, so an external-content `rebuild` could not re-read it.
--- Triggers below always supply the values explicitly; backfill is the
--- `backfill-bigram` command.
+-- Rows reach it through `message_bigram_pending` (see the triggers below);
+-- rows indexed before migration 10 are filled by the `backfill-bigram` command.
 CREATE VIRTUAL TABLE IF NOT EXISTS message_content_bigram_fts USING fts5(
     message_uuid UNINDEXED,
     bigram_content,
     tokenize='unicode61 remove_diacritics 1'
 );
 
--- Triggers to keep both FTS tables in sync. `bigram_analyze` is a Rust scalar
--- function registered on every connection (see `src/bigram.rs` and `db::connect`).
+-- messages rows whose bigram entry still has to be built. Drained by
+-- `schema::drain_bigram_pending` at the end of every index run.
+CREATE TABLE IF NOT EXISTS message_bigram_pending (
+    msg_rowid INTEGER PRIMARY KEY
+);
+
+-- Triggers to keep both FTS tables in sync.
+--
+-- They are pure SQL on purpose: this DB is shared by every installed version
+-- of the binary, and a trigger that calls a Rust function (`bigram_analyze`)
+-- makes every write from a binary that does not register it fail. So the
+-- bigram side only queues the row here; `drain_bigram_pending` analyzes it.
 CREATE TRIGGER IF NOT EXISTS messages_ai AFTER INSERT ON messages BEGIN
     INSERT INTO message_content_fts(rowid, message_uuid, full_content)
     VALUES (new.rowid, new.message_uuid, new.full_content);
-    INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
-    VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
+    INSERT OR IGNORE INTO message_bigram_pending(msg_rowid) VALUES (new.rowid);
 END;
 
--- Removal uses the 'delete' command rather than `DELETE FROM ... WHERE rowid = ?`.
--- This is an external-content table (content='messages'), so a plain DELETE re-reads
--- the content row to find the terms to unindex -- and by AFTER DELETE that row is
--- already gone, leaving the index entry behind with no error raised.
--- On UPDATE the failure differs: the content row still exists but already holds the NEW
--- values, so a plain DELETE unindexes those and the old terms stay searchable forever.
 -- Removal uses the 'delete' command rather than `DELETE FROM ... WHERE rowid = ?`.
 -- This is an external-content table (content='messages'), so a plain DELETE re-reads
 -- the content row to find the terms to unindex -- and by AFTER DELETE that row is
@@ -99,16 +102,18 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
     INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
     VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
     DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
+    DELETE FROM message_bigram_pending WHERE msg_rowid = old.rowid;
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+-- Limited to the indexed columns: the indexer backfills `model` with UPDATEs
+-- row by row (Claude Code), which must not drop and re-queue every bigram entry.
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE OF full_content, message_uuid ON messages BEGIN
     INSERT INTO message_content_fts(message_content_fts, rowid, message_uuid, full_content)
     VALUES ('delete', old.rowid, old.message_uuid, old.full_content);
     INSERT INTO message_content_fts(rowid, message_uuid, full_content)
     VALUES (new.rowid, new.message_uuid, new.full_content);
     DELETE FROM message_content_bigram_fts WHERE rowid = old.rowid;
-    INSERT INTO message_content_bigram_fts(rowid, message_uuid, bigram_content)
-    VALUES (new.rowid, new.message_uuid, bigram_analyze(new.full_content));
+    INSERT OR IGNORE INTO message_bigram_pending(msg_rowid) VALUES (new.rowid);
 END;
 
 -- Conversation metadata (one per session)

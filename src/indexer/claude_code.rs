@@ -1855,8 +1855,7 @@ impl ConversationIndexer {
         Ok(())
     }
 
-    /// Get a mutable reference to the connection (for external indexers).
-    #[allow(dead_code)]
+    /// The indexer's connection, for work that runs after indexing (bigram drain).
     pub fn connection(&self) -> &Connection {
         &self.conn
     }

@@ -45,9 +45,8 @@ pub fn connect(db_path: &str, readonly: bool) -> Result<Connection> {
          PRAGMA foreign_keys=OFF;",
     )?;
 
-    // Scalar function used by the messages_ai/au FTS sync triggers to fill the
-    // bigram table. Registering on every connection (read-only included: it
-    // costs nothing and avoids "no such function" surprises on writers).
+    // Scalar function used by the bigram drain/backfill. Registering on every
+    // connection (read-only included) costs nothing and lets any writer drain.
     crate::bigram::register_sql_function(&conn)?;
 
     Ok(conn)
