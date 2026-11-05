@@ -241,6 +241,13 @@ fn active_path_uuids(
     leaf: &str,
 ) -> std::collections::HashSet<String> {
     let mut active = std::collections::HashSet::new();
+    // OpenCode and Codex indexers store `parent_uuid = NULL` for every message.
+    // With no lineage to walk, the leaf says nothing about which siblings are
+    // off-path, so treat the active path as unknown. Callers then mark nothing
+    // abandoned instead of flagging every message but the last.
+    if !parent_of.values().any(|parent| parent.is_some()) {
+        return active;
+    }
     if !parent_of.contains_key(leaf) {
         return active;
     }
@@ -5589,6 +5596,53 @@ mod tests {
             "no false positives without a leaf"
         );
         assert!(!result.tree[0].is_abandoned);
+    }
+
+    #[test]
+    fn test_tree_without_parent_links_marks_nothing() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess-noparent",
+            "/proj",
+            "no parent links",
+            "2025-01-15T09:00:00",
+            "2025-01-15T11:00:00",
+            "codex",
+        );
+        conn.execute(
+            "UPDATE conversations SET leaf_message_uuid = 'm2' WHERE session_id = 'sess-noparent'",
+            [],
+        )
+        .unwrap();
+        insert_test_message(
+            &conn,
+            "m1",
+            "sess-noparent",
+            "user text",
+            "user",
+            "2025-01-15T10:00:00",
+            "/proj",
+        );
+        insert_test_message(
+            &conn,
+            "m2",
+            "sess-noparent",
+            "assistant text",
+            "assistant",
+            "2025-01-15T10:01:00",
+            "/proj",
+        );
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let result = searcher.get_conversation_tree("sess-noparent").unwrap();
+
+        assert!(result.error.is_none());
+        assert!(
+            result.warning.is_none(),
+            "no parent links means no branch can be identified as abandoned"
+        );
+        assert!(result.tree.iter().all(|node| !node.is_abandoned));
     }
 
     #[test]

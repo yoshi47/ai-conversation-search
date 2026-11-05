@@ -150,6 +150,11 @@ const MIGRATIONS: &[(i64, &str, MigrationKind)] = &[
         "queue bigram indexing instead of calling bigram_analyze in triggers",
         MigrationKind::Custom,
     ),
+    (
+        17,
+        "clear codex sync state to re-index paginated user messages",
+        MigrationKind::Custom,
+    ),
 ];
 
 /// Initialize the database schema and run migrations.
@@ -362,6 +367,7 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bo
         // Data-only migration: a fresh DB has empty (or absent) sync tables,
         // so there is nothing to backfill and it counts as applied.
         15 => return Ok(sync_tables_empty_for_model_backfill(conn)),
+        17 => return Ok(sync_tables_empty_for_codex_backfill(conn)),
         v => unreachable!("unhandled custom migration version: {}", v),
     };
 
@@ -380,18 +386,8 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bo
     Ok(sql.is_none_or(|s| s.contains(marker)))
 }
 
-/// Whether the model-backfill migration has nothing to do.
-///
-/// Returns true when no sync table holds rows: a fresh DB (nothing indexed yet)
-/// or a DB that already ran the backfill and has not indexed since. An existing
-/// DB with index history reports false so the migration runs once and forces a
-/// reparse that fills `messages.model` / `conversations.model`.
-fn sync_tables_empty_for_model_backfill(conn: &Connection) -> bool {
-    for table in [
-        "claude_code_sync_state",
-        "codex_sync_state",
-        "opencode_sync_state",
-    ] {
+fn sync_tables_empty(conn: &Connection, tables: &[&str]) -> bool {
+    for table in tables {
         if !table_exists(conn, table) {
             continue;
         }
@@ -407,6 +403,37 @@ fn sync_tables_empty_for_model_backfill(conn: &Connection) -> bool {
     true
 }
 
+/// Whether the model-backfill migration has nothing to do.
+///
+/// Returns true when no sync table holds rows: a fresh DB (nothing indexed yet)
+/// or a DB that already ran the backfill and has not indexed since. An existing
+/// DB with index history reports false so the migration runs once and forces a
+/// reparse that fills `messages.model` / `conversations.model`.
+fn sync_tables_empty_for_model_backfill(conn: &Connection) -> bool {
+    sync_tables_empty(
+        conn,
+        &[
+            "claude_code_sync_state",
+            "codex_sync_state",
+            "opencode_sync_state",
+        ],
+    )
+}
+
+/// Whether the Codex user-message backfill has nothing to do.
+fn sync_tables_empty_for_codex_backfill(conn: &Connection) -> bool {
+    sync_tables_empty(conn, &["codex_sync_state"])
+}
+
+fn clear_sync_tables(conn: &Connection, tables: &[&str]) -> Result<()> {
+    for table in tables {
+        if table_exists(conn, table) {
+            conn.execute(&format!("DELETE FROM {}", table), [])?;
+        }
+    }
+    Ok(())
+}
+
 /// Clear per-source sync cursors so the next index reparses every transcript.
 ///
 /// Model columns (migrations 11-12) are NULL for rows indexed before they
@@ -416,16 +443,20 @@ fn sync_tables_empty_for_model_backfill(conn: &Connection) -> bool {
 /// is lost. Runs inside its own transaction; a fresh DB has empty tables and
 /// this is a no-op.
 fn clear_sync_state_for_model_backfill(conn: &Connection) -> Result<()> {
-    for table in [
-        "claude_code_sync_state",
-        "codex_sync_state",
-        "opencode_sync_state",
-    ] {
-        if table_exists(conn, table) {
-            conn.execute(&format!("DELETE FROM {}", table), [])?;
-        }
-    }
-    Ok(())
+    clear_sync_tables(
+        conn,
+        &[
+            "claude_code_sync_state",
+            "codex_sync_state",
+            "opencode_sync_state",
+        ],
+    )
+}
+
+/// Clear the Codex cursor so the next index reparses paginated rollouts with
+/// the new user-message extraction.
+fn clear_codex_sync_state(conn: &Connection) -> Result<()> {
+    clear_sync_tables(conn, &["codex_sync_state"])
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
@@ -578,6 +609,7 @@ fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
         10 => migrate_add_bigram_fts(conn),
         15 => clear_sync_state_for_model_backfill(conn),
         16 => migrate_bigram_pending_queue(conn),
+        17 => clear_codex_sync_state(conn),
         v => unreachable!("unhandled custom migration version: {}", v),
     }
 }
@@ -1492,6 +1524,30 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "{} should be cleared", table);
         }
+    }
+
+    #[test]
+    fn test_migration_17_clears_codex_sync_state() {
+        let conn = setup_fresh_db();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO codex_sync_state (file_path, mtime) VALUES ('/tmp/codex.jsonl', 1.0)",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM schema_version WHERE version = 17", [])
+            .unwrap();
+        assert!(!detect_custom_migration_applied(&conn, 17).unwrap());
+
+        init_schema(&conn).unwrap();
+
+        assert!(is_migration_applied(&conn, 17));
+        let remaining: i64 = conn
+            .query_row("SELECT COUNT(*) FROM codex_sync_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(remaining, 0);
     }
 
     #[test]
