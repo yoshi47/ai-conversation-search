@@ -6,7 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-11-05
+
 ### Fixed
+
+- Codex の user 発言が索引に入らなかった。paginated rollout は user 発言を `event_msg/item_completed` の `item.type=UserMessage` に書くが、インデクサは legacy の `event_msg/user_message` しか読んでおらず、`response_item` の user は注入コンテキストとして捨てていた。`item_completed` を第一候補にし、無い場合だけ `response_item` の user を使う（AGENTS.md や environment_context などの注入ブロックは除外）。既存セッションを再索引するため、マイグレーション 17 で `codex_sync_state` をクリアする。Codex のタイトルも `Untitled` ではなく最初の実プロンプトになる
 
 - `status` and the search-time warning no longer report claude-mem observer transcripts as
   "not indexed". The on-disk count now walks the same profile directories as the indexer

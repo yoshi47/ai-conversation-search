@@ -9,6 +9,68 @@ use crate::error::Result;
 const DEFAULT_CODEX_SESSIONS: &str = "~/.codex/sessions";
 const CX_PREFIX: &str = "codex:";
 
+/// Text blocks Codex injects with `role: "user"` in the protocol log. They are
+/// harness context (AGENTS.md, sandbox policy, subagent notifications), not
+/// something the human typed.
+const INJECTED_USER_PREFIXES: &[&str] = &[
+    "# AGENTS.md",
+    "<environment_context>",
+    "<user_instructions>",
+    "<permissions instructions>",
+    "<turn_aborted>",
+    "<skills_instructions>",
+    "<skill",
+    "<user_action>",
+    "<user_shell_command>",
+    "<collaboration_mode>",
+    "<multi_agent",
+    "<subagent_notification>",
+];
+
+fn is_injected_user_text(text: &str) -> bool {
+    let text = text.trim_start();
+    INJECTED_USER_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
+/// Join the text of content parts whose `type` is one of `accepted_types`.
+/// Codex uses `input_text` for user input and `output_text` for assistant
+/// output in `response_item`, and plain `text` inside `item_completed`.
+fn content_text(content: &serde_json::Value, accepted_types: &[&str]) -> String {
+    let Some(parts) = content.as_array() else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter(|part| {
+            part.get("type")
+                .and_then(|t| t.as_str())
+                .is_some_and(|t| accepted_types.contains(&t))
+        })
+        .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extract the human-written parts of a protocol-log user message, dropping
+/// harness-injected blocks part by part so a message that mixes context and a
+/// real prompt still keeps the prompt.
+fn user_input_text(content: &serde_json::Value) -> String {
+    let Some(parts) = content.as_array() else {
+        return String::new();
+    };
+    parts
+        .iter()
+        .filter(|part| part.get("type").and_then(|t| t.as_str()) == Some("input_text"))
+        .filter_map(|part| part.get("text").and_then(|t| t.as_str()))
+        .map(str::trim)
+        .filter(|text| !text.is_empty() && !is_injected_user_text(text))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub struct CodexIndexer {
     search_db_path: String,
     sessions_dir: PathBuf,
@@ -219,6 +281,50 @@ impl CodexIndexer {
         let mut title_parts: Vec<String> = Vec::new();
         let mut current_model: Option<String> = None;
 
+        // Paginated rollouts write the same turn twice: the protocol log
+        // (`response_item/message`) and the display log
+        // (`event_msg/item_completed`). Prefer the display log for user turns:
+        // it contains only what the human typed, while the protocol copy also
+        // carries injected AGENTS.md / environment context. Legacy rollouts
+        // have `event_msg/user_message` instead, so the protocol copy is only a
+        // fallback when neither event exists.
+        let has_item_user = lines[1..].iter().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|event| {
+                    if event.get("type").and_then(|t| t.as_str()) != Some("event_msg")
+                        || event
+                            .get("payload")
+                            .and_then(|p| p.get("type"))
+                            .and_then(|t| t.as_str())
+                            != Some("item_completed")
+                    {
+                        return false;
+                    }
+                    event
+                        .get("payload")
+                        .and_then(|p| p.get("item"))
+                        .is_some_and(|item| {
+                            item.get("type").and_then(|t| t.as_str()) == Some("UserMessage")
+                                && item.get("content").is_some_and(|content| {
+                                    !content_text(content, &["text"]).trim().is_empty()
+                                })
+                        })
+                })
+        });
+        let has_legacy_user = lines[1..].iter().any(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .ok()
+                .is_some_and(|event| {
+                    event.get("type").and_then(|t| t.as_str()) == Some("event_msg")
+                        && event
+                            .get("payload")
+                            .and_then(|p| p.get("type"))
+                            .and_then(|t| t.as_str())
+                            == Some("user_message")
+                })
+        });
+
         for line in &lines[1..] {
             let event: serde_json::Value = match serde_json::from_str(line) {
                 Ok(v) => v,
@@ -257,7 +363,30 @@ impl CodexIndexer {
                         .and_then(|t| t.as_str())
                         .unwrap_or("");
                     match msg_type {
+                        "item_completed" => {
+                            let item = event_payload.get("item");
+                            if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                                != Some("UserMessage")
+                            {
+                                continue;
+                            }
+                            let text = item
+                                .and_then(|i| i.get("content"))
+                                .map(|content| content_text(content, &["text"]))
+                                .unwrap_or_default();
+                            if !text.trim().is_empty() {
+                                if title_parts.is_empty() {
+                                    title_parts.push(text.chars().take(100).collect());
+                                }
+                                messages.push(("user".to_string(), timestamp, text, None));
+                            }
+                        }
                         "user_message" => {
+                            // Legacy history mode; paginated rollouts use
+                            // item_completed/UserMessage above instead.
+                            if has_item_user {
+                                continue;
+                            }
                             let text = event_payload
                                 .get("message")
                                 .and_then(|m| m.as_str())
@@ -383,30 +512,40 @@ impl CodexIndexer {
                                 .get("role")
                                 .and_then(|r| r.as_str())
                                 .unwrap_or("");
-                            if role == "user" || role == "developer" {
+                            if role == "developer" {
                                 continue;
                             }
-                            if let Some(content_parts) =
-                                event_payload.get("content").and_then(|c| c.as_array())
-                            {
-                                for part in content_parts {
-                                    if part.get("type").and_then(|t| t.as_str())
-                                        == Some("output_text")
-                                    {
-                                        if let Some(text) =
-                                            part.get("text").and_then(|t| t.as_str())
-                                        {
-                                            if !text.trim().is_empty() {
-                                                messages.push((
-                                                    "assistant".to_string(),
-                                                    timestamp.clone(),
-                                                    text.to_string(),
-                                                    current_model.clone(),
-                                                ));
-                                            }
-                                        }
-                                    }
+                            if role == "user" {
+                                // The clean copy is in event_msg/item_completed
+                                // (or the legacy event_msg/user_message). Only
+                                // fall back to the protocol log when neither
+                                // event was written.
+                                if has_item_user || has_legacy_user {
+                                    continue;
                                 }
+                                let text = event_payload
+                                    .get("content")
+                                    .map(user_input_text)
+                                    .unwrap_or_default();
+                                if !text.trim().is_empty() {
+                                    if title_parts.is_empty() {
+                                        title_parts.push(text.chars().take(100).collect());
+                                    }
+                                    messages.push(("user".to_string(), timestamp, text, None));
+                                }
+                                continue;
+                            }
+                            let text = event_payload
+                                .get("content")
+                                .map(|content| content_text(content, &["output_text"]))
+                                .unwrap_or_default();
+                            if !text.trim().is_empty() {
+                                messages.push((
+                                    "assistant".to_string(),
+                                    timestamp.clone(),
+                                    text,
+                                    current_model.clone(),
+                                ));
                             }
                         }
                         _ => {}
@@ -557,6 +696,16 @@ mod tests {
             writeln!(f, "{}", line).unwrap();
         }
         file_path
+    }
+
+    fn message_rows(conn: &Connection) -> Vec<(String, String)> {
+        let mut stmt = conn
+            .prepare("SELECT message_type, full_content FROM messages ORDER BY depth ASC")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
     }
 
     #[test]
@@ -963,5 +1112,139 @@ mod tests {
         // user_message + two agent_messages (consolidated) = 2
         assert_eq!(msg_count, 2);
         assert_eq!(project, "/tmp/myproject");
+    }
+
+    #[test]
+    fn test_paginated_item_completed_user_message_is_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+
+        let session_file = write_session_file(
+            dir.path(),
+            "paginated-user.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"12121212-3434-5656-7878-909090909090","cwd":"/tmp","timestamp":"2026-10-02T05:05:00Z"}}"#,
+                r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\n\ninjected"},{"type":"input_text","text":"<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"}]},"timestamp":"2026-10-02T05:05:01Z"}"##,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"本物の指示"}]},"timestamp":"2026-10-02T05:05:02Z"}"#,
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"本物の指示"}]}},"timestamp":"2026-10-02T05:05:02Z"}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"了解しました"}]},"timestamp":"2026-10-02T05:05:03Z"}"#,
+            ],
+        );
+
+        let indexer = create_indexer(dir.path());
+        let count = indexer.index_session_file(&conn, &session_file).unwrap();
+        assert_eq!(count, 2);
+
+        let rows = message_rows(&conn);
+        assert_eq!(rows[0], ("user".to_string(), "本物の指示".to_string()));
+        assert_eq!(
+            rows[1],
+            ("assistant".to_string(), "了解しました".to_string())
+        );
+
+        let title: String = conn
+            .query_row(
+                "SELECT conversation_summary FROM conversations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "本物の指示");
+    }
+
+    #[test]
+    fn test_paginated_response_item_user_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+
+        let session_file = write_session_file(
+            dir.path(),
+            "paginated-fallback.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"23232323-4545-6767-8989-010101010101","cwd":"/tmp","timestamp":"2026-10-02T05:05:00Z"}}"#,
+                r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\n\ninjected"}]},"timestamp":"2026-10-02T05:05:01Z"}"##,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/tmp</cwd>\n</environment_context>"}]},"timestamp":"2026-10-02T05:05:02Z"}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"フォールバックの指示"}]},"timestamp":"2026-10-02T05:05:03Z"}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"対応します"}]},"timestamp":"2026-10-02T05:05:04Z"}"#,
+            ],
+        );
+
+        let indexer = create_indexer(dir.path());
+        let count = indexer.index_session_file(&conn, &session_file).unwrap();
+        assert_eq!(count, 2);
+
+        let rows = message_rows(&conn);
+        assert_eq!(
+            rows[0],
+            ("user".to_string(), "フォールバックの指示".to_string())
+        );
+        assert_eq!(rows[1], ("assistant".to_string(), "対応します".to_string()));
+
+        let title: String = conn
+            .query_row(
+                "SELECT conversation_summary FROM conversations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "フォールバックの指示");
+    }
+
+    #[test]
+    fn test_paginated_injected_user_context_is_not_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+
+        let session_file = write_session_file(
+            dir.path(),
+            "paginated-injected-only.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"34343434-5656-7878-9090-121212121212","cwd":"/tmp","timestamp":"2026-10-02T05:05:00Z"}}"#,
+                r##"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions\n\ninjected"}]},"timestamp":"2026-10-02T05:05:01Z"}"##,
+                r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"<permissions instructions>sandbox</permissions instructions>"}]},"timestamp":"2026-10-02T05:05:02Z"}"#,
+                r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"了解しました"}]},"timestamp":"2026-10-02T05:05:03Z"}"#,
+            ],
+        );
+
+        let indexer = create_indexer(dir.path());
+        let count = indexer.index_session_file(&conn, &session_file).unwrap();
+        assert_eq!(count, 1);
+
+        let rows = message_rows(&conn);
+        assert_eq!(
+            rows,
+            vec![("assistant".to_string(), "了解しました".to_string())]
+        );
+
+        let title: String = conn
+            .query_row(
+                "SELECT conversation_summary FROM conversations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Untitled");
+    }
+
+    #[test]
+    fn test_paginated_item_completed_joins_multiple_text_parts() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+
+        let session_file = write_session_file(
+            dir.path(),
+            "paginated-multipart.jsonl",
+            &[
+                r#"{"type":"session_meta","payload":{"id":"45454545-6767-8989-0101-232323232323","cwd":"/tmp","timestamp":"2026-10-02T05:05:00Z"}}"#,
+                r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","content":[{"type":"text","text":"1行目"},{"type":"text","text":"2行目"}]}},"timestamp":"2026-10-02T05:05:01Z"}"#,
+            ],
+        );
+
+        let indexer = create_indexer(dir.path());
+        let count = indexer.index_session_file(&conn, &session_file).unwrap();
+        assert_eq!(count, 1);
+
+        let rows = message_rows(&conn);
+        assert_eq!(rows[0], ("user".to_string(), "1行目\n2行目".to_string()));
     }
 }
