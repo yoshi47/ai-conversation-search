@@ -136,7 +136,8 @@ impl ConversationRow {
             message_count: row.get("message_count")?,
             source: row.get("source")?,
             indexed_at: row.get("indexed_at")?,
-            // Tolerant: partial SELECTs (e.g. load_context) don't project this.
+            // Tolerant: the read-only search connection never runs migrations, so a DB
+            // that predates the column has no `model` in `SELECT *`.
             model: row.get::<_, Option<String>>("model").unwrap_or(None),
         })
     }
@@ -667,7 +668,6 @@ pub struct IndexStatus {
 pub struct ConversationSearch {
     conn: Connection,
     db_path: String,
-    fts_rebuilt: bool,
 }
 
 impl ConversationSearch {
@@ -684,7 +684,6 @@ impl ConversationSearch {
         Ok(Self {
             conn,
             db_path: db_path.to_string(),
-            fts_rebuilt: false,
         })
     }
 
@@ -731,37 +730,31 @@ impl ConversationSearch {
                     r.get(0)
                 })?;
 
-        let mut by_source = Vec::new();
-        {
-            let mut stmt = self.conn.prepare(
-                "SELECT COALESCE(source, 'claude_code'), COUNT(*) FROM conversations GROUP BY source ORDER BY COUNT(*) DESC"
-            )?;
-            let rows = stmt.query_map([], |row| {
+        let by_source = self
+            .conn
+            .prepare(
+                "SELECT COALESCE(source, 'claude_code'), COUNT(*) FROM conversations GROUP BY COALESCE(source, 'claude_code') ORDER BY COUNT(*) DESC"
+            )?
+            .query_map([], |row| {
                 Ok(SourceCount {
                     source: row.get(0)?,
                     count: row.get(1)?,
                 })
-            })?;
-            for row in rows.flatten() {
-                by_source.push(row);
-            }
-        }
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
-        let mut by_repo = Vec::new();
-        {
-            let mut stmt = self.conn.prepare(
+        let by_repo = self
+            .conn
+            .prepare(
                 "SELECT repo_root, COUNT(*) as cnt FROM conversations WHERE repo_root IS NOT NULL GROUP BY repo_root ORDER BY cnt DESC LIMIT 20"
-            )?;
-            let rows = stmt.query_map([], |row| {
+            )?
+            .query_map([], |row| {
                 Ok(RepoCount {
                     repo_root: row.get(0)?,
                     count: row.get(1)?,
                 })
-            })?;
-            for row in rows.flatten() {
-                by_repo.push(row);
-            }
-        }
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
 
         let indexed_files: i64 =
             self.conn
@@ -976,6 +969,12 @@ impl ConversationSearch {
         const BATCH_SIZE: usize = 500;
         let mut all_results: Vec<SearchResultRow> = Vec::new();
         let mut candidates_scanned = 0usize;
+        // Full-match boost (Hybrid path only): rows holding every long term sort
+        // above partial OR matches. Single-term and Raw queries skip the content
+        // scan -- every row trivially qualifies, so the order stays pure bm25.
+        // Judged per batch, while context_snippet still holds the full text, because
+        // the early stop below counts these rows.
+        let mut full_rowids: std::collections::HashSet<i64> = std::collections::HashSet::new();
 
         for chunk in scored.chunks(BATCH_SIZE) {
             candidates_scanned += chunk.len();
@@ -1018,6 +1017,11 @@ impl ConversationSearch {
             // bm25 score lives in phase 1 and is not visible to this query.
 
             let batch_results = self.execute_search_typed(&sql, &batch_params)?;
+            for r in &batch_results {
+                if boost_terms.len() < 2 || contains_all_terms(&r.context_snippet, &boost_terms) {
+                    full_rowids.insert(r.rowid);
+                }
+            }
             all_results.extend(batch_results);
 
             // Early stop, valid ONLY for relevance order.
@@ -1029,34 +1033,32 @@ impl ConversationSearch {
             //
             // What holds instead: phase 1 returns rowids sorted best-first, so after
             // processing batches 0..k every unprocessed candidate scores no better than
-            // what we already hold. Once we have `limit` post-filter rows, they are the
-            // globally best `limit` rows -- filters only remove candidates, never promote
-            // them, so this is independent of which filters are active.
+            // what we already hold. Once we have `limit` post-filter FULL matches, they
+            // are the globally best `limit` rows -- filters only remove candidates, never
+            // promote them, so this is independent of which filters are active.
+            //
+            // WRONG alternative: counting all collected rows. The sort below ranks a
+            // full match above every partial one regardless of bm25, so `limit` partial
+            // rows prove nothing about a full match further down the bm25 order.
             //
             // Does not hold for Recent order: recency is uncorrelated with bm25 rank.
-            if filter.sort == SortOrder::Relevance && all_results.len() >= limit as usize {
+            if filter.sort == SortOrder::Relevance && full_rowids.len() >= limit as usize {
                 break;
             }
         }
 
         // 本文ヒット済みセッションは除外して合流し、代表/上位を奪わせない。
         // 順序は下のソートで決める: 本文の全語一致 > タイトルのみ > 本文の部分一致。
+        // タイトル行は本文の全語一致より下の層なので、上の早期打ち切りの判定には影響しない。
         let mut title_rowids: std::collections::HashSet<i64> = std::collections::HashSet::new();
         self.inject_title_matches(trimmed, filter, &mut all_results, &mut title_rowids, limit)?;
-
-        // Full-match boost (Hybrid path only): rows holding every long term sort
-        // above partial OR matches. Single-term and Raw queries skip the content
-        // scan -- every row trivially qualifies, so the order stays pure bm25.
-        // Runs before snippet extraction, while context_snippet still holds the
-        // full text (title rows hold the title itself, which matches by AND).
-        let mut full_rowids: std::collections::HashSet<i64> = std::collections::HashSet::new();
-        if boost_terms.len() < 2 {
-            full_rowids.extend(all_results.iter().map(|r| r.rowid));
-        } else {
-            for r in &all_results {
-                if contains_all_terms(&r.context_snippet, &boost_terms) {
-                    full_rowids.insert(r.rowid);
-                }
+        // Title rows hold the title itself in context_snippet, which matches by AND.
+        for r in all_results
+            .iter()
+            .filter(|r| title_rowids.contains(&r.rowid))
+        {
+            if boost_terms.len() < 2 || contains_all_terms(&r.context_snippet, &boost_terms) {
+                full_rowids.insert(r.rowid);
             }
         }
 
@@ -1508,16 +1510,18 @@ impl ConversationSearch {
             params.push(Box::new(format!("%{}%", escape_like(term))));
         }
         Self::append_conversation_filters(&mut sql, &mut params, filter)?;
+        // Excluded in SQL so the LIMIT counts only unseen sessions; filtering after the
+        // LIMIT let recent already-seen titles fill the cap. One JSON parameter rather
+        // than a placeholder per id: the grouped path passes every matching session,
+        // which can exceed SQLITE_MAX_VARIABLE_NUMBER.
+        sql.push_str(" AND c.session_id NOT IN (SELECT value FROM json_each(?))");
+        params.push(Box::new(serde_json::to_string(seen_sessions)?));
         sql.push_str(" ORDER BY c.last_message_at DESC LIMIT ?");
         params.push(Box::new(limit.saturating_add(1)));
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
-        let rows = self.query_rows(&sql, &param_refs, SearchResultRow::from_row)?;
-        Ok(rows
-            .into_iter()
-            .filter(|r| !seen_sessions.contains(&r.session_id))
-            .collect())
+        self.query_rows(&sql, &param_refs, SearchResultRow::from_row)
     }
 
     /// Fold title-only sessions into an existing body-FTS result set.
@@ -1598,27 +1602,13 @@ impl ConversationSearch {
     }
 
     fn execute_search_typed(
-        &mut self,
+        &self,
         sql: &str,
         params: &[Box<dyn rusqlite::types::ToSql>],
     ) -> Result<Vec<SearchResultRow>> {
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
-
-        match self.query_rows(sql, &param_refs, SearchResultRow::from_row) {
-            Ok(results) => Ok(results),
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("fts5: missing row") && !self.fts_rebuilt {
-                    eprintln!("FTS index corruption detected, rebuilding...");
-                    self.rebuild_fts()?;
-                    eprintln!("FTS index rebuilt, retrying search...");
-                    self.query_rows(sql, &param_refs, SearchResultRow::from_row)
-                } else {
-                    Err(e)
-                }
-            }
-        }
+        self.query_rows(sql, &param_refs, SearchResultRow::from_row)
     }
 
     fn query_rows<T, F>(
@@ -1631,15 +1621,10 @@ impl ConversationSearch {
         F: Fn(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
     {
         let mut stmt = self.conn.prepare(sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(params), |row| map_fn(row))?;
-        let mut results = Vec::new();
-        for row in rows {
-            match row {
-                Ok(r) => results.push(r),
-                Err(e) => log::warn!("Error reading row: {}", e),
-            }
-        }
-        Ok(results)
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params), |row| map_fn(row))?
+            .collect::<rusqlite::Result<Vec<T>>>()?;
+        Ok(rows)
     }
 
     pub fn get_conversation_context(
@@ -2219,9 +2204,6 @@ impl ConversationSearch {
 
         let param_refs: Vec<&dyn rusqlite::types::ToSql> =
             params.iter().map(|p| p.as_ref()).collect();
-        // Known limitation, shared with the search paths: query_rows drops rows whose
-        // mapping fails with a log::warn, so a failure on the over-fetched row would
-        // under-report truncation rather than over-report it.
         let mut rows = self.query_rows(&sql, &param_refs, ConversationRow::from_row)?;
         let truncated = rows.len() as i64 > limit;
         rows.truncate(limit as usize);
@@ -2377,133 +2359,6 @@ impl ConversationSearch {
             }
         }
     }
-
-    #[allow(dead_code)]
-    pub fn load_context(
-        &self,
-        days_back: i64,
-        project_path: Option<&str>,
-        repo: Option<&str>,
-        max_conversations: i64,
-        max_messages_per_conv: i64,
-    ) -> Result<String> {
-        let cutoff = (Local::now() - TimeDelta::days(days_back)).naive_local();
-        let cutoff_str = cutoff.format("%Y-%m-%dT%H:%M:%S").to_string();
-
-        let mut sql = String::from(
-            "SELECT session_id, conversation_summary, project_path, message_count, last_message_at FROM conversations WHERE last_message_at >= ? AND conversation_summary IS NOT NULL AND conversation_summary != 'None' AND message_count > 2 AND NOT (project_path LIKE '%claude/finder' AND message_count < 5)"
-        );
-        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-        params.push(Box::new(cutoff_str));
-
-        if let Some(pp) = project_path {
-            sql.push_str(" AND project_path = ?");
-            params.push(Box::new(pp.to_string()));
-        }
-
-        if let Some(r) = repo {
-            sql.push_str(" AND repo_root LIKE ? ESCAPE '\\'");
-            params.push(Box::new(format!("%{}%", escape_like(r))));
-        }
-
-        sql.push_str(" ORDER BY last_message_at DESC LIMIT ?");
-        params.push(Box::new(max_conversations));
-
-        let param_refs: Vec<&dyn rusqlite::types::ToSql> =
-            params.iter().map(|p| p.as_ref()).collect();
-        let conversations = self.query_rows(&sql, &param_refs, ConversationRow::from_row)?;
-
-        if conversations.is_empty() {
-            return Ok(format!(
-                "No conversations found in the last {} day(s).",
-                days_back
-            ));
-        }
-
-        let day_word = if days_back == 1 { "" } else { "s" };
-        let mut lines = vec![format!(
-            "# Conversations (last {} day{})\n",
-            days_back, day_word
-        )];
-
-        for conv in &conversations {
-            let session_id = &conv.session_id;
-            let summary = conv.conversation_summary.as_deref().unwrap_or("");
-            let project = conv.project_path.as_deref().unwrap_or("");
-            let msg_count = conv.message_count;
-            let last_at = conv.last_message_at.as_deref().unwrap_or("");
-
-            let date_str = format_timestamp(last_at, true, false);
-            let session_short = &session_id[..std::cmp::min(8, session_id.len())];
-
-            lines.push(format!("## [{}] {}", session_short, summary));
-            lines.push(format!(
-                "**{} msgs** | {} | {}\n",
-                msg_count, project, date_str
-            ));
-
-            // Fetch messages
-            let msg_sql = "SELECT message_uuid, timestamp, message_type, summary, is_sidechain, project_path, is_tool_noise FROM messages WHERE session_id = ? AND is_tool_noise = FALSE AND is_meta_conversation = FALSE ORDER BY timestamp DESC LIMIT ?";
-            let mut msg_results = self.query_rows(
-                msg_sql,
-                &[
-                    session_id as &dyn rusqlite::types::ToSql,
-                    &max_messages_per_conv as &dyn rusqlite::types::ToSql,
-                ],
-                |row| {
-                    Ok((
-                        row.get::<_, String>("message_uuid")?,
-                        row.get::<_, String>("timestamp")?,
-                        row.get::<_, String>("message_type")?,
-                        row.get::<_, Option<String>>("summary")?,
-                        row.get::<_, bool>("is_sidechain")?,
-                    ))
-                },
-            )?;
-
-            msg_results.reverse();
-
-            for (uuid, timestamp, msg_type, summary_opt, is_sidechain) in &msg_results {
-                let msg_summary = summary_opt.as_deref().unwrap_or("");
-                if msg_summary.is_empty()
-                    || msg_summary.starts_with("[Tool")
-                    || msg_summary == "[Tool result]"
-                    || msg_summary.starts_with("[Request interrupted")
-                    || msg_summary.trim().len() < 10
-                {
-                    continue;
-                }
-
-                let msg_time = format_timestamp(timestamp, false, false);
-                let icon = if msg_type == "user" {
-                    "\u{1f464}"
-                } else {
-                    "\u{1f916}"
-                };
-                let branch = if *is_sidechain { "\u{1f33f} " } else { "" };
-                let uuid_short = &uuid[..8.min(uuid.len())];
-
-                lines.push(format!(
-                    "{} {} `{}` {}{}",
-                    icon, msg_time, uuid_short, branch, msg_summary
-                ));
-            }
-
-            lines.push(String::new());
-        }
-
-        Ok(lines.join("\n"))
-    }
-
-    fn rebuild_fts(&mut self) -> Result<()> {
-        let rw_conn = crate::db::connect(&self.db_path, false)?;
-        rw_conn.execute(
-            "INSERT INTO message_content_fts(message_content_fts) VALUES('rebuild')",
-            [],
-        )?;
-        self.fts_rebuilt = true;
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -2512,7 +2367,6 @@ impl ConversationSearch {
         Self {
             conn,
             db_path: String::new(),
-            fts_rebuilt: false,
         }
     }
 }
@@ -3969,6 +3823,145 @@ mod tests {
             results[0].message_uuid, "full",
             "the document holding every term must rank first despite worse bm25"
         );
+    }
+
+    /// The early stop must wait for `limit` FULL matches, not `limit` rows: the tier
+    /// rule puts a full match above every partial one, so a full match past the first
+    /// batch still belongs on top. Stopping on raw row count let one batch of partial
+    /// matches fill the page and the full match was never fetched.
+    #[test]
+    fn test_early_stop_keeps_full_match_beyond_first_batch() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-01T00:00:00",
+            "2025-01-31T00:00:00",
+            "claude_code",
+        );
+        // Both terms common, so neither idf lifts the full match; its length then sinks
+        // it below all 600 short partial matches -- past the first BATCH_SIZE of 500.
+        for i in 0..300 {
+            for term in ["alpha", "bravo"] {
+                insert_test_message(
+                    &conn,
+                    &format!("{}{:04}", term, i),
+                    "sess1",
+                    term,
+                    "user",
+                    "2025-01-10T10:00:00",
+                    "/proj",
+                );
+            }
+        }
+        let diluted = format!(
+            "alpha {} bravo {}",
+            "filler ".repeat(300),
+            "filler ".repeat(300)
+        );
+        insert_test_message(
+            &conn,
+            "full",
+            "sess1",
+            &diluted,
+            "user",
+            "2025-01-02T10:00:00",
+            "/proj",
+        );
+
+        let mut s = ConversationSearch::from_connection(conn);
+        let fts_query = match plan_query("alpha bravo") {
+            QueryPlan::Hybrid { fts_query, .. } => fts_query,
+            other => panic!("expected Hybrid, got {}", plan_name(&other)),
+        };
+        let full_rowid: i64 = s
+            .conn
+            .query_row(
+                "SELECT rowid FROM messages WHERE message_uuid = 'full'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let phase1_rank = s
+            .query_fts_rowids(&fts_query)
+            .unwrap()
+            .iter()
+            .position(|(rowid, _)| *rowid == full_rowid)
+            .unwrap();
+        assert!(
+            phase1_rank >= 500,
+            "fixture must put the full match past the first batch, got rank {}",
+            phase1_rank
+        );
+
+        let rows = s
+            .search_conversations("alpha bravo", &default_filter())
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 10);
+        assert_eq!(rows[0].message_uuid, "full");
+    }
+
+    /// Fixture for the title-cap tests: two recent sessions whose titles match and
+    /// whose bodies partially match, plus an older title-only session. The body hits
+    /// are partial (one of two terms) so the full title match outranks them.
+    fn setup_title_cap_db() -> ConversationSearch {
+        let conn = setup_test_db();
+        for (sid, title, last_at, body) in [
+            ("seen1", "alpha bravo one", "2025-01-20T10:00:00", "alpha"),
+            ("seen2", "alpha bravo two", "2025-01-19T10:00:00", "alpha"),
+            (
+                "title_only",
+                "alpha bravo old",
+                "2025-01-05T10:00:00",
+                "unrelated text",
+            ),
+        ] {
+            insert_test_conversation(
+                &conn,
+                sid,
+                "/proj",
+                title,
+                "2025-01-01T00:00:00",
+                last_at,
+                "claude_code",
+            );
+            insert_test_message(
+                &conn,
+                &format!("{}_msg", sid),
+                sid,
+                body,
+                "user",
+                last_at,
+                "/proj",
+            );
+        }
+        ConversationSearch::from_connection(conn)
+    }
+
+    /// The title query's LIMIT must apply after excluding sessions that body FTS already
+    /// found. Capping first let the recent, already-seen titles take every slot and
+    /// dropped the older title-only session.
+    #[test]
+    fn test_title_cap_applies_after_excluding_seen_sessions() {
+        let mut s = setup_title_cap_db();
+        let filter = SearchFilter {
+            limit: 1,
+            ..Default::default()
+        };
+
+        let flat = s.search_conversations("alpha bravo", &filter).unwrap().rows;
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].session_id, "title_only");
+
+        let grouped = s
+            .search_grouped_by_session("alpha bravo", &filter)
+            .unwrap()
+            .rows;
+        assert_eq!(grouped.len(), 1);
+        assert_eq!(grouped[0].representative.session_id, "title_only");
     }
 
     /// Body hits sort above title-only matches in the same tier. Before the tier
@@ -6648,5 +6641,91 @@ mod tests {
         let status = searcher.get_index_status(2).unwrap();
 
         assert_eq!(status.orphan_conversations, 1);
+    }
+
+    /// A NULL source is displayed as `claude_code`, so it must also be counted as one.
+    /// Grouping on the raw column split them into two rows with the same label.
+    #[test]
+    fn test_status_by_source_merges_null_into_claude_code() {
+        let conn = setup_test_db();
+        insert_orphan_conversation(&conn, "explicit", None, 0, "claude_code");
+        conn.execute(
+            "INSERT INTO conversations (session_id, project_path, conversation_file, root_message_uuid, first_message_at, last_message_at, message_count, source) VALUES ('legacy', '/proj', NULL, 'root1', '2025-01-15T10:00:00', '2025-01-15T10:01:00', 0, NULL)",
+            [],
+        )
+        .unwrap();
+
+        let searcher = ConversationSearch::from_connection(conn);
+        let status = searcher.get_index_status(0).unwrap();
+
+        let claude: Vec<_> = status
+            .by_source
+            .iter()
+            .filter(|s| s.source == "claude_code")
+            .collect();
+        assert_eq!(claude.len(), 1, "one row per displayed source");
+        assert_eq!(claude[0].count, 2);
+    }
+
+    /// A step-time SQLite error ends the iteration. Swallowing it returned the rows read
+    /// so far as if they were the complete answer.
+    #[test]
+    fn test_query_rows_propagates_step_error() {
+        let searcher = ConversationSearch::from_connection(setup_test_db());
+        // abs(i64::MIN) overflows while stepping onto the second row.
+        let result = searcher.query_rows(
+            "SELECT abs(x) FROM (SELECT 1 AS x UNION ALL SELECT -9223372036854775808)",
+            &[],
+            |row| row.get::<_, i64>(0),
+        );
+        assert!(
+            result.is_err(),
+            "step error must propagate, got {:?}",
+            result
+        );
+    }
+
+    /// Index entries whose content row is gone are dropped by the phase-2 rowid join
+    /// instead of surfacing as `fts5: missing row`: phase 1 reads only rowid and bm25,
+    /// and the error fires only when an FTS column is read through the content table.
+    /// This is why search has no FTS auto-rebuild; `status` reports the damage instead.
+    #[test]
+    fn test_search_tolerates_orphaned_fts_entries() {
+        let conn = setup_test_db();
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "summary",
+            "2025-01-15T09:00:00",
+            "2025-01-15T10:00:00",
+            "claude_code",
+        );
+        for uuid in ["gone", "kept"] {
+            insert_test_message(
+                &conn,
+                uuid,
+                "sess1",
+                "rustacean content",
+                "user",
+                "2025-01-15T10:00:00",
+                "/proj",
+            );
+        }
+        // Bypass the delete trigger to strand the index entry, like the pre-0.15.0 bug.
+        conn.execute_batch(
+            "DROP TRIGGER messages_ad; DELETE FROM messages WHERE message_uuid = 'gone';",
+        )
+        .unwrap();
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let flat = searcher
+            .search_conversations("rustacean", &default_filter())
+            .unwrap();
+        assert_eq!(uuids(&flat.rows), vec!["kept"]);
+        let grouped = searcher
+            .search_grouped_by_session("rustacean", &default_filter())
+            .unwrap();
+        assert_eq!(grouped.rows.len(), 1);
     }
 }
