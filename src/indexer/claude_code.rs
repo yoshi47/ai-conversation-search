@@ -862,7 +862,7 @@ impl ConversationIndexer {
             // per prompt and only the last matters, so overwrite -- it wins over
             // the legacy summary-line leaf below.
             if entry.entry_type.as_deref() == Some("last-prompt") {
-                if let Some(leaf) = entry.leaf_uuid.clone() {
+                if let Some(leaf) = entry.leaf_uuid {
                     if !leaf.trim().is_empty() {
                         leaf_uuid_from_jsonl = Some(leaf);
                     }
