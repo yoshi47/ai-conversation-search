@@ -24,6 +24,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - OpenCode DB のパスを URI に埋め込んで開いていたため、`?` `#` `%` を含むパスでは別のファイルを開いていた。パスをそのまま渡す
 - OpenCode の `root_message_uuid` / `leaf_message_uuid` が、本文が空で索引しなかったメッセージを指すことがあった。索引したメッセージの先頭と末尾を使う。再索引で索引できるメッセージが0件になったセッションは、conversations の行も消す
 - Claude Code の transcript に同じ uuid の行が複数あると、深さ計算が止まらないことがあった（親が違う重複行で閉路ができると無限ループ、親が同じだとキューが段ごとに倍増）。生 transcript から木を作る `tree` などの経路も、同じ閉路で無限に再帰していた。パース時に uuid の重複行を除き（最初の行を残す。索引の `INSERT OR IGNORE` と同じ）、深さ計算にも訪問済みの判定を足した
+- メッセージが 0 件の transcript、summarizer の会話、session_id の無い transcript を索引しないとき、同期状態を記録していなかった。そのため毎回フルパースされ、`status` にも「未索引」として残り続けていた。observer の会話と同じく、処理済みとして mtime を記録するようにした
 
 ## [0.18.2] - 2026-11-05
 

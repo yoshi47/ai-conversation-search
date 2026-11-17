@@ -1300,14 +1300,19 @@ impl ConversationIndexer {
 
         let (conv_meta, mut messages) = self.parse_conversation_file(file_path)?;
 
+        // Every skip below stamps sync_state, as the observer skip does: re-running
+        // cannot change the outcome until the file changes, and an unstamped file is
+        // re-parsed on every run and counted as "not indexed" by `status`.
         if messages.is_empty() {
             self.log(&format!("  No messages found in {}", file_path.display()));
+            record_sync_state(&self.conn, file_path, file_mtime)?;
             return Ok(());
         }
 
         // Skip summarizer conversations
         if summarization::is_summarizer_conversation(&messages) {
             self.log("  Skipping automated summarizer conversation");
+            record_sync_state(&self.conn, file_path, file_mtime)?;
             return Ok(());
         }
 
@@ -1316,8 +1321,6 @@ impl ConversationIndexer {
         // us through CONVERSATION_SEARCH_EXTRA_DIRS.
         if !self.index_observer && summarization::is_observer_conversation(&messages) {
             self.log("  Skipping claude-mem observer conversation");
-            // Recorded even though nothing is indexed: claude-mem keeps producing these,
-            // and without a sync_state row every run would re-parse each one in full.
             record_sync_state(&self.conn, file_path, file_mtime)?;
             return Ok(());
         }
@@ -1355,6 +1358,7 @@ impl ConversationIndexer {
             Some(s) => s.clone(),
             None => {
                 self.log(&format!("  No session_id found in {}", file_path.display()));
+                record_sync_state(&self.conn, file_path, file_mtime)?;
                 return Ok(());
             }
         };
@@ -3053,6 +3057,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamped, 1);
+    }
+
+    fn sync_state_rows(indexer: &ConversationIndexer, file: &Path) -> i64 {
+        indexer
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_sync_state WHERE file_path = ?",
+                [file.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    // `status` compares sync_state rows with files on disk. A transcript the indexer
+    // deliberately leaves out must still be stamped, or it reads as "not indexed" forever
+    // and is fully re-parsed on every run.
+
+    #[test]
+    fn test_indexer_records_sync_state_for_transcript_without_messages() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "empty",
+            &[r#"{"type":"custom-title","customTitle":"t"}"#],
+        );
+
+        indexer.index_conversation(&file).unwrap();
+
+        assert_eq!(sync_state_rows(&indexer, &file), 1);
+    }
+
+    #[test]
+    fn test_indexer_records_sync_state_for_skipped_summarizer() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "summarizer",
+            &[
+                r#"{"uuid":"u1","parentUuid":null,"type":"user","sessionId":"sum1","message":{"role":"user","content":"Summarize this conversation"}}"#,
+                r#"{"uuid":"u2","parentUuid":"u1","type":"assistant","sessionId":"sum1","message":{"role":"assistant","content":"ok"}}"#,
+            ],
+        );
+
+        indexer.index_conversation(&file).unwrap();
+
+        assert_eq!(count_messages(&indexer), 0);
+        assert_eq!(sync_state_rows(&indexer, &file), 1);
+    }
+
+    #[test]
+    fn test_indexer_records_sync_state_for_transcript_without_session_id() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "nosession",
+            &[
+                r#"{"uuid":"u1","parentUuid":null,"type":"user","message":{"role":"user","content":"hello"}}"#,
+            ],
+        );
+
+        indexer.index_conversation(&file).unwrap();
+
+        assert_eq!(count_messages(&indexer), 0);
+        assert_eq!(sync_state_rows(&indexer, &file), 1);
     }
 
     #[test]
