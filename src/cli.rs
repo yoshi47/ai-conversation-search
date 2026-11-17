@@ -2396,22 +2396,51 @@ fn print_tree_nodes(nodes: &[TreeNode], indent: usize, opts: &TreeOpts) {
 
 fn cmd_resume(uuid: &str) -> Result<()> {
     let target = resolve_resume_target(uuid)?;
-    match target.project_path {
-        Some(project_path) => {
-            println!("cd -- {}", shell_quote(&project_path));
-            println!(
-                "{} --resume {}",
-                claude_cmd(),
-                shell_quote(&target.session_id)
-            );
+    match resume_lines(&target, &claude_cmd()) {
+        Ok(lines) => {
+            for line in lines {
+                println!("{}", line);
+            }
+            Ok(())
         }
-        None => {
-            eprintln!("Message not found: {}", uuid);
+        Err(reason) => {
+            eprintln!("{}", reason);
             std::process::exit(1);
         }
     }
+}
 
-    Ok(())
+/// The lines `resume` prints, or why there is nothing to print.
+///
+/// OpenCode and Codex sessions are an error rather than a note on stdout: callers run
+/// this output, and an empty stdout with exit 0 would let `eval "$(… resume …)"` go on
+/// as if it had resumed something.
+fn resume_lines(target: &ResumeTarget, cmd: &str) -> std::result::Result<Vec<String>, String> {
+    match target.source.as_str() {
+        "opencode" => {
+            return Err(format!(
+                "OpenCode sessions are resumed with their own tools: {}",
+                target.session_id
+            ))
+        }
+        "codex" => {
+            return Err(format!(
+                "Codex sessions are resumed with their own tools: {}",
+                target.session_id
+            ))
+        }
+        _ => {}
+    }
+    match target.project_path.as_deref() {
+        Some(project_path) => Ok(vec![
+            format!("cd -- {}", shell_quote(project_path)),
+            format!("{} --resume {}", cmd, shell_quote(&target.session_id)),
+        ]),
+        None => Err(format!(
+            "No project path recorded for session {}",
+            target.session_id
+        )),
+    }
 }
 
 /// A session that can be resumed, resolved from either a message UUID or a session ID.
@@ -2421,6 +2450,18 @@ struct ResumeTarget {
     session_id: String,
     project_path: Option<String>,
     model: Option<String>,
+}
+
+/// The source a session id belongs to, read from the prefix the indexers stamp on it
+/// (`indexer/opencode.rs`, `indexer/codex.rs`). Only for rows that lack a `source`.
+fn source_for_session_id(session_id: &str) -> &'static str {
+    if session_id.starts_with("oc:") {
+        "opencode"
+    } else if session_id.starts_with("codex:") {
+        "codex"
+    } else {
+        "claude_code"
+    }
 }
 
 /// Escape LIKE wildcards for prefix resolution (same rules as `search::escape_like`).
@@ -2443,10 +2484,9 @@ fn fetch_resume_target(
         let sid: String = row.get(0)?;
         let source: Option<String> = row.get(1)?;
         let project_path: Option<String> = row.get(2)?;
-        // Tolerant: a stale handle mid-migration may lack the column.
-        let model: Option<String> = row.get::<_, Option<String>>(3).unwrap_or(None);
+        let model: Option<String> = row.get(3)?;
         return Ok(Some(ResumeTarget {
-            source: source.unwrap_or_else(|| "claude_code".to_string()),
+            source: source.unwrap_or_else(|| source_for_session_id(&sid).to_string()),
             session_id: sid,
             project_path,
             model,
@@ -2465,7 +2505,7 @@ fn fetch_resume_target(
 fn resolve_resume_target_with_conn(
     conn: &rusqlite::Connection,
     input: &str,
-) -> Result<ResumeTarget> {
+) -> Result<Option<ResumeTarget>> {
     if input.is_empty() {
         return Err(AppError::General("empty session id".to_string()));
     }
@@ -2483,7 +2523,7 @@ fn resolve_resume_target_with_conn(
     }
 
     if let Some(target) = fetch_resume_target(conn, input)? {
-        return Ok(target);
+        return Ok(Some(target));
     }
 
     let esc = escape_resume_like(input);
@@ -2507,13 +2547,7 @@ fn resolve_resume_target_with_conn(
         0 => {}
         1 => {
             let full = candidates.into_iter().next().unwrap();
-            if let Some(target) = fetch_resume_target(conn, &full)? {
-                return Ok(target);
-            }
-            return Err(AppError::General(format!(
-                "Conversation {} not found",
-                input
-            )));
+            return fetch_resume_target(conn, &full);
         }
         n => {
             let sample = candidates
@@ -2540,25 +2574,31 @@ fn resolve_resume_target_with_conn(
     match msg {
         Ok((session_id, msg_project)) => {
             if let Some(target) = fetch_resume_target(conn, &session_id)? {
-                return Ok(target);
+                return Ok(Some(target));
             }
-            Ok(ResumeTarget {
-                source: "claude_code".to_string(),
+            Ok(Some(ResumeTarget {
+                source: source_for_session_id(&session_id).to_string(),
                 session_id,
                 project_path: msg_project,
                 model: None,
-            })
+            }))
         }
-        Err(_) => Err(AppError::General(format!(
-            "Conversation {} not found",
-            input
-        ))),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(e.into()),
     }
 }
 
-fn resolve_resume_target(input: &str) -> Result<ResumeTarget> {
-    let conn = db::connect(db::DEFAULT_DB_PATH, true)?;
+fn not_found(input: &str) -> AppError {
+    AppError::General(format!("Conversation {} not found", input))
+}
+
+fn resolve_resume_target_at(db_path: &str, input: &str) -> Result<Option<ResumeTarget>> {
+    let conn = db::connect(db_path, true)?;
     resolve_resume_target_with_conn(&conn, input)
+}
+
+fn resolve_resume_target(input: &str) -> Result<ResumeTarget> {
+    resolve_resume_target_at(db::DEFAULT_DB_PATH, input)?.ok_or_else(|| not_found(input))
 }
 
 /// Split `claude_cmd()` into its real binary.
@@ -2821,7 +2861,39 @@ fn short_preview_time(ts: &str) -> String {
     ts.chars().take(16).collect()
 }
 
-#[allow(clippy::too_many_arguments)]
+/// How `preview` resolved its input.
+enum PreviewTarget {
+    Ready(ResumeTarget),
+    Failed(String),
+}
+
+/// Resolve `preview`'s input, indexing the transcript on the spot when it is not in the
+/// index yet -- the same retry `tree` gets from `lookup_tree`.
+///
+/// Only "not found" earns the retry. Ambiguous prefixes, unsafe input and database
+/// errors fail straight away: indexing cannot fix them, and an ambiguous prefix could
+/// pick one transcript out of several on disk.
+fn resolve_preview_target(
+    db_path: &str,
+    input: &str,
+    project_roots: Option<&[std::path::PathBuf]>,
+) -> Result<PreviewTarget> {
+    match resolve_resume_target_at(db_path, input) {
+        Ok(Some(target)) => return Ok(PreviewTarget::Ready(target)),
+        Ok(None) => {}
+        Err(e) => return Ok(PreviewTarget::Failed(e.to_string())),
+    }
+
+    let tree = lookup_tree(db_path, input, project_roots)?;
+    if let Some(error) = tree.error {
+        return Ok(PreviewTarget::Failed(error));
+    }
+    match resolve_resume_target_at(db_path, input)? {
+        Some(target) => Ok(PreviewTarget::Ready(target)),
+        None => Ok(PreviewTarget::Failed(not_found(input).to_string())),
+    }
+}
+
 fn cmd_preview(
     session_id: &str,
     query: Option<&str>,
@@ -2831,39 +2903,51 @@ fn cmd_preview(
     content_chars: usize,
 ) -> Result<()> {
     // Canonicalize first so bare prefixes (`e16efca0`) and `oc:`/`codex:`
-    // inputs resolve exactly like `resume-spec`. Ambiguous/unsafe inputs
-    // are hard errors here, matching `tree`'s wording via the shared helper.
-    // In `--json` mode an unresolvable id still prints the `tree`-shaped
-    // error envelope (`.error` key) so JSON readers need no second shape —
-    // only the exit status tells success from failure.
-    let target = match resolve_resume_target(session_id) {
-        Ok(target) => target,
+    // inputs resolve exactly like `resume-spec`. In `--json` mode an
+    // unresolvable id still prints the `tree`-shaped error envelope (`.error`
+    // key, no messages) so JSON readers need no second shape — only the exit
+    // status tells success from failure.
+    let resolved = match resolve_preview_target(db::DEFAULT_DB_PATH, session_id, None) {
+        Ok(resolved) => resolved,
         Err(e) => {
+            // Same reason as `cmd_tree`: with no database yet, the spawn is what builds one.
+            maybe_background_index();
+            return Err(e);
+        }
+    };
+    let target = match resolved {
+        PreviewTarget::Ready(target) => target,
+        PreviewTarget::Failed(reason) => {
             if json_output {
-                if let Ok(tree) = lookup_tree(db::DEFAULT_DB_PATH, session_id, None) {
-                    let json_val = serde_json::to_value(&tree)?;
-                    let mut localized = localize_timestamps(json_val);
-                    if let Some(map) = localized.as_object_mut() {
-                        map.insert("returned_messages".to_string(), serde_json::Value::from(0));
-                        map.insert(
-                            "query".to_string(),
-                            match normalize_preview_query(query) {
-                                Some(q) => serde_json::Value::String(q),
-                                None => serde_json::Value::Null,
-                            },
-                        );
-                        map.insert("matches".to_string(), serde_json::Value::Array(Vec::new()));
-                        map.insert("project_exists".to_string(), serde_json::Value::Null);
-                        map.insert("project_basename".to_string(), serde_json::Value::Null);
-                    }
-                    println!("{}", serde_json::to_string_pretty(&localized)?);
+                let envelope = crate::search::ConversationTree {
+                    conversation: None,
+                    tree: Vec::new(),
+                    total_messages: 0,
+                    warning: None,
+                    error: Some(reason.clone()),
+                };
+                let json_val = serde_json::to_value(&envelope)?;
+                let mut localized = localize_timestamps(json_val);
+                if let Some(map) = localized.as_object_mut() {
+                    map.insert("returned_messages".to_string(), serde_json::Value::from(0));
+                    map.insert(
+                        "query".to_string(),
+                        match normalize_preview_query(query) {
+                            Some(q) => serde_json::Value::String(q),
+                            None => serde_json::Value::Null,
+                        },
+                    );
+                    map.insert("matches".to_string(), serde_json::Value::Array(Vec::new()));
+                    map.insert("project_exists".to_string(), serde_json::Value::Null);
+                    map.insert("project_basename".to_string(), serde_json::Value::Null);
                 }
+                println!("{}", serde_json::to_string_pretty(&localized)?);
                 use std::io::Write;
                 let _ = std::io::stdout().flush();
-                eprintln!("Error: {}", e);
+                eprintln!("Error: {}", reason);
                 std::process::exit(1);
             }
-            return Err(e);
+            return Err(AppError::General(reason));
         }
     };
     let project_exists: Option<bool> = target
@@ -2982,11 +3066,6 @@ fn cmd_preview(
                 eprintln!("Warning: {}", warning);
             }
             let project = target.project_path.as_deref().unwrap_or("(unknown)");
-            let (start, end) = if returned == 0 {
-                (0, 0)
-            } else {
-                (total.saturating_sub(returned) + 1, total)
-            };
             println!(
                 "Project: {}{}",
                 project,
@@ -2995,7 +3074,9 @@ fn cmd_preview(
             if let Some(m) = tree.conversation.as_ref().and_then(|c| c.model.as_deref()) {
                 println!("Model: {}", m);
             }
-            println!("Messages: {}-{}/{} (returned/total)", start, end, total);
+            // Not a `start-end` range: tool turns and rewound branches are dropped before
+            // the tail is taken, so positions in `total` cannot be derived from `returned`.
+            println!("Messages: {}/{} (returned/total)", returned, total);
             let range = if returned == 0 {
                 "(empty)".to_string()
             } else {
@@ -3822,10 +3903,13 @@ mod tests {
             "claude_code",
             Some("/tmp/proj"),
         );
-        let target = resolve_resume_target_with_conn(&conn, "abcdef01").unwrap();
+        let target = resolve_resume_target_with_conn(&conn, "abcdef01")
+            .unwrap()
+            .unwrap();
         assert_eq!(target.session_id, "abcdef01-2222-3333-4444-555555555555");
-        let full =
-            resolve_resume_target_with_conn(&conn, "abcdef01-2222-3333-4444-555555555555").unwrap();
+        let full = resolve_resume_target_with_conn(&conn, "abcdef01-2222-3333-4444-555555555555")
+            .unwrap()
+            .unwrap();
         assert_eq!(full.session_id, target.session_id);
     }
 
@@ -3834,9 +3918,97 @@ mod tests {
         let conn = resume_test_conn();
         insert_conversation(&conn, "sess-1", "claude_code", Some("/tmp/proj"));
         insert_message(&conn, "msg-uuid-1", "sess-1");
-        let target = resolve_resume_target_with_conn(&conn, "msg-uuid-1").unwrap();
+        let target = resolve_resume_target_with_conn(&conn, "msg-uuid-1")
+            .unwrap()
+            .unwrap();
         assert_eq!(target.session_id, "sess-1");
         assert_eq!(target.project_path.as_deref(), Some("/tmp/proj"));
+    }
+
+    #[test]
+    fn test_resolve_resume_target_unknown_input_is_none() {
+        let conn = resume_test_conn();
+        assert!(resolve_resume_target_with_conn(&conn, "nothing-here")
+            .unwrap()
+            .is_none());
+    }
+
+    /// Only "no such row" means not found. A broken index has to surface as itself, or
+    /// the user goes looking for a session that is there all along.
+    #[test]
+    fn test_resolve_resume_target_propagates_message_lookup_errors() {
+        let conn = resume_test_conn();
+        conn.execute_batch("DROP TABLE messages;").unwrap();
+        let err = resolve_resume_target_with_conn(&conn, "msg-uuid-1").unwrap_err();
+        assert!(
+            !err.to_string().contains("not found"),
+            "a DB error must not read as not found, got: {}",
+            err
+        );
+    }
+
+    /// Messages can outlive their conversation row; the id prefix still says which tool
+    /// owns the session, so it must not be handed to `claude --resume`.
+    #[test]
+    fn test_resolve_resume_target_message_only_rows_keep_their_source() {
+        let conn = resume_test_conn();
+        insert_message(&conn, "oc-msg", "oc:ses_abc");
+        insert_message(&conn, "cx-msg", "codex:019e72d8");
+        insert_message(&conn, "cc-msg", "abc-123");
+        let source = |input: &str| {
+            resolve_resume_target_with_conn(&conn, input)
+                .unwrap()
+                .unwrap()
+                .source
+        };
+        assert_eq!(source("oc-msg"), "opencode");
+        assert_eq!(source("cx-msg"), "codex");
+        assert_eq!(source("cc-msg"), "claude_code");
+    }
+
+    fn resume_target(source: &str, session_id: &str, project: Option<&str>) -> ResumeTarget {
+        ResumeTarget {
+            source: source.to_string(),
+            session_id: session_id.to_string(),
+            project_path: project.map(str::to_string),
+            model: None,
+        }
+    }
+
+    #[test]
+    fn test_resume_lines_claude_session() {
+        let lines = resume_lines(
+            &resume_target("claude_code", "abc-123", Some("/tmp/my proj")),
+            "claude",
+        )
+        .unwrap();
+        assert_eq!(
+            lines,
+            vec![
+                "cd -- '/tmp/my proj'".to_string(),
+                "claude --resume abc-123".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_resume_lines_refuses_opencode_and_codex() {
+        for (source, sid, label) in [
+            ("opencode", "oc:ses_abc", "OpenCode"),
+            ("codex", "codex:019e72d8", "Codex"),
+        ] {
+            let err =
+                resume_lines(&resume_target(source, sid, Some("/tmp/proj")), "claude").unwrap_err();
+            assert!(err.contains(label), "got: {}", err);
+            assert!(!err.contains("--resume"), "got: {}", err);
+        }
+    }
+
+    #[test]
+    fn test_resume_lines_without_project_path_is_an_error() {
+        let err =
+            resume_lines(&resume_target("claude_code", "abc-123", None), "claude").unwrap_err();
+        assert!(err.contains("project path"), "got: {}", err);
     }
 
     #[test]
@@ -3944,9 +4116,13 @@ mod tests {
 
 #[cfg(test)]
 mod index_single_session_tests {
-    use super::{index_single_session, lookup_tree, transcript_lookup_key, TargetedIndex};
+    use super::{
+        index_single_session, lookup_tree, resolve_preview_target, transcript_lookup_key,
+        PreviewTarget, TargetedIndex,
+    };
     use crate::indexer::ConversationIndexer;
     use crate::search::ConversationSearch;
+    use std::path::PathBuf;
 
     #[test]
     fn rejects_non_claude_code_sources() {
@@ -4202,6 +4378,82 @@ mod index_single_session_tests {
             "expected an exclusion message, got: {}",
             error
         );
+    }
+
+    /// `preview` has to reach the same on-the-spot index as `tree`: a session that ended a
+    /// minute ago is exactly what the fzf preview pane is pointed at.
+    #[test]
+    fn preview_indexes_a_missing_session_then_resolves_it() {
+        let home = tempfile::tempdir().unwrap();
+        let roots = vec![home.path().join("projects")];
+        let project = roots[0].join("-tmp-someproject");
+        std::fs::create_dir_all(&project).unwrap();
+        let session = "c0ffee01-2222-3333-4444-555555555555";
+        std::fs::write(
+            project.join(format!("{}.jsonl", session)),
+            format!(
+                "{}\n",
+                format_args!(
+                    r#"{{"uuid":"pv1","parentUuid":null,"isSidechain":false,"timestamp":"2026-01-15T10:00:00Z","type":"user","sessionId":"{session}","cwd":"/tmp/someproject","message":{{"role":"user","content":"preview me"}}}}"#
+                )
+            ),
+        )
+        .unwrap();
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        let db_path = db_path.to_str().unwrap();
+        ConversationIndexer::new(db_path, true).unwrap();
+
+        match resolve_preview_target(db_path, "c0ffee01", Some(&roots)).unwrap() {
+            PreviewTarget::Ready(target) => assert_eq!(target.session_id, session),
+            PreviewTarget::Failed(reason) => panic!("expected Ready, got: {}", reason),
+        }
+    }
+
+    /// Ambiguous prefixes stay ambiguous (no on-the-spot index picking one), and a missing
+    /// id still fails after the retry.
+    #[test]
+    fn preview_failures_report_why() {
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("index.db");
+        let db_path = db_path.to_str().unwrap();
+        let indexer = ConversationIndexer::new(db_path, true).unwrap();
+        for sid in [
+            "beefcafe-1111-3333-4444-555555555555",
+            "beefcafe-2222-3333-4444-555555555555",
+        ] {
+            indexer
+                .connection()
+                .execute(
+                    "INSERT INTO conversations (session_id, source, project_path, message_count)
+                     VALUES (?, 'claude_code', '/tmp/p', 1)",
+                    [sid],
+                )
+                .unwrap();
+            indexer
+                .connection()
+                .execute(
+                    "INSERT INTO messages (message_uuid, session_id, depth, timestamp, message_type, project_path, full_content)
+                     VALUES (?1 || '-m', ?1, 0, '2026-01-15T10:00:00Z', 'user', '/tmp/p', 'secret body')",
+                    [sid],
+                )
+                .unwrap();
+        }
+        drop(indexer);
+        let empty_roots: Vec<PathBuf> = Vec::new();
+
+        for (input, expected) in [
+            ("beefcafe", "Ambiguous"),
+            ("0ddba11-not-there", "not found"),
+        ] {
+            match resolve_preview_target(db_path, input, Some(&empty_roots)).unwrap() {
+                PreviewTarget::Ready(t) => panic!("{}: expected Failed, got {:?}", input, t),
+                PreviewTarget::Failed(reason) => {
+                    assert!(reason.contains(expected), "{}: got {}", input, reason)
+                }
+            }
+        }
     }
 }
 
