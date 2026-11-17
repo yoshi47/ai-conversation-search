@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.3] - 2026-11-17
+
 ### Fixed
 
 - 複数語の検索（`--group-by-session` なし）で、全語一致の行が上位から漏れることがあった。表示順は全語一致を部分一致より上に置くが、候補の打ち切りは集めた行数だけを見ていた。そのため bm25 上位 500 件で部分一致が `--limit` 件そろうと、それより後ろの全語一致を取得せずに返していた。打ち切りは全語一致が `--limit` 件そろった時点にした。全語一致が少ないクエリは候補を最後まで読むので、`--group-by-session` と同程度まで遅くなる
