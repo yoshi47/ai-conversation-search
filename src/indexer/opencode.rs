@@ -50,23 +50,22 @@ impl OpenCodeIndexer {
         }
     }
 
-    fn connect_opencode(&self) -> Option<Connection> {
+    fn connect_opencode(&self) -> Result<Option<Connection>> {
         if !self.opencode_db_path.exists() {
             self.log(&format!(
                 "OpenCode DB not found: {}",
                 self.opencode_db_path.display()
             ));
-            return None;
+            return Ok(None);
         }
 
-        let uri = format!("file:{}?mode=ro", self.opencode_db_path.display());
-        Connection::open_with_flags(
-            &uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .ok()
+        // Not a `file:...?mode=ro` URI: the path is not percent-encoded, so `?`, `#`
+        // or `%` in it would open a different file.
+        let conn = Connection::open_with_flags(
+            &self.opencode_db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        Ok(Some(conn))
     }
 
     fn epoch_ms_to_iso(epoch_ms: i64) -> String {
@@ -109,7 +108,7 @@ impl OpenCodeIndexer {
     }
 
     pub fn scan_and_index(&self, days_back: Option<i64>) -> Result<usize> {
-        let oc_conn = match self.connect_opencode() {
+        let oc_conn = match self.connect_opencode()? {
             Some(c) => c,
             None => return Ok(0),
         };
@@ -150,8 +149,6 @@ impl OpenCodeIndexer {
         search_conn: &Connection,
         days_back: Option<i64>,
     ) -> Result<usize> {
-        search_conn.execute_batch("BEGIN;")?;
-
         let last_sync = Self::get_last_sync_time(search_conn);
 
         let cutoff_ms: i64 = if let Some(d) = days_back {
@@ -161,7 +158,11 @@ impl OpenCodeIndexer {
             last_sync.unwrap_or_default()
         };
 
-        let sessions = fetch_sessions(oc_conn, cutoff_ms)?;
+        let (sessions, skipped) = fetch_sessions(oc_conn, cutoff_ms)?;
+        if skipped > 0 {
+            // Even under --quiet: an upstream schema change would otherwise just index nothing.
+            eprintln!("  Skipped {} unreadable OpenCode session row(s)", skipped);
+        }
 
         if sessions.is_empty() {
             self.log("No new OpenCode sessions to index");
@@ -174,6 +175,7 @@ impl OpenCodeIndexer {
         ));
 
         let mut max_time_updated = cutoff_ms;
+        let mut min_failed_time_updated: Option<i64> = None;
         let mut indexed_count: usize = 0;
 
         for (id, title, directory, time_created, time_updated, worktree) in &sessions {
@@ -185,29 +187,37 @@ impl OpenCodeIndexer {
                 time_updated: *time_updated,
                 worktree: worktree.as_deref(),
             };
-            match self.index_session(oc_conn, search_conn, &info) {
-                Ok(count) if count > 0 => {
-                    indexed_count += 1;
-                    if *time_updated > max_time_updated {
-                        max_time_updated = *time_updated;
+            // index_session deletes the old rows before inserting, so each session gets
+            // its own transaction: a failure must roll back the delete, not commit it.
+            let tx = search_conn.unchecked_transaction()?;
+            let outcome = match self.index_session(oc_conn, &tx, &info) {
+                Ok(count) => tx.commit().map(|()| count).map_err(Into::into),
+                Err(e) => Err(e),
+            };
+            match outcome {
+                Ok(count) => {
+                    if count > 0 {
+                        indexed_count += 1;
                     }
-                }
-                Ok(_) => {
-                    if *time_updated > max_time_updated {
-                        max_time_updated = *time_updated;
-                    }
+                    max_time_updated = max_time_updated.max(*time_updated);
                 }
                 Err(e) => {
                     // Even under --quiet: the background indexer's stderr is its only record.
                     eprintln!("  Error indexing session {}: {}", id, e);
+                    min_failed_time_updated = Some(
+                        min_failed_time_updated.map_or(*time_updated, |t| t.min(*time_updated)),
+                    );
                 }
             }
         }
 
-        search_conn.execute_batch("COMMIT;")?;
-
-        if max_time_updated > cutoff_ms {
-            Self::set_last_sync_time(search_conn, max_time_updated);
+        // Stop short of the oldest failed session so the next cursor-based run retries it.
+        let cursor = match min_failed_time_updated {
+            Some(failed) => max_time_updated.min(failed - 1),
+            None => max_time_updated,
+        };
+        if cursor > cutoff_ms {
+            Self::set_last_sync_time(search_conn, cursor);
         }
 
         self.log(&format!("Indexed {} OpenCode sessions", indexed_count));
@@ -253,10 +263,13 @@ impl OpenCodeIndexer {
             search_conn.execute("DELETE FROM messages WHERE session_id = ?", [&session_id])?;
         }
 
-        let messages = fetch_messages(oc_conn, info.session_id_raw)?;
-
-        if messages.is_empty() {
-            return Ok(0);
+        let (messages, skipped) = fetch_messages(oc_conn, info.session_id_raw)?;
+        if skipped > 0 {
+            // Even under --quiet: an upstream schema change would otherwise just index nothing.
+            eprintln!(
+                "  Skipped {} unreadable message(s) in OpenCode session {}",
+                skipped, info.session_id_raw
+            );
         }
 
         let session_model = super::distinct_model_list(
@@ -266,14 +279,10 @@ impl OpenCodeIndexer {
                 .collect::<Vec<_>>(),
         );
 
-        let repo_root = if !work_dir.is_empty() {
-            super::resolve_repo_root_cached(search_conn, work_dir)
-        } else {
-            None
-        };
-
         let mut msg_count: usize = 0;
         let mut first_timestamp: Option<String> = None;
+        let mut root_message_uuid: Option<String> = None;
+        let mut leaf_message_uuid: Option<String> = None;
 
         for (msg_id, role, msg_time_created, content, model) in &messages {
             if content.trim().is_empty() {
@@ -286,6 +295,10 @@ impl OpenCodeIndexer {
             if first_timestamp.is_none() {
                 first_timestamp = Some(timestamp.clone());
             }
+            if root_message_uuid.is_none() {
+                root_message_uuid = Some(message_uuid.clone());
+            }
+            leaf_message_uuid = Some(message_uuid.clone());
             search_conn.execute(
                 "INSERT OR REPLACE INTO messages (message_uuid, session_id, parent_uuid, is_sidechain, depth, timestamp, message_type, project_path, conversation_file, full_content, is_meta_conversation, is_tool_noise, model) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 rusqlite::params![
@@ -308,8 +321,20 @@ impl OpenCodeIndexer {
         }
 
         if msg_count == 0 {
+            // A re-index that leaves nothing searchable must not keep a conversations row
+            // pointing at the messages deleted above.
+            search_conn.execute(
+                "DELETE FROM conversations WHERE session_id = ?",
+                [&session_id],
+            )?;
             return Ok(0);
         }
+
+        let repo_root = if !work_dir.is_empty() {
+            super::resolve_repo_root_cached(search_conn, work_dir)
+        } else {
+            None
+        };
 
         // Blank-rejecting, not just None-rejecting: a whitespace-only upstream title would
         // otherwise be stored and render as an empty row in `list`.
@@ -326,8 +351,8 @@ impl OpenCodeIndexer {
                 work_dir,
                 repo_root,
                 self.opencode_db_path.to_string_lossy(),
-                format!("{}{}", OC_PREFIX, messages[0].0),
-                format!("{}{}", OC_PREFIX, messages.last().unwrap().0),
+                root_message_uuid,
+                leaf_message_uuid,
                 display_title,
                 first_timestamp.as_deref().unwrap_or(&session_created_iso),
                 session_updated_iso,
@@ -354,7 +379,8 @@ type SessionRow = (
     Option<String>,
 );
 
-fn fetch_sessions(conn: &Connection, cutoff_ms: i64) -> Result<Vec<SessionRow>> {
+/// Sessions updated after `cutoff_ms`, plus the number of rows that could not be read.
+fn fetch_sessions(conn: &Connection, cutoff_ms: i64) -> Result<(Vec<SessionRow>, usize)> {
     // session_v2.time_updated is not bumped on every appended message, so using it
     // alone as the sync cursor would miss sessions that grew after the last run.
     let mut stmt = conn.prepare(
@@ -369,20 +395,24 @@ fn fetch_sessions(conn: &Connection, cutoff_ms: i64) -> Result<Vec<SessionRow>> 
          WHERE time_updated > ?
          ORDER BY time_updated DESC",
     )?;
-    let rows = stmt
-        .query_map([cutoff_ms], |row| {
-            Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
-    Ok(rows)
+    let mut rows = Vec::new();
+    let mut skipped = 0;
+    for row in stmt.query_map([cutoff_ms], |row| {
+        Ok((
+            row.get(0)?,
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ))
+    })? {
+        match row {
+            Ok(row) => rows.push(row),
+            Err(_) => skipped += 1,
+        }
+    }
+    Ok((rows, skipped))
 }
 
 /// (message id, role, time_created, content, model) for user/assistant messages, in order.
@@ -413,43 +443,49 @@ fn extract_model(data: &serde_json::Value, role: &str) -> Option<String> {
     }
 }
 
-fn fetch_messages(conn: &Connection, session_id: &str) -> Result<Vec<MessageRow>> {
+/// Messages of `session_id`, plus the number of rows or JSON envelopes that could not be read.
+fn fetch_messages(conn: &Connection, session_id: &str) -> Result<(Vec<MessageRow>, usize)> {
     let mut stmt = conn.prepare(
         "SELECT id, type, time_created, data FROM session_message
          WHERE session_id = ? AND type IN ('user', 'assistant')
          ORDER BY seq ASC",
     )?;
-    let rows = stmt
-        .query_map([session_id], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .filter_map(|(id, role, time_created, data)| {
-            let data: serde_json::Value = serde_json::from_str(&data).ok()?;
-            // Parts are embedded in the message: user text is `text`, assistant parts are `content[]`.
-            let content = if role == "user" {
-                data.get("text")
-                    .and_then(|t| t.as_str())
-                    .unwrap_or_default()
-                    .to_string()
-            } else {
-                let parts = data
-                    .get("content")
-                    .and_then(|c| c.as_array())
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]);
-                OpenCodeIndexer::build_message_content(parts)
-            };
-            let model = extract_model(&data, &role);
-            Some((id, role, time_created, content, model))
-        })
-        .collect();
-    Ok(rows)
+    let mut rows = Vec::new();
+    let mut skipped = 0;
+    for row in stmt.query_map([session_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })? {
+        let Ok((id, role, time_created, data)) = row else {
+            skipped += 1;
+            continue;
+        };
+        let Ok(data) = serde_json::from_str::<serde_json::Value>(&data) else {
+            skipped += 1;
+            continue;
+        };
+        // Parts are embedded in the message: user text is `text`, assistant parts are `content[]`.
+        let content = if role == "user" {
+            data.get("text")
+                .and_then(|t| t.as_str())
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            let parts = data
+                .get("content")
+                .and_then(|c| c.as_array())
+                .map(Vec::as_slice)
+                .unwrap_or(&[]);
+            OpenCodeIndexer::build_message_content(parts)
+        };
+        let model = extract_model(&data, &role);
+        rows.push((id, role, time_created, content, model));
+    }
+    Ok((rows, skipped))
 }
 
 #[cfg(test)]
@@ -533,7 +569,8 @@ mod tests {
 
     #[test]
     fn test_fetch_messages_keeps_only_user_and_assistant_in_seq_order() {
-        let rows = fetch_messages(&oc_db(), "s1").unwrap();
+        let (rows, skipped) = fetch_messages(&oc_db(), "s1").unwrap();
+        assert_eq!(skipped, 0);
         assert_eq!(
             rows,
             vec![
@@ -573,7 +610,8 @@ mod tests {
         // session_v2.time_updated (200) lags the last message (900); the cursor must use 900
         // or a session that grew after the last sync would be skipped.
         let conn = oc_db();
-        let rows = fetch_sessions(&conn, 500).unwrap();
+        let (rows, skipped) = fetch_sessions(&conn, 500).unwrap();
+        assert_eq!(skipped, 0);
         assert_eq!(
             rows,
             vec![(
@@ -585,7 +623,226 @@ mod tests {
                 Some("/repo".into())
             )]
         );
-        assert!(fetch_sessions(&conn, 900).unwrap().is_empty());
+        assert!(fetch_sessions(&conn, 900).unwrap().0.is_empty());
+    }
+
+    fn search_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(include_str!("../../data/schema.sql"))
+            .unwrap();
+        crate::schema::init_schema(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS opencode_sync_state (key TEXT PRIMARY KEY, value TEXT)",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn test_indexer() -> OpenCodeIndexer {
+        OpenCodeIndexer {
+            search_db_path: String::new(),
+            opencode_db_path: PathBuf::from("/nonexistent/opencode.db"),
+            quiet: true,
+        }
+    }
+
+    fn contents(conn: &Connection, session_id: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT full_content FROM messages WHERE session_id = ? ORDER BY depth")
+            .unwrap();
+        stmt.query_map([session_id], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect()
+    }
+
+    fn fail_inserts_for(conn: &Connection, session_id: &str) {
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER fail_insert BEFORE INSERT ON messages
+             WHEN NEW.session_id = '{}' BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+            session_id
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn test_failed_session_keeps_old_messages_and_holds_cursor() {
+        let oc = oc_db();
+        oc.execute_batch(
+            r#"INSERT INTO session_v2 VALUES ('s2', 'p1', 'T2', '/repo', 100, 300);
+               INSERT INTO session_message VALUES ('n1', 's2', 'user', 1, 110, 300, '{"text":"old s2"}');"#,
+        )
+        .unwrap();
+        let search = search_db();
+        let indexer = test_indexer();
+        assert_eq!(indexer.do_index(&oc, &search, None).unwrap(), 2);
+
+        // Both sessions grow; s2 (older) fails while s1 (newer) succeeds.
+        oc.execute_batch(
+            r#"INSERT INTO session_message VALUES ('n2', 's2', 'user', 2, 2000, 2000, '{"text":"new s2"}');
+               INSERT INTO session_message VALUES ('m5', 's1', 'user', 5, 3000, 3000, '{"text":"new s1"}');"#,
+        )
+        .unwrap();
+        fail_inserts_for(&search, "oc:s2");
+        indexer.do_index(&oc, &search, None).unwrap();
+
+        assert_eq!(contents(&search, "oc:s2"), vec!["old s2".to_string()]);
+        assert!(contents(&search, "oc:s1").contains(&"new s1".to_string()));
+        let cursor = OpenCodeIndexer::get_last_sync_time(&search).unwrap();
+        assert!(
+            cursor < 2000,
+            "cursor {} skipped the failed session",
+            cursor
+        );
+
+        search.execute_batch("DROP TRIGGER fail_insert;").unwrap();
+        indexer.do_index(&oc, &search, None).unwrap();
+        assert_eq!(
+            contents(&search, "oc:s2"),
+            vec!["old s2".to_string(), "new s2".to_string()]
+        );
+    }
+
+    /// A DB damaged before the fix (messages deleted, conversations row left with the
+    /// old last_message_at) is repaired by a full `index --all` pass.
+    #[test]
+    fn test_full_pass_repairs_session_whose_messages_were_deleted() {
+        let oc = oc_db();
+        // Inside the 9999-day window that `index --all` passes.
+        oc.execute(
+            "UPDATE session_message SET time_updated = ? WHERE id = 'm3'",
+            [chrono::Utc::now().timestamp_millis()],
+        )
+        .unwrap();
+        let search = search_db();
+        let indexer = test_indexer();
+        indexer.do_index(&oc, &search, None).unwrap();
+
+        search
+            .execute_batch(
+                "DELETE FROM messages WHERE session_id = 'oc:s1';
+                 UPDATE conversations SET last_message_at = '1970-01-01T00:00:00.500Z'
+                 WHERE session_id = 'oc:s1';",
+            )
+            .unwrap();
+        indexer.do_index(&oc, &search, Some(9999)).unwrap();
+        assert_eq!(
+            contents(&search, "oc:s1"),
+            vec![
+                "question".to_string(),
+                "answer\n[Tool: shell]\nls".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_root_and_leaf_point_at_indexed_messages() {
+        let oc = oc_db();
+        oc.execute_batch(
+            r#"INSERT INTO session_message VALUES
+                 ('m0', 's1', 'user', 0, 105, 105, '{"text":"  "}'),
+                 ('m9', 's1', 'assistant', 9, 170, 170, '{"content":[]}');"#,
+        )
+        .unwrap();
+        let search = search_db();
+        test_indexer().do_index(&oc, &search, None).unwrap();
+        let (root, leaf): (String, String) = search
+            .query_row(
+                "SELECT root_message_uuid, leaf_message_uuid FROM conversations WHERE session_id = 'oc:s1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((root.as_str(), leaf.as_str()), ("oc:m1", "oc:m3"));
+    }
+
+    #[test]
+    fn test_reindex_with_no_content_drops_conversation_row() {
+        let oc = oc_db();
+        let search = search_db();
+        let indexer = test_indexer();
+        indexer.do_index(&oc, &search, None).unwrap();
+
+        oc.execute_batch(
+            r#"UPDATE session_message SET data = '{"text":""}' WHERE id = 'm1';
+               UPDATE session_message SET data = '{"content":[]}', time_updated = 1000 WHERE id = 'm3';"#,
+        )
+        .unwrap();
+        indexer.do_index(&oc, &search, None).unwrap();
+        let rows: i64 = search
+            .query_row(
+                "SELECT COUNT(*) FROM conversations WHERE session_id = 'oc:s1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
+    fn test_fetch_messages_reports_skipped_rows() {
+        let oc = oc_db();
+        oc.execute_batch(
+            r#"INSERT INTO session_message VALUES
+                 ('b1', 's1', 'user', 5, 170, 170, 'not json'),
+                 ('b2', 's1', 'user', 6, 180, 180, X'00');"#,
+        )
+        .unwrap();
+        let (rows, skipped) = fetch_messages(&oc, "s1").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(skipped, 2);
+    }
+
+    #[test]
+    fn test_fetch_sessions_reports_skipped_rows() {
+        let oc = oc_db();
+        oc.execute_batch("INSERT INTO session_v2 VALUES ('s2', 'p1', 'T2', '/repo', 'abc', 300);")
+            .unwrap();
+        let (rows, skipped) = fetch_sessions(&oc, 0).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(skipped, 1);
+    }
+
+    fn write_oc_db(path: &std::path::Path) {
+        let src = oc_db();
+        src.execute("VACUUM INTO ?", [path.to_string_lossy()])
+            .unwrap();
+    }
+
+    #[test]
+    fn test_opencode_db_path_with_uri_metacharacters() {
+        let dir = tempfile::tempdir().unwrap();
+        let oc_dir = dir.path().join("a#b?c%41");
+        std::fs::create_dir_all(&oc_dir).unwrap();
+        let oc_path = oc_dir.join("opencode.db");
+        write_oc_db(&oc_path);
+
+        let search_path = dir.path().join("search.db");
+        crate::schema::init_schema(&db::connect(search_path.to_str().unwrap(), false).unwrap())
+            .unwrap();
+        let indexer = OpenCodeIndexer::new(search_path.to_str(), oc_path.to_str(), true);
+        assert_eq!(indexer.scan_and_index(None).unwrap(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_unopenable_opencode_db_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let oc_path = dir.path().join("opencode.db");
+        write_oc_db(&oc_path);
+        std::fs::set_permissions(&oc_path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let search_path = dir.path().join("search.db");
+        let indexer = OpenCodeIndexer::new(search_path.to_str(), oc_path.to_str(), true);
+        let result = indexer.scan_and_index(None);
+        std::fs::set_permissions(&oc_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(
+            result.is_err(),
+            "expected an error, got {:?}",
+            result.map(|_| ())
+        );
     }
 
     #[test]
