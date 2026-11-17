@@ -227,7 +227,7 @@ pub enum Commands {
     /// Initialize database and index
     Init {
         /// Days of history to index (default: 7)
-        #[arg(long, default_value_t = 7)]
+        #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(i64).range(0..=9999))]
         days: i64,
         /// Reinitialize existing database
         #[arg(long)]
@@ -239,7 +239,7 @@ pub enum Commands {
     /// Index conversations
     Index {
         /// Days back to index (default: 1)
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(i64).range(0..=9999))]
         days: i64,
         /// Index all conversations
         #[arg(long)]
@@ -280,7 +280,7 @@ pub enum Commands {
         #[arg(long)]
         exact: bool,
         /// Limit to last N days
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..=9999))]
         days: Option<i64>,
         /// Start date (YYYY-MM-DD, yesterday, today)
         #[arg(long)]
@@ -351,7 +351,7 @@ pub enum Commands {
     /// List recent conversations
     List {
         /// Days back (default: 7)
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(i64).range(0..=9999))]
         days: Option<i64>,
         /// Start date
         #[arg(long)]

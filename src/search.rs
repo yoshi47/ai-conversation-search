@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
-use chrono::{DateTime, Local, TimeDelta, Utc};
+use chrono::{DateTime, Local, Utc};
 use rusqlite::Connection;
 use serde::Serialize;
 
-use crate::date_utils::build_date_filter;
+use crate::date_utils::{build_date_filter, date_bounds, days_cutoff};
 use crate::db;
 use crate::error::{AppError, Result};
 use crate::indexer::{ConversationIndexer, Message};
@@ -1375,9 +1375,8 @@ impl ConversationSearch {
                 }
             }
         } else if let Some(d) = days_back {
-            let cutoff = (Local::now() - TimeDelta::days(d)).naive_local();
             sql.push_str(" AND m.timestamp >= ?");
-            params.push(Box::new(cutoff.format("%Y-%m-%dT%H:%M:%S").to_string()));
+            params.push(Box::new(days_cutoff(d)?));
         }
 
         if let Some(pp) = project_path {
@@ -1423,39 +1422,19 @@ impl ConversationSearch {
         params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
         filter: &SearchFilter<'_>,
     ) -> Result<()> {
-        use chrono::{NaiveTime, TimeDelta};
-
-        if let Some(d) = filter.date {
-            let start = crate::date_utils::parse_date(d)?;
-            let end = start + TimeDelta::days(1);
-            sql.push_str(" AND c.last_message_at >= ? AND c.first_message_at < ?");
-            params.push(Box::new(
-                start
-                    .and_time(NaiveTime::MIN)
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string(),
-            ));
-            params.push(Box::new(
-                end.and_time(NaiveTime::MIN)
-                    .format("%Y-%m-%dT%H:%M:%S")
-                    .to_string(),
-            ));
-        } else if filter.since.is_some() || filter.until.is_some() {
-            if let Some(s) = filter.since {
-                let start = crate::date_utils::parse_date(s)?.and_time(NaiveTime::MIN);
+        if filter.date.is_some() || filter.since.is_some() || filter.until.is_some() {
+            let (start, end) = date_bounds(filter.since, filter.until, filter.date)?;
+            if let Some(s) = start {
                 sql.push_str(" AND c.last_message_at >= ?");
-                params.push(Box::new(start.format("%Y-%m-%dT%H:%M:%S").to_string()));
+                params.push(Box::new(s));
             }
-            if let Some(u) = filter.until {
-                let end = (crate::date_utils::parse_date(u)? + TimeDelta::days(1))
-                    .and_time(NaiveTime::MIN);
+            if let Some(e) = end {
                 sql.push_str(" AND c.first_message_at < ?");
-                params.push(Box::new(end.format("%Y-%m-%dT%H:%M:%S").to_string()));
+                params.push(Box::new(e));
             }
         } else if let Some(d) = filter.days_back {
-            let cutoff = (chrono::Local::now() - TimeDelta::days(d)).naive_local();
             sql.push_str(" AND c.last_message_at >= ?");
-            params.push(Box::new(cutoff.format("%Y-%m-%dT%H:%M:%S").to_string()));
+            params.push(Box::new(days_cutoff(d)?));
         }
 
         if let Some(pp) = filter.project_path {
@@ -2168,9 +2147,8 @@ impl ConversationSearch {
                 }
             }
         } else if let Some(d) = effective_days {
-            let cutoff = (Local::now() - TimeDelta::days(d)).naive_local();
             sql.push_str(" AND last_message_at >= ?");
-            params.push(Box::new(cutoff.format("%Y-%m-%dT%H:%M:%S").to_string()));
+            params.push(Box::new(days_cutoff(d)?));
         }
 
         if let Some(pp) = project_path {
@@ -4337,7 +4315,7 @@ mod tests {
             "claude_code",
         );
         // Use a timestamp that's definitely recent
-        let recent_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let recent_ts = stored_ts(Utc::now());
         insert_test_message(
             &conn,
             "new_msg",
@@ -4363,6 +4341,78 @@ mod tests {
         // Only the recent message should be returned
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].message_uuid, "new_msg");
+    }
+
+    /// Indexers store UTC with millis and `Z`; tests must insert the same shape.
+    fn stored_ts(dt: DateTime<Utc>) -> String {
+        dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
+    }
+
+    #[test]
+    fn test_days_back_compares_against_utc_timestamps() {
+        // 20h old is inside --days 1 in every timezone. A local wall-clock cutoff
+        // compared against UTC values drops it anywhere east of UTC+4.
+        let conn = setup_test_db();
+        let ts = stored_ts(Utc::now() - chrono::TimeDelta::hours(20));
+        insert_test_conversation(
+            &conn,
+            "sess1",
+            "/proj",
+            "TzNeedleTitle",
+            &ts,
+            &ts,
+            "claude_code",
+        );
+        insert_test_message(&conn, "m1", "sess1", "tz needle body", "user", &ts, "/proj");
+
+        let mut searcher = ConversationSearch::from_connection(conn);
+        let f = SearchFilter {
+            days_back: Some(1),
+            ..default_filter()
+        };
+        let body = searcher.search_conversations("body", &f).unwrap().rows;
+        assert_eq!(body.len(), 1, "message filter");
+        let title = searcher
+            .search_conversations("TzNeedleTitle", &f)
+            .unwrap()
+            .rows;
+        assert_eq!(title.len(), 1, "conversation filter");
+        let listed = searcher.list_recent_conversations(&f).unwrap().rows;
+        assert_eq!(listed.len(), 1, "list filter");
+    }
+
+    #[test]
+    fn test_out_of_range_date_filters_are_errors_not_panics() {
+        let conn = setup_test_db();
+        let ts = stored_ts(Utc::now());
+        insert_test_conversation(&conn, "sess1", "/proj", "summary", &ts, &ts, "claude_code");
+        insert_test_message(&conn, "m1", "sess1", "needle", "user", &ts, "/proj");
+        let mut searcher = ConversationSearch::from_connection(conn);
+
+        let filters = [
+            SearchFilter {
+                days_back: Some(100_000_000),
+                ..default_filter()
+            },
+            SearchFilter {
+                date: Some("+262142-12-31"),
+                ..default_filter()
+            },
+            SearchFilter {
+                until: Some("+262142-12-31"),
+                ..default_filter()
+            },
+        ];
+        for f in &filters {
+            assert!(matches!(
+                searcher.search_conversations("needle", f),
+                Err(AppError::DateParse(_))
+            ));
+            assert!(matches!(
+                searcher.list_recent_conversations(f),
+                Err(AppError::DateParse(_))
+            ));
+        }
     }
 
     #[test]
@@ -4535,16 +4585,30 @@ mod tests {
         assert_eq!(results[0].message_uuid, "msg1");
     }
 
+    /// `--date` is a local calendar day; noon local is inside it in every timezone.
+    fn local_noon_stored(y: i32, m: u32, d: u32) -> String {
+        let local = chrono::NaiveDate::from_ymd_opt(y, m, d)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(Local)
+            .earliest()
+            .unwrap();
+        stored_ts(local.with_timezone(&Utc))
+    }
+
     #[test]
     fn test_search_date_filter() {
         let conn = setup_test_db();
+        let jan14 = local_noon_stored(2025, 1, 14);
+        let jan15 = local_noon_stored(2025, 1, 15);
         insert_test_conversation(
             &conn,
             "sess1",
             "/proj",
             "summary",
-            "2025-01-14T09:00:00",
-            "2025-01-15T10:00:00",
+            &jan14,
+            &jan15,
             "claude_code",
         );
         insert_test_message(
@@ -4553,7 +4617,7 @@ mod tests {
             "sess1",
             "message on jan 15",
             "user",
-            "2025-01-15T10:00:00",
+            &jan15,
             "/proj",
         );
         insert_test_message(
@@ -4562,7 +4626,7 @@ mod tests {
             "sess1",
             "message on jan 14",
             "user",
-            "2025-01-14T10:00:00",
+            &jan14,
             "/proj",
         );
 
@@ -6109,7 +6173,7 @@ mod tests {
     #[test]
     fn test_list_recent_conversations() {
         let conn = setup_test_db();
-        let recent_ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let recent_ts = stored_ts(Utc::now());
         insert_test_conversation(
             &conn,
             "sess1",
@@ -6166,7 +6230,7 @@ mod tests {
     #[test]
     fn test_list_recent_conversations_reports_truncation() {
         let conn = setup_test_db();
-        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let ts = stored_ts(Utc::now());
         for session in ["sess1", "sess2", "sess3"] {
             insert_test_conversation(&conn, session, "/proj", "summary", &ts, &ts, "claude_code");
         }
@@ -6201,7 +6265,7 @@ mod tests {
         // `--limit 0` returns nothing while conversations exist; without the flag this
         // reads as "no conversations found".
         let conn = setup_test_db();
-        let ts = Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+        let ts = stored_ts(Utc::now());
         insert_test_conversation(&conn, "sess1", "/proj", "summary", &ts, &ts, "claude_code");
         let searcher = ConversationSearch::from_connection(conn);
 
