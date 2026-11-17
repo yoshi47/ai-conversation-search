@@ -5,7 +5,6 @@ use rusqlite::Connection;
 use serde::Deserialize;
 
 use crate::error::Result;
-use crate::git_utils::resolve_repo_root;
 use crate::schema::{init_schema, FTS_SYNC_TRIGGERS};
 use crate::summarization;
 
@@ -553,33 +552,12 @@ impl ConversationIndexer {
         project_path: &str,
         conversation_file: Option<&str>,
     ) -> Option<String> {
-        // Check DB cache first
-        if let Ok(cached) = self.conn.query_row(
-            "SELECT repo_root FROM repo_root_cache WHERE project_path = ?",
-            [project_path],
-            |row| row.get::<_, Option<String>>(0),
-        ) {
-            return cached;
-        }
-
         // Claude Code stores project dirs as hashed names; decode from conversation file path
-        let repo_root = conversation_file.and_then(|conv_file| {
-            let conv_path = Path::new(conv_file);
-            let parent = conv_path.parent()?;
-            let dir_name = parent.file_name()?;
-            let real_path = Self::decode_project_dir_name(&dir_name.to_string_lossy())?;
-            resolve_repo_root(&real_path)
+        let real_path = conversation_file.and_then(|conv_file| {
+            let dir_name = Path::new(conv_file).parent()?.file_name()?;
+            Self::decode_project_dir_name(&dir_name.to_string_lossy())
         });
-
-        // Cache result
-        if let Some(ref root) = repo_root {
-            let _ = self.conn.execute(
-                "INSERT OR REPLACE INTO repo_root_cache (project_path, repo_root) VALUES (?, ?)",
-                rusqlite::params![project_path, root],
-            );
-        }
-
-        repo_root
+        super::resolve_repo_root_cached_at(&self.conn, project_path, real_path.as_deref())
     }
 
     /// Backfill repo_root for existing conversations that don't have one.
@@ -3121,6 +3099,43 @@ mod tests {
 
         assert_eq!(count_messages(&indexer), 0);
         assert_eq!(sync_state_rows(&indexer, &file), 1);
+    }
+
+    #[test]
+    fn test_resolve_repo_root_ignores_null_cached_by_other_indexer() {
+        // Codex/OpenCode used to cache NULL for non-git paths. The Claude path must
+        // re-resolve instead of returning that NULL after the directory became a repo.
+        let (dir, indexer) = create_test_indexer();
+        let repo = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status()
+            .expect("git must be installed to run this test");
+        assert!(status.success());
+        let repo_path = repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let encoded = repo_path.replace(['/', '.'], "-");
+        let project_dir = dir.path().join(&encoded);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let conv_file = project_dir.join("s.jsonl");
+        std::fs::write(&conv_file, "").unwrap();
+
+        indexer
+            .connection()
+            .execute(
+                "INSERT INTO repo_root_cache (project_path, repo_root) VALUES (?, NULL)",
+                [&repo_path],
+            )
+            .unwrap();
+
+        let resolved = indexer.resolve_repo_root(&repo_path, Some(&conv_file.to_string_lossy()));
+        assert_eq!(resolved, Some(repo_path));
     }
 
     #[test]
