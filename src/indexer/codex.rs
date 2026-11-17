@@ -542,7 +542,7 @@ impl CodexIndexer {
                             if !text.trim().is_empty() {
                                 messages.push((
                                     "assistant".to_string(),
-                                    timestamp.clone(),
+                                    timestamp,
                                     text,
                                     current_model.clone(),
                                 ));
