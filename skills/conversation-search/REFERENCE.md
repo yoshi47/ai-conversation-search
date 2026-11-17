@@ -473,7 +473,7 @@ key. `tree[]` holds the last N messages; `total_messages` still means
 
 ```
 Project: /home/user/proj
-Messages: 91-120/120 (returned/total)
+Messages: 30/120 (returned/total)
 Range: 2026-09-01 10:00 → 2026-09-01 12:00
 ```
 

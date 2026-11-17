@@ -29,6 +29,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - バックグラウンド索引が同時に起動すると、マイグレーションが二重に走ることがあった。負けた側は `ALTER TABLE ... ADD COLUMN` が "duplicate column name" で失敗し、Custom マイグレーション（同期カーソルのクリアなど）は二度実行された。各マイグレーションを IMMEDIATE トランザクションで実行し、その中で適用済みかを確認し直すようにした。Custom マイグレーションの本体と `schema_version` への記録も同じトランザクションに入れたので、途中で落ちても再実行で中途半端な状態にならない
 - マイグレーション 15 / 17 の「バックフィル不要」判定が、同期テーブルの読み取り失敗（SQLITE_BUSY など）を「空」として扱っていた。この判定が真になると適用済みとして記録されるため、一時的なロック競合でバックフィルが永久にスキップされうる。失敗はエラーとして返すようにした。同期カーソルのクリアも、テーブルの存在確認に失敗したときは何も消さずに成功扱いしていたので、同様にエラーにした
 - 読み取り専用で索引 DB を開くとき、パスを `file:...?mode=ro` の URI に埋め込んでいた。パスに `#` `?` `%` が含まれると別のファイルを開いて失敗する。URI をやめ、`SQLITE_OPEN_READ_ONLY` フラグだけで開くようにした
+- `resume` が OpenCode / Codex のセッションにも `claude --resume oc:…` を出していた。`resume-spec` と同じく source で分岐し、stdout には何も出さず、理由を stderr に出して exit 1 で終わる。conversations 行が無く messages だけが残っている場合も、`oc:` / `codex:` の接頭辞から source を判定する。project path が無いときの文言も「Message not found」から「No project path recorded」に直した
+- `preview` で未インデックスのセッションを指定すると、`tree` なら読めるのに「not found」で終わっていた。見つからないときは `tree` と同じくその場でインデックスし、解決をやり直す。`--json` では、そのインデックス結果の木を切り詰めずに全文出したうえで exit 1 していたが、失敗時は本文を含まないエラー用 JSON だけを返すようにした
+- メッセージ UUID からセッションを引く処理が、DB のロック・破損・スキーマ不一致まで「Conversation X not found」にしていた。該当行が無い場合だけを not found とし、それ以外のエラーはそのまま返す
+- `preview` の `Messages:` 行が `91-120/120` のような末尾範囲を表示していたが、ツール出力や rewind で外れた枝を除いた後の件数から計算しており、実際に表示した範囲と合わなかった。`30/120 (returned/total)` の形に変えた
 
 ## [0.18.2] - 2026-11-05
 
