@@ -21,12 +21,11 @@ pub fn connect(db_path: &str, readonly: bool) -> Result<Connection> {
     let resolved = expand_path(db_path);
 
     let conn = if readonly {
-        let uri = format!("file:{}?mode=ro", resolved.display());
+        // Why not a `file:...?mode=ro` URI: `#`, `?` and `%` in the path would be parsed
+        // as URI syntax and open a different file. The flag alone makes it read-only.
         Connection::open_with_flags(
-            &uri,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-                | rusqlite::OpenFlags::SQLITE_OPEN_URI
-                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            &resolved,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?
     } else {
         // Ensure parent directory exists
@@ -55,4 +54,28 @@ pub fn connect(db_path: &str, readonly: bool) -> Result<Connection> {
 /// Get the default database path (expanded).
 pub fn default_db_path() -> PathBuf {
     expand_path(DEFAULT_DB_PATH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `#`, `?` and `%` are URI syntax; a read-only open must still reach this exact file.
+    #[test]
+    fn test_readonly_connect_opens_path_with_uri_metacharacters() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a#b?c%41.db");
+        let path_str = path.to_str().unwrap();
+        connect(path_str, false)
+            .unwrap()
+            .execute_batch("CREATE TABLE marker (x); INSERT INTO marker VALUES (1);")
+            .unwrap();
+
+        let conn = connect(path_str, true).unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM marker", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(conn.execute("INSERT INTO marker VALUES (2)", []).is_err());
+    }
 }
