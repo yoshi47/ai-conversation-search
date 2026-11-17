@@ -822,6 +822,7 @@ impl ConversationIndexer {
     ) -> Result<(Option<ConversationMeta>, Vec<Message>, usize)> {
         let content = std::fs::read_to_string(file_path)?;
         let mut messages = Vec::new();
+        let mut seen_uuids: HashSet<String> = HashSet::new();
         let mut skipped_lines = 0usize;
         let mut summary_from_jsonl: Option<String> = None;
         let mut leaf_uuid_from_jsonl: Option<String> = None;
@@ -891,6 +892,12 @@ impl ConversationIndexer {
                 Some("user") | Some("assistant") => entry.entry_type.as_ref().unwrap().clone(),
                 _ => continue,
             };
+
+            // Keep the first row, as INSERT OR IGNORE does on the indexed path. A later
+            // row with another parent would otherwise make every tree walker loop.
+            if !seen_uuids.insert(uuid.clone()) {
+                continue;
+            }
 
             // Extract content
             let msg_content = match message.get("content") {
@@ -1031,7 +1038,13 @@ impl ConversationIndexer {
             }
         }
 
+        // Duplicate uuid rows can close a cycle or list the same child twice; without
+        // this the walk never ends or doubles the queue at every level.
+        let mut visited: HashSet<&str> = HashSet::new();
         while let Some((uuid, depth)) = queue.pop_front() {
+            if !visited.insert(uuid) {
+                continue;
+            }
             depths.insert(uuid.to_string(), depth);
             if let Some(kids) = children.get(uuid) {
                 for kid in kids {
@@ -2293,6 +2306,81 @@ mod tests {
         assert_eq!(depths["child1"], 1);
         assert_eq!(depths["child2"], 1);
         assert_eq!(depths["grandchild"], 2);
+    }
+
+    fn tree_msg(uuid: &str, parent: Option<&str>) -> Message {
+        Message {
+            uuid: uuid.to_string(),
+            parent_uuid: parent.map(str::to_string),
+            is_sidechain: false,
+            timestamp: None,
+            message_type: "user".to_string(),
+            content: uuid.to_string(),
+            session_id: Some("s1".to_string()),
+            is_meta_conversation: false,
+            model: None,
+        }
+    }
+
+    /// Runs `calculate_depth` on a worker thread so a regression fails the test
+    /// instead of hanging the whole suite.
+    fn depths_within_timeout(messages: Vec<Message>) -> HashMap<String, i32> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ConversationIndexer::calculate_depth(&messages));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("calculate_depth did not terminate")
+    }
+
+    #[test]
+    fn test_calculate_depth_terminates_when_duplicate_uuid_forms_cycle() {
+        // A second "b" row whose parent is "c" closes the loop b -> c -> b.
+        let messages = vec![
+            tree_msg("a", None),
+            tree_msg("b", Some("a")),
+            tree_msg("c", Some("b")),
+            tree_msg("b", Some("c")),
+        ];
+
+        let depths = depths_within_timeout(messages);
+        assert_eq!(depths["a"], 0);
+        assert_eq!(depths["b"], 1);
+        assert_eq!(depths["c"], 2);
+    }
+
+    #[test]
+    fn test_calculate_depth_duplicate_rows_with_same_parent_keep_shallowest_depth() {
+        let messages = vec![
+            tree_msg("a", None),
+            tree_msg("b", Some("a")),
+            tree_msg("b", Some("a")),
+            tree_msg("c", Some("b")),
+            tree_msg("c", Some("b")),
+        ];
+
+        let depths = depths_within_timeout(messages);
+        assert_eq!(depths.len(), 3);
+        assert_eq!(depths["c"], 2);
+    }
+
+    #[test]
+    fn test_parse_drops_duplicate_uuid_rows_keeping_first() {
+        // First row wins, matching INSERT OR IGNORE on the indexed path.
+        let file = write_temp_jsonl(&[
+            r#"{"uuid":"a","parentUuid":null,"type":"user","sessionId":"s1","message":{"role":"user","content":"first a"}}"#,
+            r#"{"uuid":"b","parentUuid":"a","type":"assistant","sessionId":"s1","message":{"role":"assistant","content":"first b"}}"#,
+            r#"{"uuid":"c","parentUuid":"b","type":"user","sessionId":"s1","message":{"role":"user","content":"c"}}"#,
+            r#"{"uuid":"b","parentUuid":"c","type":"assistant","sessionId":"s1","message":{"role":"assistant","content":"second b"}}"#,
+        ]);
+
+        let (_, messages, _) =
+            ConversationIndexer::parse_conversation_file_raw(file.path()).unwrap();
+
+        let uuids: Vec<&str> = messages.iter().map(|m| m.uuid.as_str()).collect();
+        assert_eq!(uuids, vec!["a", "b", "c"]);
+        assert_eq!(messages[1].content, "first b");
+        assert_eq!(messages[1].parent_uuid.as_deref(), Some("a"));
     }
 
     #[test]
