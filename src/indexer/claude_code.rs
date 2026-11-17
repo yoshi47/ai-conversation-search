@@ -5,7 +5,6 @@ use rusqlite::Connection;
 use serde::Deserialize;
 
 use crate::error::Result;
-use crate::git_utils::resolve_repo_root;
 use crate::schema::{init_schema, FTS_SYNC_TRIGGERS};
 use crate::summarization;
 
@@ -553,33 +552,12 @@ impl ConversationIndexer {
         project_path: &str,
         conversation_file: Option<&str>,
     ) -> Option<String> {
-        // Check DB cache first
-        if let Ok(cached) = self.conn.query_row(
-            "SELECT repo_root FROM repo_root_cache WHERE project_path = ?",
-            [project_path],
-            |row| row.get::<_, Option<String>>(0),
-        ) {
-            return cached;
-        }
-
         // Claude Code stores project dirs as hashed names; decode from conversation file path
-        let repo_root = conversation_file.and_then(|conv_file| {
-            let conv_path = Path::new(conv_file);
-            let parent = conv_path.parent()?;
-            let dir_name = parent.file_name()?;
-            let real_path = Self::decode_project_dir_name(&dir_name.to_string_lossy())?;
-            resolve_repo_root(&real_path)
+        let real_path = conversation_file.and_then(|conv_file| {
+            let dir_name = Path::new(conv_file).parent()?.file_name()?;
+            Self::decode_project_dir_name(&dir_name.to_string_lossy())
         });
-
-        // Cache result
-        if let Some(ref root) = repo_root {
-            let _ = self.conn.execute(
-                "INSERT OR REPLACE INTO repo_root_cache (project_path, repo_root) VALUES (?, ?)",
-                rusqlite::params![project_path, root],
-            );
-        }
-
-        repo_root
+        super::resolve_repo_root_cached_at(&self.conn, project_path, real_path.as_deref())
     }
 
     /// Backfill repo_root for existing conversations that don't have one.
@@ -822,6 +800,7 @@ impl ConversationIndexer {
     ) -> Result<(Option<ConversationMeta>, Vec<Message>, usize)> {
         let content = std::fs::read_to_string(file_path)?;
         let mut messages = Vec::new();
+        let mut seen_uuids: HashSet<String> = HashSet::new();
         let mut skipped_lines = 0usize;
         let mut summary_from_jsonl: Option<String> = None;
         let mut leaf_uuid_from_jsonl: Option<String> = None;
@@ -891,6 +870,12 @@ impl ConversationIndexer {
                 Some("user") | Some("assistant") => entry.entry_type.as_ref().unwrap().clone(),
                 _ => continue,
             };
+
+            // Keep the first row, as INSERT OR IGNORE does on the indexed path. A later
+            // row with another parent would otherwise make every tree walker loop.
+            if !seen_uuids.insert(uuid.clone()) {
+                continue;
+            }
 
             // Extract content
             let msg_content = match message.get("content") {
@@ -1031,7 +1016,13 @@ impl ConversationIndexer {
             }
         }
 
+        // Duplicate uuid rows can close a cycle or list the same child twice; without
+        // this the walk never ends or doubles the queue at every level.
+        let mut visited: HashSet<&str> = HashSet::new();
         while let Some((uuid, depth)) = queue.pop_front() {
+            if !visited.insert(uuid) {
+                continue;
+            }
             depths.insert(uuid.to_string(), depth);
             if let Some(kids) = children.get(uuid) {
                 for kid in kids {
@@ -1287,14 +1278,19 @@ impl ConversationIndexer {
 
         let (conv_meta, mut messages) = self.parse_conversation_file(file_path)?;
 
+        // Every skip below stamps sync_state, as the observer skip does: re-running
+        // cannot change the outcome until the file changes, and an unstamped file is
+        // re-parsed on every run and counted as "not indexed" by `status`.
         if messages.is_empty() {
             self.log(&format!("  No messages found in {}", file_path.display()));
+            record_sync_state(&self.conn, file_path, file_mtime)?;
             return Ok(());
         }
 
         // Skip summarizer conversations
         if summarization::is_summarizer_conversation(&messages) {
             self.log("  Skipping automated summarizer conversation");
+            record_sync_state(&self.conn, file_path, file_mtime)?;
             return Ok(());
         }
 
@@ -1303,8 +1299,6 @@ impl ConversationIndexer {
         // us through CONVERSATION_SEARCH_EXTRA_DIRS.
         if !self.index_observer && summarization::is_observer_conversation(&messages) {
             self.log("  Skipping claude-mem observer conversation");
-            // Recorded even though nothing is indexed: claude-mem keeps producing these,
-            // and without a sync_state row every run would re-parse each one in full.
             record_sync_state(&self.conn, file_path, file_mtime)?;
             return Ok(());
         }
@@ -1342,6 +1336,7 @@ impl ConversationIndexer {
             Some(s) => s.clone(),
             None => {
                 self.log(&format!("  No session_id found in {}", file_path.display()));
+                record_sync_state(&self.conn, file_path, file_mtime)?;
                 return Ok(());
             }
         };
@@ -2295,6 +2290,81 @@ mod tests {
         assert_eq!(depths["grandchild"], 2);
     }
 
+    fn tree_msg(uuid: &str, parent: Option<&str>) -> Message {
+        Message {
+            uuid: uuid.to_string(),
+            parent_uuid: parent.map(str::to_string),
+            is_sidechain: false,
+            timestamp: None,
+            message_type: "user".to_string(),
+            content: uuid.to_string(),
+            session_id: Some("s1".to_string()),
+            is_meta_conversation: false,
+            model: None,
+        }
+    }
+
+    /// Runs `calculate_depth` on a worker thread so a regression fails the test
+    /// instead of hanging the whole suite.
+    fn depths_within_timeout(messages: Vec<Message>) -> HashMap<String, i32> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ConversationIndexer::calculate_depth(&messages));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("calculate_depth did not terminate")
+    }
+
+    #[test]
+    fn test_calculate_depth_terminates_when_duplicate_uuid_forms_cycle() {
+        // A second "b" row whose parent is "c" closes the loop b -> c -> b.
+        let messages = vec![
+            tree_msg("a", None),
+            tree_msg("b", Some("a")),
+            tree_msg("c", Some("b")),
+            tree_msg("b", Some("c")),
+        ];
+
+        let depths = depths_within_timeout(messages);
+        assert_eq!(depths["a"], 0);
+        assert_eq!(depths["b"], 1);
+        assert_eq!(depths["c"], 2);
+    }
+
+    #[test]
+    fn test_calculate_depth_duplicate_rows_with_same_parent_keep_shallowest_depth() {
+        let messages = vec![
+            tree_msg("a", None),
+            tree_msg("b", Some("a")),
+            tree_msg("b", Some("a")),
+            tree_msg("c", Some("b")),
+            tree_msg("c", Some("b")),
+        ];
+
+        let depths = depths_within_timeout(messages);
+        assert_eq!(depths.len(), 3);
+        assert_eq!(depths["c"], 2);
+    }
+
+    #[test]
+    fn test_parse_drops_duplicate_uuid_rows_keeping_first() {
+        // First row wins, matching INSERT OR IGNORE on the indexed path.
+        let file = write_temp_jsonl(&[
+            r#"{"uuid":"a","parentUuid":null,"type":"user","sessionId":"s1","message":{"role":"user","content":"first a"}}"#,
+            r#"{"uuid":"b","parentUuid":"a","type":"assistant","sessionId":"s1","message":{"role":"assistant","content":"first b"}}"#,
+            r#"{"uuid":"c","parentUuid":"b","type":"user","sessionId":"s1","message":{"role":"user","content":"c"}}"#,
+            r#"{"uuid":"b","parentUuid":"c","type":"assistant","sessionId":"s1","message":{"role":"assistant","content":"second b"}}"#,
+        ]);
+
+        let (_, messages, _) =
+            ConversationIndexer::parse_conversation_file_raw(file.path()).unwrap();
+
+        let uuids: Vec<&str> = messages.iter().map(|m| m.uuid.as_str()).collect();
+        assert_eq!(uuids, vec!["a", "b", "c"]);
+        assert_eq!(messages[1].content, "first b");
+        assert_eq!(messages[1].parent_uuid.as_deref(), Some("a"));
+    }
+
     #[test]
     fn test_mark_meta_conversations() {
         // Create a chain: user_ask -> assistant_uses_search -> user_followup
@@ -2965,6 +3035,107 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stamped, 1);
+    }
+
+    fn sync_state_rows(indexer: &ConversationIndexer, file: &Path) -> i64 {
+        indexer
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM claude_code_sync_state WHERE file_path = ?",
+                [file.to_string_lossy().as_ref()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    // `status` compares sync_state rows with files on disk. A transcript the indexer
+    // deliberately leaves out must still be stamped, or it reads as "not indexed" forever
+    // and is fully re-parsed on every run.
+
+    #[test]
+    fn test_indexer_records_sync_state_for_transcript_without_messages() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "empty",
+            &[r#"{"type":"custom-title","customTitle":"t"}"#],
+        );
+
+        indexer.index_conversation(&file).unwrap();
+
+        assert_eq!(sync_state_rows(&indexer, &file), 1);
+    }
+
+    #[test]
+    fn test_indexer_records_sync_state_for_skipped_summarizer() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "summarizer",
+            &[
+                r#"{"uuid":"u1","parentUuid":null,"type":"user","sessionId":"sum1","message":{"role":"user","content":"Summarize this conversation"}}"#,
+                r#"{"uuid":"u2","parentUuid":"u1","type":"assistant","sessionId":"sum1","message":{"role":"assistant","content":"ok"}}"#,
+            ],
+        );
+
+        indexer.index_conversation(&file).unwrap();
+
+        assert_eq!(count_messages(&indexer), 0);
+        assert_eq!(sync_state_rows(&indexer, &file), 1);
+    }
+
+    #[test]
+    fn test_indexer_records_sync_state_for_transcript_without_session_id() {
+        let (dir, mut indexer) = create_test_indexer();
+        let file = write_jsonl_in_dir(
+            dir.path(),
+            "nosession",
+            &[
+                r#"{"uuid":"u1","parentUuid":null,"type":"user","message":{"role":"user","content":"hello"}}"#,
+            ],
+        );
+
+        indexer.index_conversation(&file).unwrap();
+
+        assert_eq!(count_messages(&indexer), 0);
+        assert_eq!(sync_state_rows(&indexer, &file), 1);
+    }
+
+    #[test]
+    fn test_resolve_repo_root_ignores_null_cached_by_other_indexer() {
+        // Codex/OpenCode used to cache NULL for non-git paths. The Claude path must
+        // re-resolve instead of returning that NULL after the directory became a repo.
+        let (dir, indexer) = create_test_indexer();
+        let repo = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(repo.path())
+            .status()
+            .expect("git must be installed to run this test");
+        assert!(status.success());
+        let repo_path = repo
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+
+        let encoded = repo_path.replace(['/', '.'], "-");
+        let project_dir = dir.path().join(&encoded);
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let conv_file = project_dir.join("s.jsonl");
+        std::fs::write(&conv_file, "").unwrap();
+
+        indexer
+            .connection()
+            .execute(
+                "INSERT INTO repo_root_cache (project_path, repo_root) VALUES (?, NULL)",
+                [&repo_path],
+            )
+            .unwrap();
+
+        let resolved = indexer.resolve_repo_root(&repo_path, Some(&conv_file.to_string_lossy()));
+        assert_eq!(resolved, Some(repo_path));
     }
 
     #[test]
