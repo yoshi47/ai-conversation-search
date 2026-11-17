@@ -100,38 +100,31 @@ impl CodexIndexer {
             return vec![];
         }
 
-        if let Some(d) = days_back {
-            let mut files = Vec::new();
-            let today = chrono::Local::now().date_naive();
-            for i in 0..=d {
-                let date = today - chrono::TimeDelta::days(i);
-                let day_dir = self.sessions_dir.join(date.format("%Y/%m/%d").to_string());
-                if day_dir.exists() {
-                    if let Ok(entries) = std::fs::read_dir(&day_dir) {
-                        for entry in entries.flatten() {
-                            let path = entry.path();
-                            if path.extension().is_some_and(|e| e == "jsonl") {
-                                files.push(path);
-                            }
-                        }
-                    }
+        // Filter by mtime, not by the `YYYY/MM/DD` directory: that is the session's start
+        // date, and resuming a session appends to the original rollout file.
+        let cutoff = days_back.map(|d| {
+            std::time::SystemTime::from(chrono::Local::now() - chrono::TimeDelta::days(d))
+        });
+        let mut files = Vec::new();
+        for entry in walkdir::WalkDir::new(&self.sessions_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if entry.path().extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+            if let Some(cutoff) = cutoff {
+                let Ok(mtime) = entry.path().metadata().and_then(|m| m.modified()) else {
+                    continue;
+                };
+                if mtime < cutoff {
+                    continue;
                 }
             }
-            files.sort();
-            files
-        } else {
-            let mut files = Vec::new();
-            for entry in walkdir::WalkDir::new(&self.sessions_dir)
-                .into_iter()
-                .filter_map(|e| e.ok())
-            {
-                if entry.path().extension().is_some_and(|e| e == "jsonl") {
-                    files.push(entry.path().to_path_buf());
-                }
-            }
-            files.sort();
-            files
+            files.push(entry.path().to_path_buf());
         }
+        files.sort();
+        files
     }
 
     fn extract_uuid_from_filename(&self, filename: &str) -> String {
@@ -169,17 +162,22 @@ impl CodexIndexer {
     fn do_index(&self, conn: &Connection, session_files: &[PathBuf]) -> Result<usize> {
         let mut indexed_count: usize = 0;
 
-        conn.execute_batch("BEGIN;")?;
-
         for session_file in session_files {
-            let mtime = match session_file.metadata() {
-                Ok(m) => m
-                    .modified()
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0),
-                Err(_) => continue,
+            // Recording a placeholder mtime (e.g. 0.0) would match on every later run and
+            // skip the file forever, so leave it unrecorded and retry next time.
+            let mtime = match session_file
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|t| t.duration_since(std::time::UNIX_EPOCH))
+            {
+                Ok(Ok(d)) => d.as_secs_f64(),
+                Ok(Err(_)) | Err(_) => {
+                    eprintln!(
+                        "  Skipping {}: cannot read its modification time",
+                        session_file.display()
+                    );
+                    continue;
+                }
             };
 
             // Check if already indexed with same mtime
@@ -193,7 +191,20 @@ impl CodexIndexer {
                 }
             }
 
-            match self.index_session_file(conn, session_file) {
+            // index_session_file deletes the old rows before inserting, so each file gets its
+            // own transaction: a failure must roll back the delete, not commit it.
+            let tx = conn.unchecked_transaction()?;
+            let outcome = self
+                .index_session_file(&tx, session_file)
+                .and_then(|count| {
+                    tx.execute(
+                        "INSERT OR REPLACE INTO codex_sync_state (file_path, mtime) VALUES (?, ?)",
+                        rusqlite::params![session_file.to_string_lossy().as_ref(), mtime],
+                    )?;
+                    tx.commit()?;
+                    Ok(count)
+                });
+            match outcome {
                 Ok(count) if count > 0 => {
                     indexed_count += 1;
                 }
@@ -208,18 +219,9 @@ impl CodexIndexer {
                             .unwrap_or_default(),
                         e
                     );
-                    continue;
                 }
             }
-
-            // Update sync state
-            conn.execute(
-                "INSERT OR REPLACE INTO codex_sync_state (file_path, mtime) VALUES (?, ?)",
-                rusqlite::params![session_file.to_string_lossy().as_ref(), mtime],
-            )?;
         }
-
-        conn.execute_batch("COMMIT;")?;
 
         if indexed_count > 0 {
             self.log(&format!("Indexed {} Codex sessions", indexed_count));
@@ -900,6 +902,88 @@ mod tests {
 
         let count3 = indexer.do_index(&conn, &files).unwrap();
         assert_eq!(count3, 1);
+    }
+
+    fn create_sync_table(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS codex_sync_state (
+                file_path TEXT PRIMARY KEY,
+                mtime REAL NOT NULL,
+                indexed_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .unwrap();
+    }
+
+    fn set_mtime(path: &Path, time: std::time::SystemTime) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn test_failed_file_keeps_old_messages_and_sync_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+        create_sync_table(&conn);
+
+        let meta = r#"{"type":"session_meta","payload":{"id":"56565656-7878-9090-1212-343434343434","cwd":"/tmp","timestamp":"2025-01-15T10:00:00Z"}}"#;
+        let user = r#"{"type":"event_msg","payload":{"type":"user_message","message":"old question"},"timestamp":"2025-01-15T10:00:01Z"}"#;
+        let session_file = write_session_file(dir.path(), "atomic.jsonl", &[meta, user]);
+        let indexer = create_indexer(dir.path());
+        let files = vec![session_file.clone()];
+        assert_eq!(indexer.do_index(&conn, &files).unwrap(), 1);
+        let old_mtime: f64 = conn
+            .query_row("SELECT mtime FROM codex_sync_state", [], |row| row.get(0))
+            .unwrap();
+
+        let agent = r#"{"type":"event_msg","payload":{"type":"agent_message","message":"new answer"},"timestamp":"2025-01-15T10:00:02Z"}"#;
+        write_session_file(dir.path(), "atomic.jsonl", &[meta, user, agent]);
+        set_mtime(
+            &session_file,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(2_000_000_000),
+        );
+        conn.execute_batch(
+            "CREATE TRIGGER fail_insert BEFORE INSERT ON messages
+             WHEN NEW.session_id = 'codex:56565656-7878-9090-1212-343434343434'
+             BEGIN SELECT RAISE(ABORT, 'boom'); END;",
+        )
+        .unwrap();
+        assert_eq!(indexer.do_index(&conn, &files).unwrap(), 0);
+
+        assert_eq!(
+            message_rows(&conn),
+            vec![("user".to_string(), "old question".to_string())]
+        );
+        let mtime: f64 = conn
+            .query_row("SELECT mtime FROM codex_sync_state", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mtime, old_mtime);
+
+        conn.execute_batch("DROP TRIGGER fail_insert;").unwrap();
+        assert_eq!(indexer.do_index(&conn, &files).unwrap(), 1);
+        assert_eq!(message_rows(&conn).len(), 2);
+    }
+
+    /// Resuming a Codex session appends to the rollout under its original start
+    /// date, so `--days` must filter by mtime rather than by the date directory.
+    #[test]
+    fn test_days_filter_uses_mtime_not_date_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let meta = r#"{"type":"session_meta","payload":{"id":"67676767-8989-0101-2323-454545454545","cwd":"/tmp","timestamp":"2025-01-15T10:00:00Z"}}"#;
+        let resumed = write_session_file(dir.path(), "resumed.jsonl", &[meta]);
+        let stale = write_session_file(dir.path(), "stale.jsonl", &[meta]);
+        set_mtime(
+            &stale,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(3 * 24 * 60 * 60),
+        );
+
+        let indexer = create_indexer(&dir.path().join("sessions"));
+        assert_eq!(indexer.find_session_files(Some(1)), vec![resumed]);
+        assert_eq!(indexer.find_session_files(None).len(), 2);
     }
 
     #[test]
