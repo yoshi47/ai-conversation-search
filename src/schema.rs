@@ -196,24 +196,11 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     bootstrap_existing_db(conn)?;
 
     for (version, description, kind) in MIGRATIONS {
-        if is_migration_applied(conn, *version) {
+        // Lock-free fast path, so an up-to-date DB never takes the write lock here.
+        if is_migration_applied(conn, *version)? {
             continue;
         }
-
-        log::info!("Running migration {}: {}", version, description);
-
-        match kind {
-            MigrationKind::Sql(sql) => {
-                let tx = conn.unchecked_transaction()?;
-                tx.execute_batch(sql)?;
-                record_migration(&tx, *version)?;
-                tx.commit()?;
-            }
-            MigrationKind::Custom => {
-                run_custom_migration(conn, *version)?;
-                record_migration(conn, *version)?;
-            }
-        }
+        apply_migration(conn, *version, description, kind)?;
     }
 
     // Second pass: now that all migrations have run, ensure all indexes/triggers exist
@@ -223,7 +210,10 @@ pub fn init_schema(conn: &Connection) -> Result<()> {
     // Migration 16 is already recorded and will not rerun, so check the shape every time.
     if !fts_triggers_use_pending_queue(conn)? {
         eprintln!("Repairing FTS sync triggers reverted by an older ai-conversation-search");
-        migrate_bigram_pending_queue(conn)?;
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        migrate_bigram_pending_queue(&tx)?;
+        tx.commit()?;
     }
 
     if required_writer < MIN_WRITER_SCHEMA {
@@ -258,13 +248,42 @@ fn ensure_schema_version_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn is_migration_applied(conn: &Connection, version: i64) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM schema_version WHERE version = ?",
-        [version],
-        |_| Ok(()),
-    )
-    .is_ok()
+/// Run one migration and record it, atomically.
+///
+/// Why not trust the caller's `is_migration_applied`: background indexers can start
+/// concurrently, and another one may have applied this migration between that read and
+/// this write lock. Re-checking under IMMEDIATE turns the loser into a no-op instead of
+/// a "duplicate column name" failure or a second sync-state wipe.
+fn apply_migration(
+    conn: &Connection,
+    version: i64,
+    description: &str,
+    kind: &MigrationKind,
+) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if is_migration_applied(&tx, version)? {
+        return Ok(());
+    }
+
+    log::info!("Running migration {}: {}", version, description);
+    match kind {
+        MigrationKind::Sql(sql) => tx.execute_batch(sql)?,
+        MigrationKind::Custom => run_custom_migration(&tx, version)?,
+    }
+    record_migration(&tx, version)?;
+    tx.commit()?;
+    Ok(())
+}
+
+fn is_migration_applied(conn: &Connection, version: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM schema_version WHERE version = ?",
+            [version],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn record_migration(conn: &Connection, version: i64) -> Result<()> {
@@ -332,7 +351,7 @@ fn detect_sql_migration_applied(conn: &Connection, sql: &str) -> bool {
     }
     if sql.contains("CREATE TABLE") {
         if let Some(table) = parse_create_table(sql) {
-            return table_exists(conn, &table);
+            return table_exists(conn, &table).unwrap_or(false);
         }
     }
     if sql.contains("CREATE INDEX") {
@@ -366,8 +385,8 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bo
         16 => ("trigger", "messages_ai", "message_bigram_pending"),
         // Data-only migration: a fresh DB has empty (or absent) sync tables,
         // so there is nothing to backfill and it counts as applied.
-        15 => return Ok(sync_tables_empty_for_model_backfill(conn)),
-        17 => return Ok(sync_tables_empty_for_codex_backfill(conn)),
+        15 => return sync_tables_empty_for_model_backfill(conn),
+        17 => return sync_tables_empty_for_codex_backfill(conn),
         v => unreachable!("unhandled custom migration version: {}", v),
     };
 
@@ -386,21 +405,21 @@ fn detect_custom_migration_applied(conn: &Connection, version: i64) -> Result<bo
     Ok(sql.is_none_or(|s| s.contains(marker)))
 }
 
-fn sync_tables_empty(conn: &Connection, tables: &[&str]) -> bool {
+/// Errors propagate for the same reason as in `detect_custom_migration_applied`:
+/// "empty" means "applied", and that is permanent.
+fn sync_tables_empty(conn: &Connection, tables: &[&str]) -> Result<bool> {
     for table in tables {
-        if !table_exists(conn, table) {
+        if !table_exists(conn, table)? {
             continue;
         }
-        let count: i64 = conn
-            .query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
-                row.get(0)
-            })
-            .unwrap_or(0);
+        let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {}", table), [], |row| {
+            row.get(0)
+        })?;
         if count > 0 {
-            return false;
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Whether the model-backfill migration has nothing to do.
@@ -409,7 +428,7 @@ fn sync_tables_empty(conn: &Connection, tables: &[&str]) -> bool {
 /// or a DB that already ran the backfill and has not indexed since. An existing
 /// DB with index history reports false so the migration runs once and forces a
 /// reparse that fills `messages.model` / `conversations.model`.
-fn sync_tables_empty_for_model_backfill(conn: &Connection) -> bool {
+fn sync_tables_empty_for_model_backfill(conn: &Connection) -> Result<bool> {
     sync_tables_empty(
         conn,
         &[
@@ -421,13 +440,13 @@ fn sync_tables_empty_for_model_backfill(conn: &Connection) -> bool {
 }
 
 /// Whether the Codex user-message backfill has nothing to do.
-fn sync_tables_empty_for_codex_backfill(conn: &Connection) -> bool {
+fn sync_tables_empty_for_codex_backfill(conn: &Connection) -> Result<bool> {
     sync_tables_empty(conn, &["codex_sync_state"])
 }
 
 fn clear_sync_tables(conn: &Connection, tables: &[&str]) -> Result<()> {
     for table in tables {
-        if table_exists(conn, table) {
+        if table_exists(conn, table)? {
             conn.execute(&format!("DELETE FROM {}", table), [])?;
         }
     }
@@ -440,8 +459,8 @@ fn clear_sync_tables(conn: &Connection, tables: &[&str]) -> Result<()> {
 /// existed, and the incremental paths skip unchanged files/sessions. Wiping the
 /// cursors forces one full reparse; the indexers backfill NULL models in place
 /// (Claude Code updates rows, OpenCode/Codex re-insert sessions), so no data
-/// is lost. Runs inside its own transaction; a fresh DB has empty tables and
-/// this is a no-op.
+/// is lost. Runs inside the transaction `apply_migration` opens; a fresh DB has
+/// empty tables and this is a no-op.
 fn clear_sync_state_for_model_backfill(conn: &Connection) -> Result<()> {
     clear_sync_tables(
         conn,
@@ -471,13 +490,15 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> bool {
     .is_ok()
 }
 
-fn table_exists(conn: &Connection, table: &str) -> bool {
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
-        [table],
-        |_| Ok(()),
-    )
-    .is_ok()
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
 }
 
 fn index_exists(conn: &Connection, index: &str) -> bool {
@@ -602,6 +623,9 @@ pub fn drain_bigram_pending(conn: &Connection) -> Result<usize> {
 }
 
 /// Run custom migration by version.
+///
+/// The bodies open no transaction of their own: `apply_migration` runs them inside the
+/// IMMEDIATE transaction that also records the version.
 fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
     match version {
         8 => migrate_fts_to_trigram(conn),
@@ -621,11 +645,9 @@ fn run_custom_migration(conn: &Connection, version: i64) -> Result<()> {
 /// by the previous triggers are not repaired here -- that needs a full rebuild, which
 /// `prune-observer` performs.
 fn migrate_fix_fts_delete_triggers(conn: &Connection) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
-    tx.execute_batch(FTS_SYNC_TRIGGERS)?;
-    tx.commit()?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
+    conn.execute_batch(FTS_SYNC_TRIGGERS)?;
     Ok(())
 }
 
@@ -638,19 +660,17 @@ fn migrate_fix_fts_delete_triggers(conn: &Connection) -> Result<()> {
 /// not in a migration that runs inside the background indexer. New writes are
 /// covered by the triggers from this point on.
 fn migrate_add_bigram_fts(conn: &Connection) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
+    conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS message_content_bigram_fts USING fts5(
             message_uuid UNINDEXED,
             bigram_content,
             tokenize='unicode61 remove_diacritics 1'
         );",
     )?;
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_ai;")?;
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
-    tx.execute_batch(FTS_SYNC_TRIGGERS)?;
-    tx.commit()?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS messages_ai;")?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
+    conn.execute_batch(FTS_SYNC_TRIGGERS)?;
     Ok(())
 }
 
@@ -658,17 +678,16 @@ fn migrate_add_bigram_fts(conn: &Connection) -> Result<()> {
 ///
 /// No rows are queued here: under the pre-16 triggers a write either filled its bigram
 /// entry or failed and rolled back as a whole. Rows older than migration 10 remain
-/// `backfill-bigram`'s job.
+/// `backfill-bigram`'s job. Callers run it inside a transaction: dropping the triggers
+/// and committing before they are recreated would let writes skip the FTS tables.
 fn migrate_bigram_pending_queue(conn: &Connection) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
-    tx.execute_batch(
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS message_bigram_pending (msg_rowid INTEGER PRIMARY KEY);
          DROP TRIGGER IF EXISTS messages_ai;
          DROP TRIGGER IF EXISTS messages_ad;
          DROP TRIGGER IF EXISTS messages_au;",
     )?;
-    tx.execute_batch(FTS_SYNC_TRIGGERS)?;
-    tx.commit()?;
+    conn.execute_batch(FTS_SYNC_TRIGGERS)?;
     Ok(())
 }
 
@@ -694,14 +713,12 @@ fn migrate_fts_to_trigram(conn: &Connection) -> Result<()> {
 
     log::info!("Migrating FTS index to trigram tokenizer for Japanese/CJK support...");
 
-    let tx = conn.unchecked_transaction()?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS messages_ai;")?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
+    conn.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
+    conn.execute_batch("DROP TABLE IF EXISTS message_content_fts;")?;
 
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_ai;")?;
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_ad;")?;
-    tx.execute_batch("DROP TRIGGER IF EXISTS messages_au;")?;
-    tx.execute_batch("DROP TABLE IF EXISTS message_content_fts;")?;
-
-    tx.execute_batch(
+    conn.execute_batch(
         "CREATE VIRTUAL TABLE IF NOT EXISTS message_content_fts USING fts5(
             message_uuid UNINDEXED,
             full_content,
@@ -711,14 +728,12 @@ fn migrate_fts_to_trigram(conn: &Connection) -> Result<()> {
         );",
     )?;
 
-    tx.execute_batch(FTS_SYNC_TRIGGERS)?;
+    conn.execute_batch(FTS_SYNC_TRIGGERS)?;
 
-    tx.execute(
+    conn.execute(
         "INSERT INTO message_content_fts(message_content_fts) VALUES('rebuild')",
         [],
     )?;
-
-    tx.commit()?;
 
     log::info!("FTS trigram migration complete.");
     Ok(())
@@ -1293,11 +1308,11 @@ mod tests {
         assert_eq!(count, MIGRATIONS.len() as i64);
 
         // Verify key tables exist
-        assert!(table_exists(&conn, "messages"));
-        assert!(table_exists(&conn, "conversations"));
-        assert!(table_exists(&conn, "repo_root_cache"));
-        assert!(table_exists(&conn, "claude_code_sync_state"));
-        assert!(table_exists(&conn, "schema_version"));
+        assert!(table_exists(&conn, "messages").unwrap());
+        assert!(table_exists(&conn, "conversations").unwrap());
+        assert!(table_exists(&conn, "repo_root_cache").unwrap());
+        assert!(table_exists(&conn, "claude_code_sync_state").unwrap());
+        assert!(table_exists(&conn, "schema_version").unwrap());
 
         // Verify key columns
         assert!(column_exists(&conn, "messages", "is_meta_conversation"));
@@ -1330,7 +1345,7 @@ mod tests {
         conn.execute_batch(SCHEMA_SQL).unwrap();
 
         // No schema_version table yet
-        assert!(!table_exists(&conn, "schema_version"));
+        assert!(!table_exists(&conn, "schema_version").unwrap());
 
         // Now run init_schema - it should bootstrap
         init_schema(&conn).unwrap();
@@ -1397,8 +1412,8 @@ mod tests {
         assert!(column_exists(&conn, "messages", "is_meta_conversation"));
         assert!(column_exists(&conn, "conversations", "repo_root"));
         assert!(column_exists(&conn, "conversations", "source"));
-        assert!(table_exists(&conn, "repo_root_cache"));
-        assert!(table_exists(&conn, "claude_code_sync_state"));
+        assert!(table_exists(&conn, "repo_root_cache").unwrap());
+        assert!(table_exists(&conn, "claude_code_sync_state").unwrap());
         assert!(index_exists(&conn, "idx_conv_repo_root"));
         assert!(index_exists(&conn, "idx_conv_source"));
 
@@ -1427,7 +1442,7 @@ mod tests {
         // Verify each version is recorded
         for (version, _, _) in MIGRATIONS {
             assert!(
-                is_migration_applied(&conn, *version),
+                is_migration_applied(&conn, *version).unwrap(),
                 "migration {} should be recorded",
                 version
             );
@@ -1500,8 +1515,8 @@ mod tests {
         assert!(column_exists(&conn, "conversations", "model"));
         assert!(index_exists(&conn, "idx_conv_model"));
         assert!(index_exists(&conn, "idx_msg_model"));
-        assert!(is_migration_applied(&conn, 11));
-        assert!(is_migration_applied(&conn, 15));
+        assert!(is_migration_applied(&conn, 11).unwrap());
+        assert!(is_migration_applied(&conn, 15).unwrap());
         // Content preserved.
         let content: String = conn
             .query_row(
@@ -1541,13 +1556,106 @@ mod tests {
 
         init_schema(&conn).unwrap();
 
-        assert!(is_migration_applied(&conn, 17));
+        assert!(is_migration_applied(&conn, 17).unwrap());
         let remaining: i64 = conn
             .query_row("SELECT COUNT(*) FROM codex_sync_state", [], |row| {
                 row.get(0)
             })
             .unwrap();
         assert_eq!(remaining, 0);
+    }
+
+    /// Rollback-journal file DB with a codex cursor row, plus a second connection
+    /// holding an EXCLUSIVE lock so reading the sync tables fails with SQLITE_BUSY.
+    fn sync_state_db_locked_by_other_writer() -> (tempfile::TempDir, Connection, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let conn = Connection::open(&path).unwrap();
+        init_schema(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO codex_sync_state (file_path, mtime) VALUES ('/tmp/codex.jsonl', 1.0)",
+            [],
+        )
+        .unwrap();
+        // schema.sql switches to WAL, where an exclusive writer does not block readers.
+        conn.execute_batch("PRAGMA journal_mode=DELETE;").unwrap();
+        conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let locker = Connection::open(&path).unwrap();
+        locker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        (dir, conn, locker)
+    }
+
+    /// A busy probe must not read as "nothing to backfill": bootstrap would record
+    /// 15/17 and the backfill would never run.
+    #[test]
+    fn test_sync_backfill_probe_propagates_busy_error() {
+        let (_dir, conn, _locker) = sync_state_db_locked_by_other_writer();
+
+        assert!(detect_custom_migration_applied(&conn, 15).is_err());
+        assert!(detect_custom_migration_applied(&conn, 17).is_err());
+    }
+
+    /// Skipping the DELETE on a failed existence probe would let `apply_migration`
+    /// record the migration with the cursors still in place.
+    #[test]
+    fn test_clear_sync_tables_propagates_busy_error() {
+        let (_dir, conn, _locker) = sync_state_db_locked_by_other_writer();
+
+        assert!(clear_codex_sync_state(&conn).is_err());
+    }
+
+    static RACE_WRITER_WAITING: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    fn flag_and_retry(_attempts: i32) -> bool {
+        RACE_WRITER_WAITING.store(true, std::sync::atomic::Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        true
+    }
+
+    /// Two background indexers can start together. The loser must see the winner's
+    /// migration once it gets the write lock, not fail with "duplicate column name".
+    #[test]
+    fn test_concurrent_init_schema_does_not_rerun_applied_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        let setup = Connection::open(&path).unwrap();
+        init_schema(&setup).unwrap();
+        setup
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 DROP INDEX idx_conv_model;
+                 ALTER TABLE conversations DROP COLUMN model;
+                 DELETE FROM schema_version WHERE version IN (12, 13);",
+            )
+            .unwrap();
+        drop(setup);
+
+        let winner = Connection::open(&path).unwrap();
+        winner
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 ALTER TABLE conversations ADD COLUMN model TEXT;
+                 INSERT INTO schema_version (version) VALUES (12);",
+            )
+            .unwrap();
+
+        let loser = std::thread::spawn(move || {
+            let conn = Connection::open(&path).unwrap();
+            conn.busy_handler(Some(flag_and_retry)).unwrap();
+            init_schema(&conn)
+        });
+
+        // Commit only once the loser is blocked on the write lock, i.e. after it has
+        // already read schema_version without version 12.
+        while !RACE_WRITER_WAITING.load(std::sync::atomic::Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        winner.execute_batch("COMMIT;").unwrap();
+
+        loser.join().unwrap().unwrap();
+        assert!(column_exists(&winner, "conversations", "model"));
+        assert!(index_exists(&winner, "idx_conv_model"));
     }
 
     #[test]

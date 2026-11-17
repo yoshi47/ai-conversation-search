@@ -2,16 +2,18 @@ use regex::Regex;
 use std::sync::LazyLock;
 
 static CMD_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
-    vec![
-        Regex::new(r"ai-conversation-search\s+(search|list|index|tree|context|resume)").unwrap(),
-        Regex::new(r"ai-conversation-search\s+--\w+\s+(search|list|index|tree|context|resume)")
-            .unwrap(),
-        Regex::new(r"ai-conversation-search\s+(--help|--version|-h|-v)").unwrap(),
-        Regex::new(r"uv\s+tool\s+upgrade\s+ai-conversation-search").unwrap(),
-        Regex::new(r"pip\s+install\s+--upgrade\s+ai-conversation-search").unwrap(),
-        Regex::new(r"command\s+-v\s+ai-conversation-search").unwrap(),
-        Regex::new(r"which\s+ai-conversation-search").unwrap(),
+    [
+        r"ai-conversation-search\s+(search|list|index|tree|context|resume)",
+        r"ai-conversation-search\s+--\w+\s+(search|list|index|tree|context|resume)",
+        r"ai-conversation-search\s+(--help|--version|-h|-v)",
+        r"uv\s+tool\s+upgrade\s+ai-conversation-search",
+        r"pip\s+install\s+--upgrade\s+ai-conversation-search",
+        r"command\s+-v\s+ai-conversation-search",
+        r"which\s+ai-conversation-search",
     ]
+    .into_iter()
+    .map(|p| Regex::new(p).expect("CMD_PATTERNS are literal regexes and must compile"))
+    .collect()
 });
 
 const NOISE_PATTERNS: &[&str] = &[
