@@ -13,6 +13,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - 圧縮・展開されただけのセッションは読み直さない（同期状態は `.zst` を外したパスで持つ）。そのため `conversation_file` は、最後に読んだときの `.jsonl` / `.jsonl.zst` のどちらかのパスを指したままになることがある
   - `.jsonl` と `.jsonl.zst` が両方あるとき（Codex の圧縮・展開の途中や、それが中断したとき）は、Codex と同じく `.jsonl` を読む
   - 一覧を取ってから読むまでの間に Codex がファイルを差し替えた場合は、エラーにせず次回に回す
+- 索引した時点で git リポジトリでなかったプロジェクトの会話は、後から `git init` しても `repo_root` が NULL のままだった（0.18.3 で直したのは、これから索引する会話だけ）。`index --all`（1 日 1 回の定期の全量索引を含む）で、Claude Code・Codex・OpenCode の該当する会話の `repo_root` を解決し直して埋めるようにした。git は未解決のパスごとに 1 回だけ起動する。すでに `repo_root` が入っている会話は書き換えない
 
 ## [0.18.3] - 2026-11-17
 

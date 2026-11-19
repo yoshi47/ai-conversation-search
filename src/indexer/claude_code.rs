@@ -560,41 +560,69 @@ impl ConversationIndexer {
         super::resolve_repo_root_cached_at(&self.conn, project_path, real_path.as_deref())
     }
 
-    /// Backfill repo_root for existing conversations that don't have one.
-    #[allow(dead_code)]
-    pub fn backfill_repo_roots(&self) {
-        let mut stmt = match self.conn.prepare(
-            "SELECT session_id, project_path, conversation_file FROM conversations WHERE repo_root IS NULL AND project_path IS NOT NULL",
-        ) {
-            Ok(s) => s,
-            Err(_) => return,
-        };
-
-        let rows: Vec<(String, String, Option<String>)> = match stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Option<String>>(2)?,
-            ))
-        }) {
-            Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
-            Err(_) => return,
+    /// Fill in repo_root for conversations of every source that were indexed while
+    /// their project was not (yet) a git repository.
+    ///
+    /// Indexing never rewrites repo_root on rows it does not re-insert, so without this
+    /// a NULL written before `git init` stays NULL. Returns the number of rows updated.
+    pub fn backfill_repo_roots(&self) -> Result<usize> {
+        let rows: Vec<(String, String, Option<String>, String)> = {
+            let mut stmt = self.conn.prepare(
+                "SELECT session_id, project_path, conversation_file, COALESCE(source, 'claude_code') FROM conversations WHERE repo_root IS NULL AND project_path IS NOT NULL",
+            )?;
+            let rows: rusqlite::Result<Vec<_>> = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect();
+            rows?
         };
 
         if rows.is_empty() {
-            return;
+            return Ok(0);
         }
 
-        let mut updated = 0;
-        for (session_id, project_path, conv_file) in &rows {
-            if let Some(root) = self.resolve_repo_root(project_path, conv_file.as_deref()) {
-                let _ = self.conn.execute(
-                    "UPDATE conversations SET repo_root = ? WHERE session_id = ?",
-                    rusqlite::params![root, session_id],
-                );
-                updated += 1;
+        // Memoized per run, misses included: resolve_repo_root_cached_at deliberately
+        // does not cache "not a repo", so without this a non-git path would spawn git
+        // once per row instead of once per path.
+        let mut memo: HashMap<(&str, &str, Option<&Path>), Option<String>> = HashMap::new();
+        let mut updates: Vec<(&str, String)> = Vec::new();
+        for (session_id, project_path, conv_file, source) in &rows {
+            // Claude Code's lookup path is decoded from the transcript's project dir, so
+            // that dir is part of the key: keyed on project_path alone, a miss from an
+            // undecodable dir would hide a decodable one with the same cwd. Codex/OpenCode
+            // store the real cwd in project_path, and their conversation_file dir says
+            // nothing about the project.
+            let is_claude = source == "claude_code";
+            let transcript_dir = conv_file
+                .as_deref()
+                .filter(|_| is_claude)
+                .and_then(|f| Path::new(f).parent());
+            let root = memo
+                .entry((source.as_str(), project_path.as_str(), transcript_dir))
+                .or_insert_with(|| {
+                    if is_claude {
+                        self.resolve_repo_root(project_path, conv_file.as_deref())
+                    } else {
+                        super::resolve_repo_root_cached(&self.conn, project_path)
+                    }
+                });
+            if let Some(root) = root {
+                updates.push((session_id.as_str(), root.clone()));
             }
         }
+
+        // Resolution writes repo_root_cache through self.conn, so it runs before the
+        // transaction (same reason as in do_index_conversation).
+        let tx = self.conn.unchecked_transaction()?;
+        let mut updated = 0;
+        for (session_id, root) in &updates {
+            updated += tx.execute(
+                "UPDATE conversations SET repo_root = ? WHERE session_id = ? AND repo_root IS NULL",
+                rusqlite::params![root, session_id],
+            )?;
+        }
+        tx.commit()?;
 
         if updated > 0 {
             self.log(&format!(
@@ -603,6 +631,7 @@ impl ConversationIndexer {
                 rows.len()
             ));
         }
+        Ok(updated)
     }
 
     pub(crate) fn discover_project_dirs(&self) -> Vec<PathBuf> {
@@ -1840,7 +1869,9 @@ impl ConversationIndexer {
             }
         }
 
-        self.backfill_repo_roots();
+        if let Err(e) = self.backfill_repo_roots() {
+            self.log(&format!("  repo_root backfill failed: {}", e));
+        }
         self.log("\nIndexing complete!");
         Ok(())
     }
@@ -3136,6 +3167,189 @@ mod tests {
 
         let resolved = indexer.resolve_repo_root(&repo_path, Some(&conv_file.to_string_lossy()));
         assert_eq!(resolved, Some(repo_path));
+    }
+
+    fn git_init_canonical(dir: &Path) -> String {
+        let status = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(dir)
+            .status()
+            .expect("git must be installed to run this test");
+        assert!(status.success());
+        dir.canonicalize().unwrap().to_string_lossy().to_string()
+    }
+
+    fn insert_conversation_row(
+        indexer: &ConversationIndexer,
+        session_id: &str,
+        source: &str,
+        project_path: &str,
+        repo_root: Option<&str>,
+        conversation_file: &str,
+    ) {
+        indexer
+            .connection()
+            .execute(
+                "INSERT INTO conversations (session_id, project_path, repo_root, conversation_file, message_count, source) VALUES (?, ?, ?, ?, 0, ?)",
+                rusqlite::params![session_id, project_path, repo_root, conversation_file, source],
+            )
+            .unwrap();
+    }
+
+    fn repo_root_of(indexer: &ConversationIndexer, session_id: &str) -> Option<String> {
+        indexer
+            .connection()
+            .query_row(
+                "SELECT repo_root FROM conversations WHERE session_id = ?",
+                [session_id],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn test_backfill_repo_roots_resolves_codex_row_by_project_path() {
+        let (dir, indexer) = create_test_indexer();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = git_init_canonical(repo.path());
+        // A rollout-style location whose parent dir name decodes to nothing, so only
+        // the project_path can lead to the repo.
+        let rollout_dir = dir.path().join("17");
+        std::fs::create_dir_all(&rollout_dir).unwrap();
+        let rollout = rollout_dir.join("rollout-x.jsonl");
+        insert_conversation_row(
+            &indexer,
+            "cx_1",
+            "codex",
+            &repo_path,
+            None,
+            &rollout.to_string_lossy(),
+        );
+
+        let updated = indexer.backfill_repo_roots().unwrap();
+
+        assert_eq!(updated, 1);
+        assert_eq!(repo_root_of(&indexer, "cx_1"), Some(repo_path));
+    }
+
+    #[test]
+    fn test_backfill_repo_roots_resolves_claude_row_from_project_dir() {
+        let (dir, indexer) = create_test_indexer();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = git_init_canonical(repo.path());
+        let project_dir = dir.path().join(repo_path.replace(['/', '.'], "-"));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let conv_file = project_dir.join("s.jsonl");
+        insert_conversation_row(
+            &indexer,
+            "cc_1",
+            "claude_code",
+            &repo_path,
+            None,
+            &conv_file.to_string_lossy(),
+        );
+
+        let updated = indexer.backfill_repo_roots().unwrap();
+
+        assert_eq!(updated, 1);
+        assert_eq!(repo_root_of(&indexer, "cc_1"), Some(repo_path));
+    }
+
+    #[test]
+    fn test_backfill_repo_roots_claude_miss_in_one_dir_does_not_hide_another_dir() {
+        let (dir, indexer) = create_test_indexer();
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = git_init_canonical(repo.path());
+        let undecodable = dir.path().join("-no-such-dir-xyz").join("a.jsonl");
+        let project_dir = dir.path().join(repo_path.replace(['/', '.'], "-"));
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let decodable = project_dir.join("b.jsonl");
+        // Inserted first so it is resolved first and its miss would be memoized.
+        insert_conversation_row(
+            &indexer,
+            "cc_a",
+            "claude_code",
+            &repo_path,
+            None,
+            &undecodable.to_string_lossy(),
+        );
+        insert_conversation_row(
+            &indexer,
+            "cc_b",
+            "claude_code",
+            &repo_path,
+            None,
+            &decodable.to_string_lossy(),
+        );
+
+        indexer.backfill_repo_roots().unwrap();
+
+        assert_eq!(repo_root_of(&indexer, "cc_b"), Some(repo_path));
+    }
+
+    #[test]
+    fn test_backfill_repo_roots_leaves_unresolvable_and_resolved_rows_alone() {
+        let (dir, indexer) = create_test_indexer();
+        let plain = tempfile::tempdir().unwrap();
+        let plain_path = plain
+            .path()
+            .canonicalize()
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let missing = plain.path().join("gone").to_string_lossy().to_string();
+        let unrelated = dir.path().join("17").join("r.jsonl");
+        let unrelated = unrelated.to_string_lossy();
+
+        insert_conversation_row(
+            &indexer,
+            "oc_plain",
+            "opencode",
+            &plain_path,
+            None,
+            &unrelated,
+        );
+        insert_conversation_row(
+            &indexer,
+            "oc_missing",
+            "opencode",
+            &missing,
+            None,
+            &unrelated,
+        );
+        insert_conversation_row(
+            &indexer,
+            "oc_set",
+            "opencode",
+            &plain_path,
+            Some("/kept/as/is"),
+            &unrelated,
+        );
+        // Claude row whose project dir name cannot be decoded: its project_path came from
+        // the sessions-index.json fallback, and the lookup only uses the decoded name, so
+        // staying NULL is the intended outcome.
+        let repo = tempfile::tempdir().unwrap();
+        let repo_path = git_init_canonical(repo.path());
+        let undecodable = dir.path().join("-no-such-dir-xyz").join("s.jsonl");
+        insert_conversation_row(
+            &indexer,
+            "cc_undecodable",
+            "claude_code",
+            &repo_path,
+            None,
+            &undecodable.to_string_lossy(),
+        );
+
+        let updated = indexer.backfill_repo_roots().unwrap();
+
+        assert_eq!(updated, 0);
+        assert_eq!(repo_root_of(&indexer, "oc_plain"), None);
+        assert_eq!(repo_root_of(&indexer, "oc_missing"), None);
+        assert_eq!(
+            repo_root_of(&indexer, "oc_set"),
+            Some("/kept/as/is".to_string())
+        );
+        assert_eq!(repo_root_of(&indexer, "cc_undecodable"), None);
     }
 
     #[test]
