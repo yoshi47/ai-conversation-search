@@ -2,7 +2,7 @@
   "skills": [
     {
       "name": "conversation-search",
-      "version": "0.18.3",
+      "version": "0.18.4",
       "files": ["conversation-search.md", "REFERENCE.md"]
     }
   ]

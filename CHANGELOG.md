@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.18.4] - 2026-11-19
+
 ### Fixed
 
 - Codex が圧縮した rollout（`.jsonl.zst`）を索引していなかった。Codex は7日以上更新のない rollout を `.jsonl.zst` に置き換えるため、圧縮後のセッションは `index --all` でも新しく入らなかった。`.jsonl.zst` も展開して読むようにした
