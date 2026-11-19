@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Codex が圧縮した rollout（`.jsonl.zst`）を索引していなかった。Codex は7日以上更新のない rollout を `.jsonl.zst` に置き換えるため、圧縮後のセッションは `index --all` でも新しく入らなかった。`.jsonl.zst` も展開して読むようにした
+  - 既に圧縮されたセッションは、`index --all`（定期の全量索引を含む）で入る。バックグラウンド索引（`--days 1`）は7日以上前のファイルを見ないため、これだけでは入らない。0.18.2 の再索引（マイグレーション 17）が届かなかった圧縮済みセッションも、ここで user 発言が入る
+  - 圧縮・展開されただけのセッションは読み直さない（同期状態は `.zst` を外したパスで持つ）。そのため `conversation_file` は、最後に読んだときの `.jsonl` / `.jsonl.zst` のどちらかのパスを指したままになることがある
+  - `.jsonl` と `.jsonl.zst` が両方あるとき（Codex の圧縮・展開の途中や、それが中断したとき）は、Codex と同じく `.jsonl` を読む
+  - 一覧を取ってから読むまでの間に Codex がファイルを差し替えた場合は、エラーにせず次回に回す
+
 ## [0.18.3] - 2026-11-17
 
 ### Fixed

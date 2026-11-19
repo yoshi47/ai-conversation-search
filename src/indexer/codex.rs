@@ -4,10 +4,47 @@ use regex::Regex;
 use rusqlite::Connection;
 
 use crate::db;
-use crate::error::Result;
+use crate::error::{AppError, Result};
 
 const DEFAULT_CODEX_SESSIONS: &str = "~/.codex/sessions";
 const CX_PREFIX: &str = "codex:";
+// Codex compresses rollouts idle for 7+ days to `<name>.jsonl.zst` and removes the
+// plain file; resuming the session decompresses it back to `<name>.jsonl`.
+
+// Compared as bytes, not `to_str()`: a non-UTF-8 file name must still be listed.
+fn file_name_ends_with(path: &Path, suffix: &str) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.as_encoded_bytes().ends_with(suffix.as_bytes()))
+}
+
+fn is_compressed_rollout(path: &Path) -> bool {
+    file_name_ends_with(path, ".jsonl.zst")
+}
+
+fn is_rollout_file(path: &Path) -> bool {
+    is_compressed_rollout(path) || file_name_ends_with(path, ".jsonl")
+}
+
+/// The `.jsonl` path a rollout has whether or not it is currently compressed. Sync state
+/// is keyed by it: compression keeps both content and mtime, so keying by the physical
+/// path would re-parse every session once Codex compresses it.
+fn plain_rollout_path(path: &Path) -> PathBuf {
+    if is_compressed_rollout(path) {
+        // Strips only the trailing `.zst`; the name ends in `.jsonl.zst`.
+        path.with_extension("")
+    } else {
+        path.to_path_buf()
+    }
+}
+
+fn read_rollout(path: &Path) -> Result<String> {
+    if !is_compressed_rollout(path) {
+        return Ok(std::fs::read_to_string(path)?);
+    }
+    let bytes = zstd::decode_all(std::fs::File::open(path)?)?;
+    String::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.utf8_error()).into())
+}
 
 /// Text blocks Codex injects with `role: "user"` in the protocol log. They are
 /// harness context (AGENTS.md, sandbox policy, subagent notifications), not
@@ -110,7 +147,12 @@ impl CodexIndexer {
             .into_iter()
             .filter_map(|e| e.ok())
         {
-            if entry.path().extension().is_none_or(|e| e != "jsonl") {
+            if !is_rollout_file(entry.path()) {
+                continue;
+            }
+            // Codex reads the plain file whenever both exist (mid-compression,
+            // mid-decompression, or after an interrupted one), so we do too.
+            if is_compressed_rollout(entry.path()) && plain_rollout_path(entry.path()).exists() {
                 continue;
             }
             if let Some(cutoff) = cutoff {
@@ -171,6 +213,8 @@ impl CodexIndexer {
                 .map(|t| t.duration_since(std::time::UNIX_EPOCH))
             {
                 Ok(Ok(d)) => d.as_secs_f64(),
+                // See the NotFound arm below.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                 Ok(Err(_)) | Err(_) => {
                     eprintln!(
                         "  Skipping {}: cannot read its modification time",
@@ -180,10 +224,11 @@ impl CodexIndexer {
                 }
             };
 
+            let sync_key = plain_rollout_path(session_file);
             // Check if already indexed with same mtime
             if let Ok(existing_mtime) = conn.query_row(
                 "SELECT mtime FROM codex_sync_state WHERE file_path = ?",
-                [session_file.to_string_lossy().as_ref()],
+                [sync_key.to_string_lossy().as_ref()],
                 |row| row.get::<_, f64>(0),
             ) {
                 if (existing_mtime - mtime).abs() < 0.001 {
@@ -199,7 +244,7 @@ impl CodexIndexer {
                 .and_then(|count| {
                     tx.execute(
                         "INSERT OR REPLACE INTO codex_sync_state (file_path, mtime) VALUES (?, ?)",
-                        rusqlite::params![session_file.to_string_lossy().as_ref(), mtime],
+                        rusqlite::params![sync_key.to_string_lossy().as_ref(), mtime],
                     )?;
                     tx.commit()?;
                     Ok(count)
@@ -209,6 +254,10 @@ impl CodexIndexer {
                     indexed_count += 1;
                 }
                 Ok(_) => {}
+                // Not an error: Codex swapped `.jsonl` and `.jsonl.zst` after we listed the
+                // files, and the next run lists the other one. Logging it would put a false
+                // failure in the background log every time a session is compressed or resumed.
+                Err(AppError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
                 // Even under --quiet: the background indexer's stderr is its only record.
                 Err(e) => {
                     eprintln!(
@@ -233,7 +282,7 @@ impl CodexIndexer {
     }
 
     fn index_session_file(&self, conn: &Connection, session_file: &Path) -> Result<usize> {
-        let content = std::fs::read_to_string(session_file)?;
+        let content = read_rollout(session_file)?;
         let lines: Vec<&str> = content.lines().collect();
         if lines.is_empty() {
             return Ok(0);
@@ -254,8 +303,12 @@ impl CodexIndexer {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| {
+                // The plain name, so the fallback id survives compression unchanged.
                 self.extract_uuid_from_filename(
-                    &session_file.file_name().unwrap().to_string_lossy(),
+                    &plain_rollout_path(session_file)
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy(),
                 )
             });
 
@@ -1330,5 +1383,271 @@ mod tests {
 
         let rows = message_rows(&conn);
         assert_eq!(rows[0], ("user".to_string(), "1行目\n2行目".to_string()));
+    }
+
+    const ZST_META: &str = r#"{"type":"session_meta","payload":{"id":"78787878-9090-1212-3434-565656565656","cwd":"/tmp","timestamp":"2025-01-15T10:00:00Z"}}"#;
+    const ZST_USER: &str = r#"{"type":"event_msg","payload":{"type":"user_message","message":"圧縮前の質問"},"timestamp":"2025-01-15T10:00:01Z"}"#;
+    const ZST_AGENT: &str = r#"{"type":"event_msg","payload":{"type":"agent_message","message":"compressed answer"},"timestamp":"2025-01-15T10:00:02Z"}"#;
+
+    /// Does what Codex's compression worker does: write `<plain>.zst` with the
+    /// plain file's mtime. The plain file is left in place; tests remove it when
+    /// they need the post-compression state.
+    fn compress_like_codex(plain: &Path) -> PathBuf {
+        let data = std::fs::read(plain).unwrap();
+        let compressed = PathBuf::from(format!("{}.zst", plain.display()));
+        std::fs::write(&compressed, zstd::encode_all(data.as_slice(), 3).unwrap()).unwrap();
+        let mtime = plain.metadata().unwrap().modified().unwrap();
+        set_mtime(&compressed, mtime);
+        compressed
+    }
+
+    #[test]
+    fn test_find_session_files_includes_compressed_rollouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = write_session_file(dir.path(), "plain.jsonl", &[ZST_META]);
+        let only_zst = write_session_file(dir.path(), "only-zst.jsonl", &[ZST_META]);
+        let only_zst = {
+            let compressed = compress_like_codex(&only_zst);
+            std::fs::remove_file(&only_zst).unwrap();
+            compressed
+        };
+        // Mid-compression (or mid-materialization) both exist; Codex reads the plain one.
+        let both = write_session_file(dir.path(), "both.jsonl", &[ZST_META]);
+        compress_like_codex(&both);
+
+        let indexer = create_indexer(&dir.path().join("sessions"));
+        let mut expected = vec![both.clone(), only_zst.clone(), plain.clone()];
+        expected.sort();
+        assert_eq!(indexer.find_session_files(None), expected);
+        // The background indexer runs with `--days 1`; a recent `.zst` must pass it.
+        assert_eq!(indexer.find_session_files(Some(1)), expected);
+
+        // Codex keeps the original mtime on the `.zst`, so `--days` treats it the same.
+        set_mtime(
+            &only_zst,
+            std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 60 * 60),
+        );
+        let mut recent = vec![both, plain];
+        recent.sort();
+        assert_eq!(indexer.find_session_files(Some(1)), recent);
+    }
+
+    #[test]
+    fn test_compressed_rollout_is_indexed() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+        create_sync_table(&conn);
+
+        let plain = write_session_file(
+            dir.path(),
+            "rollout-zst.jsonl",
+            &[ZST_META, ZST_USER, ZST_AGENT],
+        );
+        let compressed = compress_like_codex(&plain);
+        std::fs::remove_file(&plain).unwrap();
+
+        let indexer = create_indexer(&dir.path().join("sessions"));
+        let files = indexer.find_session_files(None);
+        assert_eq!(indexer.do_index(&conn, &files).unwrap(), 1);
+        assert_eq!(
+            message_rows(&conn),
+            vec![
+                ("user".to_string(), "圧縮前の質問".to_string()),
+                ("assistant".to_string(), "compressed answer".to_string()),
+            ]
+        );
+
+        let conversation_file: String = conn
+            .query_row("SELECT conversation_file FROM conversations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(conversation_file, compressed.to_string_lossy());
+        let sync_keys: Vec<String> = conn
+            .prepare("SELECT file_path FROM codex_sync_state")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(sync_keys, vec![plain.to_string_lossy().to_string()]);
+
+        assert_eq!(indexer.do_index(&conn, &files).unwrap(), 0);
+    }
+
+    /// Compression changes neither content nor mtime, so a session indexed as
+    /// `.jsonl` must not be parsed again once Codex swaps it for `.jsonl.zst`.
+    #[test]
+    fn test_compression_after_index_does_not_reindex() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+        create_sync_table(&conn);
+
+        let plain = write_session_file(
+            dir.path(),
+            "rollout-later.jsonl",
+            &[ZST_META, ZST_USER, ZST_AGENT],
+        );
+        let indexer = create_indexer(&dir.path().join("sessions"));
+        assert_eq!(
+            indexer
+                .do_index(&conn, &indexer.find_session_files(None))
+                .unwrap(),
+            1
+        );
+
+        compress_like_codex(&plain);
+        std::fs::remove_file(&plain).unwrap();
+        assert_eq!(
+            indexer
+                .do_index(&conn, &indexer.find_session_files(None))
+                .unwrap(),
+            0
+        );
+        let sync_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM codex_sync_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sync_rows, 1);
+        assert_eq!(message_rows(&conn).len(), 2);
+    }
+
+    /// Resuming makes Codex decompress back to `.jsonl` with the original mtime, then
+    /// append. Only the append is new content.
+    #[test]
+    fn test_resumed_rollout_is_reindexed_only_after_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+        create_sync_table(&conn);
+
+        let plain = write_session_file(
+            dir.path(),
+            "rollout-resumed.jsonl",
+            &[ZST_META, ZST_USER, ZST_AGENT],
+        );
+        let compressed = compress_like_codex(&plain);
+        std::fs::remove_file(&plain).unwrap();
+        let indexer = create_indexer(&dir.path().join("sessions"));
+        assert_eq!(
+            indexer
+                .do_index(&conn, &indexer.find_session_files(None))
+                .unwrap(),
+            1
+        );
+
+        let original_mtime = compressed.metadata().unwrap().modified().unwrap();
+        let decompressed = zstd::decode_all(std::fs::File::open(&compressed).unwrap()).unwrap();
+        std::fs::write(&plain, decompressed).unwrap();
+        set_mtime(&plain, original_mtime);
+        std::fs::remove_file(&compressed).unwrap();
+        assert_eq!(
+            indexer
+                .do_index(&conn, &indexer.find_session_files(None))
+                .unwrap(),
+            0
+        );
+
+        let appended = r#"{"type":"event_msg","payload":{"type":"user_message","message":"再開後の質問"},"timestamp":"2025-01-20T10:00:00Z"}"#;
+        write_session_file(
+            dir.path(),
+            "rollout-resumed.jsonl",
+            &[ZST_META, ZST_USER, ZST_AGENT, appended],
+        );
+        set_mtime(
+            &plain,
+            original_mtime + std::time::Duration::from_secs(5 * 24 * 60 * 60),
+        );
+        assert_eq!(
+            indexer
+                .do_index(&conn, &indexer.find_session_files(None))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            message_rows(&conn).last().unwrap(),
+            &("user".to_string(), "再開後の質問".to_string())
+        );
+        let conversation_file: String = conn
+            .query_row("SELECT conversation_file FROM conversations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(conversation_file, plain.to_string_lossy());
+    }
+
+    #[test]
+    fn test_compressed_rollout_with_invalid_utf8_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+        let date_dir = dir.path().join("sessions/2025/01/15");
+        std::fs::create_dir_all(&date_dir).unwrap();
+        let path = date_dir.join("not-utf8.jsonl.zst");
+        std::fs::write(&path, zstd::encode_all(&[0xff, 0xfe][..], 3).unwrap()).unwrap();
+
+        let indexer = create_indexer(&dir.path().join("sessions"));
+        let err = indexer.index_session_file(&conn, &path).unwrap_err();
+        assert!(
+            matches!(&err, AppError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+            "{err:?}"
+        );
+    }
+
+    /// Without `payload.id` the session id comes from the file name; it must not pick
+    /// up `.jsonl` from `x.jsonl.zst` and split one session into two.
+    #[test]
+    fn test_fallback_session_id_is_stable_across_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+        let meta_without_id = r#"{"type":"session_meta","payload":{"cwd":"/tmp","timestamp":"2025-01-15T10:00:00Z"}}"#;
+        let plain = write_session_file(
+            dir.path(),
+            "no-uuid-here.jsonl",
+            &[meta_without_id, ZST_USER],
+        );
+        let compressed = compress_like_codex(&plain);
+
+        let indexer = create_indexer(&dir.path().join("sessions"));
+        indexer.index_session_file(&conn, &plain).unwrap();
+        indexer.index_session_file(&conn, &compressed).unwrap();
+        let session_ids: Vec<String> = conn
+            .prepare("SELECT session_id FROM conversations")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(session_ids, vec!["codex:no-uuid-here".to_string()]);
+    }
+
+    #[test]
+    fn test_corrupt_compressed_rollout_is_not_recorded() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = setup_test_db();
+        create_sync_table(&conn);
+
+        let plain =
+            write_session_file(dir.path(), "broken.jsonl", &[ZST_META, ZST_USER, ZST_AGENT]);
+        let broken = compress_like_codex(&plain);
+        std::fs::remove_file(&plain).unwrap();
+        let mut bytes = std::fs::read(&broken).unwrap();
+        bytes.truncate(bytes.len() / 2);
+        std::fs::write(&broken, bytes).unwrap();
+
+        let indexer = create_indexer(&dir.path().join("sessions"));
+        let err = indexer.index_session_file(&conn, &broken).unwrap_err();
+        // UnexpectedEof is zstd's "incomplete frame"; reading the bytes as plain text
+        // would fail with InvalidData instead.
+        assert!(
+            matches!(&err, AppError::Io(e) if e.kind() == std::io::ErrorKind::UnexpectedEof),
+            "{err:?}"
+        );
+        assert_eq!(indexer.do_index(&conn, &[broken]).unwrap(), 0);
+        let sync_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM codex_sync_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(sync_rows, 0);
     }
 }
