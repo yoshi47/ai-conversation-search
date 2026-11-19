@@ -13,6 +13,14 @@
 /// Halfwidth Katakana (U+FF61-FF9F) is intentionally NOT included: it lives in
 /// the fullwidth ASCII block and is treated as a separator, same as
 /// punctuation / emoji / control chars.
+///
+/// Iteration / placeholder marks (U+3005-3007 `々〆〇`, U+309D-309E `ゝゞ`) are
+/// also left out. Why not add them: existing rows were indexed without them,
+/// and binaries up to 0.18.3 keep re-analyzing queued rows the old way, so a
+/// query such as `人々` would move from LIKE to a bigram MATCH that misses
+/// those rows. As separators they make every 1-2 char term that contains them
+/// yield `None`, so it stays a LIKE residual and still matches; longer terms
+/// go to the trigram table, which never calls this.
 pub fn is_cjk(ch: char) -> bool {
     matches!(ch,
         '\u{3041}'..='\u{3096}'   // Hiragana
@@ -279,6 +287,15 @@ mod tests {
         assert_eq!(analyze_for_query("a"), None);
         assert_eq!(analyze_for_query(""), None);
         assert_eq!(analyze_for_query("   "), None);
+    }
+
+    #[test]
+    fn test_iteration_marks_stay_like_residual() {
+        for term in ["人々", "様々", "〇〇", "こゝ"] {
+            assert_eq!(analyze_for_query(term), None, "query {:?}", term);
+        }
+        // Index side splits on them the same way, so no bigram spans the mark.
+        assert_eq!(analyze_for_index("人々の生活"), "の生 生活");
     }
 
     #[test]
