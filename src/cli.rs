@@ -1014,6 +1014,13 @@ fn cmd_index(days: i64, all: bool, force: bool, quiet: bool) -> Result<()> {
 
     let other_days = if all { Some(9999i64) } else { Some(days) };
     index_other_sources(other_days, quiet);
+    // Only on --all: it spawns git for every still-unresolved existing path, which the
+    // incremental runs every few minutes should not pay; --all runs at most daily.
+    if all {
+        if let Err(e) = indexer.backfill_repo_roots() {
+            eprintln!("Warning: repo_root backfill failed: {}", e);
+        }
+    }
     drain_bigram_queue(&indexer);
     touch_stamp_file();
     if all {
